@@ -25,12 +25,12 @@ type Config struct {
 
 // BridgeConfig holds top-level bridge settings.
 type BridgeConfig struct {
-	Name     string       `toml:"name"`
-	DataDir  string       `toml:"data_dir"`
-	Routing  RoutingConfig `toml:"routing"`
-	Audit    AuditConfig  `toml:"audit"`
-	Files    FilesConfig  `toml:"files"`
-	BotAllowlist []string `toml:"bot_allowlist"`
+	Name         string        `toml:"name"`
+	DataDir      string        `toml:"data_dir"`
+	Routing      RoutingConfig `toml:"routing"`
+	Audit        AuditConfig   `toml:"audit"`
+	Files        FilesConfig   `toml:"files"`
+	BotAllowlist []string      `toml:"bot_allowlist"`
 }
 
 // RoutingConfig controls message routing behaviour.
@@ -97,20 +97,23 @@ type SourceConfig struct {
 
 // RouteConfig defines a routing rule from source to destination.
 type RouteConfig struct {
-	Source      string          `toml:"source"`
-	Match       RouteMatch      `toml:"match"`
-	Destination RouteDestination `toml:"destination"`
-}
-
-// RouteMatch specifies the matching criteria for a route.
-type RouteMatch struct {
-	EventType string `toml:"event_type"`
-	Repo      string `toml:"repo"`
+	Source      string            `toml:"source"`
+	Match       map[string]string `toml:"match"`
+	Destination RouteDestination  `toml:"destination"`
+	Template    string            `toml:"template"`
+	Correlation CorrelationConfig `toml:"correlation"`
 }
 
 // RouteDestination specifies where a matched event is routed.
 type RouteDestination struct {
-	ChannelID string `toml:"channel_id"`
+	ChannelID        string `toml:"channel_id"`
+	CorrelationField string `toml:"correlation_field"`
+}
+
+// CorrelationConfig defines how webhook events are correlated to threads.
+type CorrelationConfig struct {
+	Field   string `toml:"field"`
+	TTLDays int    `toml:"ttl_days"`
 }
 
 // envSubstRe matches ${VAR} patterns for environment variable substitution.

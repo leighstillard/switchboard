@@ -1,89 +1,777 @@
-// Package router implements the rule engine that matches ingested events
-// to destinations and coordinates message flow between Slack and jcode.
+// Package router implements the decision-making core of Switchboard.
+// It receives inbound Slack messages and webhook events, orchestrates
+// jcode session lifecycle, and routes notifications to the appropriate
+// Slack threads.
 package router
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/format5/switchboard/internal/coalesce"
 	"github.com/format5/switchboard/internal/config"
-	"github.com/format5/switchboard/internal/ingest"
 	"github.com/format5/switchboard/internal/jcode"
+	"github.com/format5/switchboard/internal/jcodeproto"
+	"github.com/format5/switchboard/internal/outbound"
 	"github.com/format5/switchboard/internal/slack"
 	"github.com/format5/switchboard/internal/store"
 )
 
-// Router evaluates routing rules and dispatches events to their destinations.
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// WebhookEvent is the normalized representation of an inbound webhook.
+type WebhookEvent struct {
+	Source      string
+	EventType   string
+	Payload     map[string]interface{}
+	Headers     map[string]string
+	RawBody     []byte
+	Idempotency string
+}
+
+// Router orchestrates message flow between Slack, jcode, and webhook sources.
 type Router struct {
-	routes []config.RouteConfig
-	slack  *slack.Edge
-	jcode  *jcode.Client
-	store  *store.Store
-	ingest *ingest.Server
-	mu     sync.RWMutex
+	cfg      *config.Config
+	store    *store.Store
+	jcode    *jcode.Client
+	edge     *slack.Edge
+	outbound *outbound.Queue
+
+	mu         sync.RWMutex
+	routes     []config.RouteConfig
+	coalescers map[string]*coalesce.SessionCoalescer // key: "channelID:threadTS"
+
+	inboundCh chan *slack.InboundMessage
+	webhookCh chan *WebhookEvent
+
+	maxQueuePerSession int
 }
 
-// New creates a new Router with the given routes and component references.
-func New(routes []config.RouteConfig, se *slack.Edge, jc *jcode.Client, st *store.Store, ing *ingest.Server) *Router {
-	return &Router{
-		routes: routes,
-		slack:  se,
-		jcode:  jc,
-		store:  st,
-		ingest: ing,
+// New creates a Router with the given dependencies.
+func New(
+	cfg *config.Config,
+	st *store.Store,
+	jc *jcode.Client,
+	edge *slack.Edge,
+	out *outbound.Queue,
+) *Router {
+	r := &Router{
+		cfg:                cfg,
+		store:              st,
+		jcode:              jc,
+		edge:               edge,
+		outbound:           out,
+		routes:             cfg.Routes,
+		coalescers:         make(map[string]*coalesce.SessionCoalescer),
+		inboundCh:          make(chan *slack.InboundMessage, 64),
+		webhookCh:          make(chan *WebhookEvent, 64),
+		maxQueuePerSession: 5,
 	}
+
+	// Register as the inbound handler for Slack events.
+	edge.SetInboundHandler(func(msg *slack.InboundMessage) {
+		select {
+		case r.inboundCh <- msg:
+		default:
+			slog.Warn("router: inbound channel full, dropping message",
+				"channel", msg.ChannelID, "user", msg.UserID)
+		}
+	})
+
+	return r
 }
 
-// Run starts the router event loop. Blocks until ctx is cancelled.
-func (r *Router) Run(ctx context.Context) {
-	slog.Info("router started", "routes", len(r.routes))
+// Run starts the router event loop. It blocks until ctx is cancelled.
+func (r *Router) Run(ctx context.Context) error {
+	slog.Info("router: starting")
+
+	// Recover active sessions from store.
+	if err := r.recoverSessions(ctx); err != nil {
+		slog.Error("router: session recovery failed", "err", err)
+		// Non-fatal; continue with no recovered sessions.
+	}
+
+	// Start maintenance ticker (nightly cleanup).
+	maintenanceTicker := time.NewTicker(6 * time.Hour)
+	defer maintenanceTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("router stopped")
-			return
-		case evt := <-r.ingest.Events():
-			r.dispatch(ctx, evt)
+			slog.Info("router: stopping")
+			r.closeAllCoalescers()
+			return ctx.Err()
+
+		case msg := <-r.inboundCh:
+			r.handleInbound(ctx, msg)
+
+		case evt := <-r.webhookCh:
+			r.handleWebhook(ctx, evt)
+
+		case <-maintenanceTicker.C:
+			r.runMaintenance()
 		}
 	}
 }
 
-// Reload hot-swaps the routing rules.
+// EnqueueWebhook submits a webhook event for processing by the router.
+func (r *Router) EnqueueWebhook(evt *WebhookEvent) {
+	select {
+	case r.webhookCh <- evt:
+	default:
+		slog.Warn("router: webhook channel full", "source", evt.Source)
+	}
+}
+
+// Reload updates the routing rules (called on SIGHUP).
 func (r *Router) Reload(routes []config.RouteConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.routes = routes
-	slog.Info("router rules reloaded", "routes", len(routes))
+	slog.Info("router: routes reloaded", "count", len(routes))
 }
 
-func (r *Router) dispatch(ctx context.Context, evt ingest.Event) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+// ---------------------------------------------------------------------------
+// Inbound Slack message handling
+// ---------------------------------------------------------------------------
 
-	for _, route := range r.routes {
-		if r.matches(route, evt) {
-			slog.Info("event routed",
-				"source", evt.Source,
-				"destination", route.Destination.ChannelID,
-			)
-			// TODO: format message from template and send to destination
-			_ = r.slack.SendMessage(ctx, route.Destination.ChannelID, string(evt.Payload), "")
+func (r *Router) handleInbound(ctx context.Context, msg *slack.InboundMessage) {
+	slog.Debug("router: inbound message",
+		"channel", msg.ChannelID,
+		"thread_ts", msg.ThreadTS,
+		"user", msg.UserID,
+		"top_level", msg.IsTopLevel,
+	)
+
+	// Check for commands.
+	if r.handleCommand(ctx, msg) {
+		return
+	}
+
+	// Resolve workdir for this channel.
+	workdir, identity := r.resolveChannel(msg.ChannelID)
+	if workdir == "" {
+		slog.Debug("router: no workdir for channel", "channel", msg.ChannelID)
+		return
+	}
+
+	// Determine the thread_ts to use as the session key.
+	threadTS := msg.ThreadTS
+	if msg.IsTopLevel {
+		threadTS = msg.MessageTS // top-level message: its own TS becomes the thread
+	}
+
+	// Look up existing session.
+	session, err := r.store.GetSession(msg.ChannelID, threadTS)
+	if err != nil {
+		slog.Error("router: store lookup failed", "err", err)
+		return
+	}
+
+	if session != nil {
+		r.handleContinuation(ctx, msg, session, threadTS)
+		return
+	}
+
+	// No existing session. Only create new sessions from top-level messages
+	// (or DMs, or explicit @mentions in threads we don't own).
+	if !msg.IsTopLevel && !msg.IsDM {
+		// Reply in a thread we don't own - ignore.
+		slog.Debug("router: reply in unowned thread, ignoring", "channel", msg.ChannelID, "thread_ts", threadTS)
+		return
+	}
+
+	r.handleNewSession(ctx, msg, workdir, identity, threadTS)
+}
+
+// handleNewSession creates a new jcode session and starts processing.
+func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage, workdir string, identity coalesce.Identity, threadTS string) {
+	slog.Info("router: creating new session",
+		"channel", msg.ChannelID,
+		"thread_ts", threadTS,
+		"workdir", workdir,
+	)
+
+	// Subscribe to a new jcode session.
+	sessionID, events, err := r.jcode.Subscribe(ctx, workdir)
+	if err != nil {
+		slog.Error("router: failed to subscribe to jcode", "err", err, "workdir", workdir)
+		r.postError(msg.ChannelID, threadTS, "Failed to start agent session: "+err.Error())
+		return
+	}
+
+	// Persist session.
+	now := time.Now().Unix()
+	expiresAt := now + 30*24*3600 // 30 days
+	sess := &store.Session{
+		ChannelID:    msg.ChannelID,
+		ThreadTS:     threadTS,
+		JcodeSession: sessionID,
+		Workdir:      workdir,
+		CreatedAt:    now,
+		LastActivity: now,
+		Status:       "processing",
+		ExpiresAt:    &expiresAt,
+	}
+	if err := r.store.CreateSession(sess); err != nil {
+		slog.Error("router: failed to persist session", "err", err)
+	}
+
+	// Create coalescer.
+	coal := coalesce.NewSessionCoalescer(
+		sessionID, "", msg.ChannelID, threadTS, workdir,
+		identity, r.outbound, r.handleImage,
+	)
+	key := coalescerKey(msg.ChannelID, threadTS)
+	r.mu.Lock()
+	r.coalescers[key] = coal
+	r.mu.Unlock()
+
+	// Add 👀 reaction to acknowledge receipt.
+	r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
+
+	// Send the user's message to jcode.
+	var images []jcodeproto.ImagePair
+	// TODO: handle file attachments -> images
+	if err := r.jcode.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
+		slog.Error("router: failed to send message to jcode", "err", err)
+		r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
+		return
+	}
+
+	// Start consuming events.
+	go r.consumeEvents(ctx, sessionID, msg.ChannelID, threadTS, events)
+}
+
+// handleContinuation routes a message to an existing session.
+func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessage, session *store.Session, threadTS string) {
+	// Check if expired.
+	if session.Status == "closed" {
+		r.outbound.Enqueue(&outbound.OutboundItem{
+			Priority:  3,
+			ChannelID: msg.ChannelID,
+			ThreadTS:  threadTS,
+			Action:    outbound.ActionPostMessage,
+			Text:      "This thread has aged out (last activity > 30 days ago). Mention me at the channel root to start fresh.",
+		})
+		return
+	}
+
+	// Update activity timestamp.
+	r.store.UpdateSessionActivity(msg.ChannelID, threadTS)
+
+	if session.Status == "idle" {
+		// Session is idle: activate it.
+		r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "processing")
+
+		// Add 👀 reaction.
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
+
+		// Send message to jcode.
+		var images []jcodeproto.ImagePair
+		if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+			slog.Error("router: failed to send continuation message", "err", err)
+			r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
+			r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
 			return
+		}
+
+		// Ensure we have a coalescer and event consumer for this session.
+		key := coalescerKey(msg.ChannelID, threadTS)
+		r.mu.RLock()
+		_, hasCoalescer := r.coalescers[key]
+		r.mu.RUnlock()
+
+		if !hasCoalescer {
+			// Re-create coalescer (e.g., after bridge restart).
+			_, identity := r.resolveChannel(msg.ChannelID)
+			coal := coalesce.NewSessionCoalescer(
+				session.JcodeSession, session.FriendlyName,
+				msg.ChannelID, threadTS, session.Workdir,
+				identity, r.outbound, r.handleImage,
+			)
+			r.mu.Lock()
+			r.coalescers[key] = coal
+			r.mu.Unlock()
+		}
+	} else if session.Status == "processing" {
+		// Session is busy: enqueue the message.
+		count, _ := r.store.CountTurns(msg.ChannelID, threadTS)
+		if count >= r.maxQueuePerSession {
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: msg.ChannelID,
+				ThreadTS:  threadTS,
+				Action:    outbound.ActionPostMessage,
+				Text:      fmt.Sprintf("I have a queue of %d messages waiting; further messages will be ignored until I catch up.", r.maxQueuePerSession),
+			})
+			return
+		}
+
+		// Enqueue the turn.
+		item := &store.TurnQueueItem{
+			ChannelID:  msg.ChannelID,
+			ThreadTS:   threadTS,
+			EnqueuedAt: time.Now().Unix(),
+			UserID:     msg.UserID,
+			Text:       msg.Text,
+		}
+		if err := r.store.EnqueueTurn(item); err != nil {
+			slog.Error("router: failed to enqueue turn", "err", err)
+			return
+		}
+
+		// Add 📋 reaction to acknowledge queuing.
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "clipboard")
+	}
+}
+
+// handleCommand checks for !stop, !cancel, !purge commands.
+func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) bool {
+	text := strings.TrimSpace(msg.Text)
+
+	threadTS := msg.ThreadTS
+	if msg.IsTopLevel {
+		threadTS = msg.MessageTS
+	}
+
+	switch {
+	case text == "!stop" || text == "!cancel":
+		session, err := r.store.GetSession(msg.ChannelID, threadTS)
+		if err != nil || session == nil {
+			return false
+		}
+		if session.Status == "processing" {
+			if err := r.jcode.Cancel(ctx, session.JcodeSession); err != nil {
+				slog.Error("router: cancel failed", "err", err)
+			}
+			r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
+			r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "octagonal_sign")
+		}
+		return true
+
+	case text == "!purge":
+		session, err := r.store.GetSession(msg.ChannelID, threadTS)
+		if err != nil || session == nil {
+			return false
+		}
+		turns, _ := r.store.DrainTurns(msg.ChannelID, threadTS)
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "wastebasket")
+		if len(turns) > 0 {
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: msg.ChannelID,
+				ThreadTS:  threadTS,
+				Action:    outbound.ActionPostMessage,
+				Text:      fmt.Sprintf("Purged %d queued message(s).", len(turns)),
+			})
+		}
+		return true
+	}
+
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Event consumption from jcode
+// ---------------------------------------------------------------------------
+
+// consumeEvents reads from a jcode session event channel and dispatches to coalescer.
+func (r *Router) consumeEvents(ctx context.Context, sessionID, channelID, threadTS string, events <-chan *jcodeproto.ServerEvent) {
+	key := coalescerKey(channelID, threadTS)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-events:
+			if !ok {
+				// Channel closed (session disconnected).
+				slog.Info("router: event channel closed", "session_id", sessionID)
+				r.store.UpdateSessionStatus(channelID, threadTS, "idle")
+				return
+			}
+
+			r.mu.RLock()
+			coal := r.coalescers[key]
+			r.mu.RUnlock()
+
+			if coal == nil {
+				slog.Debug("router: no coalescer for event", "session_id", sessionID, "type", ev.Type)
+				continue
+			}
+
+			// Handle session event (friendly name).
+			if ev.Type == jcodeproto.EventSession {
+				var sessEv jcodeproto.SessionEvent
+				if json.Unmarshal(ev.Raw, &sessEv) == nil {
+					coal.SetFriendlyName(sessEv.SessionID)
+					r.store.SetSessionFriendlyName(channelID, threadTS, sessEv.SessionID)
+				}
+				continue
+			}
+
+			// Handle history event (extract was_interrupted, then discard).
+			if ev.Type == jcodeproto.EventHistory {
+				var histEv jcodeproto.HistoryEvent
+				if json.Unmarshal(ev.Raw, &histEv) == nil {
+					if histEv.WasInterrupted != nil && *histEv.WasInterrupted {
+						slog.Info("router: session was interrupted", "session_id", sessionID)
+					}
+				}
+				continue
+			}
+
+			// Dispatch to coalescer.
+			coal.HandleEvent(ev)
+
+			// Handle turn completion.
+			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
+				r.handleTurnEnd(ctx, sessionID, channelID, threadTS)
+			}
+		}
+	}
+}
+
+// handleTurnEnd drains the turn queue and either sends the next batch or marks idle.
+func (r *Router) handleTurnEnd(ctx context.Context, sessionID, channelID, threadTS string) {
+	// Remove 👀 reaction (best effort).
+	// We'd need the original message TS for this - skip for now.
+
+	// Drain queued turns.
+	turns, err := r.store.DrainTurns(channelID, threadTS)
+	if err != nil {
+		slog.Error("router: drain turns failed", "err", err)
+		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
+		return
+	}
+
+	if len(turns) == 0 {
+		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
+		return
+	}
+
+	// Concatenate queued messages.
+	var texts []string
+	for _, t := range turns {
+		texts = append(texts, t.Text)
+	}
+	combined := strings.Join(texts, "\n\n---\n\n")
+
+	// Send combined message to jcode.
+	if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
+		slog.Error("router: failed to send queued messages", "err", err)
+		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
+		return
+	}
+
+	r.store.UpdateSessionActivity(channelID, threadTS)
+	slog.Info("router: sent queued batch", "session_id", sessionID, "count", len(turns))
+}
+
+// ---------------------------------------------------------------------------
+// Webhook handling
+// ---------------------------------------------------------------------------
+
+func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
+	slog.Debug("router: webhook event", "source", evt.Source, "event_type", evt.EventType)
+
+	r.mu.RLock()
+	routes := r.routes
+	r.mu.RUnlock()
+
+	// Find matching route.
+	var matchedRoute *config.RouteConfig
+	for i := range routes {
+		if r.matchRoute(&routes[i], evt) {
+			matchedRoute = &routes[i]
+			break
 		}
 	}
 
-	slog.Debug("no route matched", "source", evt.Source)
+	if matchedRoute == nil {
+		// No matching route: post to fallback channel.
+		fallbackID := r.cfg.Ingest.FallbackChannelID
+		if fallbackID != "" {
+			text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
+				evt.Source, evt.EventType, truncateJSON(evt.Payload, 500))
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: fallbackID,
+				Action:    outbound.ActionPostMessage,
+				Text:      text,
+			})
+		}
+		return
+	}
+
+	destChannelID := matchedRoute.Destination.ChannelID
+	if destChannelID == "" {
+		slog.Warn("router: route has no destination channel_id", "source", evt.Source)
+		return
+	}
+
+	// Check for existing correlation.
+	correlationField := matchedRoute.Correlation.Field
+	if correlationField != "" {
+		externalKey := extractField(evt.Payload, correlationField)
+		if externalKey != "" {
+			corrs, err := r.store.LookupCorrelation(evt.Source, externalKey)
+			if err == nil && len(corrs) > 0 {
+				// Post to existing correlated thread.
+				corr := corrs[0]
+				text := r.formatWebhookMessage(evt)
+				r.outbound.Enqueue(&outbound.OutboundItem{
+					Priority:  3,
+					ChannelID: corr.ChannelID,
+					ThreadTS:  corr.ThreadTS,
+					Action:    outbound.ActionPostMessage,
+					Text:      text,
+				})
+				return
+			}
+		}
+	}
+
+	// No correlation: post to channel root (creates new thread).
+	text := r.formatWebhookMessage(evt)
+	r.outbound.Enqueue(&outbound.OutboundItem{
+		Priority:  3,
+		ChannelID: destChannelID,
+		Action:    outbound.ActionPostMessage,
+		Text:      text,
+		Username:  "Switchboard",
+	})
+
+	// TODO: capture the resulting thread_ts and create a correlation entry.
+	// This requires the outbound queue to support a callback on PostMessage success.
 }
 
-func (r *Router) matches(route config.RouteConfig, evt ingest.Event) bool {
+// matchRoute checks if a webhook event matches a route's criteria.
+func (r *Router) matchRoute(route *config.RouteConfig, evt *WebhookEvent) bool {
 	if route.Source != evt.Source {
 		return false
 	}
-	if route.Match.EventType != "" && route.Match.EventType != evt.EventType {
-		return false
+
+	for key, value := range route.Match {
+		actual := extractFieldString(evt.Payload, key)
+		if strings.HasSuffix(key, "_prefix") {
+			baseKey := strings.TrimSuffix(key, "_prefix")
+			actual = extractFieldString(evt.Payload, baseKey)
+			if !strings.HasPrefix(actual, value) {
+				return false
+			}
+		} else {
+			if actual != value {
+				return false
+			}
+		}
 	}
-	// TODO: implement more match criteria (repo, branch, etc.)
+
 	return true
+}
+
+// formatWebhookMessage renders a webhook event for Slack.
+func (r *Router) formatWebhookMessage(evt *WebhookEvent) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📨 *%s* — `%s`\n", evt.Source, evt.EventType))
+
+	// Extract useful summary fields depending on source.
+	switch evt.Source {
+	case "github":
+		if repo, ok := evt.Payload["repository"].(map[string]interface{}); ok {
+			if fullName, ok := repo["full_name"].(string); ok {
+				sb.WriteString(fmt.Sprintf("Repo: `%s`\n", fullName))
+			}
+		}
+		if action, ok := evt.Payload["action"].(string); ok {
+			sb.WriteString(fmt.Sprintf("Action: `%s`\n", action))
+		}
+	case "temporal":
+		if wfID, ok := evt.Payload["workflow_id"].(string); ok {
+			sb.WriteString(fmt.Sprintf("Workflow: `%s`\n", wfID))
+		}
+	default:
+		// Generic: show first few fields.
+		summary := truncateJSON(evt.Payload, 300)
+		if summary != "" {
+			sb.WriteString("```\n")
+			sb.WriteString(summary)
+			sb.WriteString("\n```\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// ---------------------------------------------------------------------------
+// Session recovery (bridge restart)
+// ---------------------------------------------------------------------------
+
+func (r *Router) recoverSessions(ctx context.Context) error {
+	sessions, err := r.store.ListActiveSessions()
+	if err != nil {
+		return err
+	}
+
+	slog.Info("router: recovering sessions", "count", len(sessions))
+
+	for _, sess := range sessions {
+		// Try to re-attach to the jcode session.
+		events, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession)
+		if err != nil {
+			slog.Warn("router: failed to recover session",
+				"session_id", sess.JcodeSession,
+				"err", err,
+			)
+			// Mark as idle; user will re-trigger on next message.
+			r.store.UpdateSessionStatus(sess.ChannelID, sess.ThreadTS, "idle")
+			continue
+		}
+
+		// Create coalescer.
+		_, identity := r.resolveChannel(sess.ChannelID)
+		coal := coalesce.NewSessionCoalescer(
+			sess.JcodeSession, sess.FriendlyName,
+			sess.ChannelID, sess.ThreadTS, sess.Workdir,
+			identity, r.outbound, r.handleImage,
+		)
+
+		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
+		r.mu.Lock()
+		r.coalescers[key] = coal
+		r.mu.Unlock()
+
+		// Start consuming events.
+		go r.consumeEvents(ctx, sess.JcodeSession, sess.ChannelID, sess.ThreadTS, events)
+
+		slog.Info("router: recovered session",
+			"session_id", sess.JcodeSession,
+			"channel", sess.ChannelID,
+		)
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// resolveChannel looks up the workdir and identity for a channel_id.
+func (r *Router) resolveChannel(channelID string) (string, coalesce.Identity) {
+	for _, ch := range r.cfg.Channels {
+		if ch.ID == channelID {
+			return ch.Workdir, coalesce.Identity{
+				DisplayName: ch.Identity,
+				IconURL:     ch.IconURL,
+			}
+		}
+	}
+
+	// Workspace fallback.
+	if r.cfg.Bridge.Routing.WorkspaceFallback {
+		name := r.edge.ChannelName(channelID)
+		if name != "" {
+			home, _ := filepath.Abs(filepath.Join("~/workspace", name))
+			return home, coalesce.Identity{DisplayName: name + " Worker"}
+		}
+	}
+
+	return "", coalesce.Identity{}
+}
+
+func (r *Router) postError(channelID, threadTS, msg string) {
+	r.outbound.Enqueue(&outbound.OutboundItem{
+		Priority:  1,
+		ChannelID: channelID,
+		ThreadTS:  threadTS,
+		Action:    outbound.ActionPostMessage,
+		Text:      "❌ " + msg,
+	})
+}
+
+func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
+	// TODO: read image from path, validate, upload via outbound queue.
+	slog.Info("router: image upload requested", "path", req.Path, "channel", req.ChannelID)
+}
+
+func (r *Router) closeAllCoalescers() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, coal := range r.coalescers {
+		coal.Close()
+		delete(r.coalescers, key)
+	}
+}
+
+func (r *Router) runMaintenance() {
+	cfg := store.MaintenanceConfig{
+		AuditRetentionDays:         r.cfg.Bridge.Audit.RetentionDays,
+		DoneWebhookRetentionDays:   7,
+		FailedWebhookRetentionDays: 30,
+		MaxCorrelationRows:         10000,
+	}
+	if cfg.AuditRetentionDays == 0 {
+		cfg.AuditRetentionDays = 30
+	}
+	if err := r.store.RunMaintenance(cfg); err != nil {
+		slog.Error("router: maintenance failed", "err", err)
+	}
+}
+
+func coalescerKey(channelID, threadTS string) string {
+	return channelID + ":" + threadTS
+}
+
+// extractField extracts a dotted path from a nested map.
+func extractField(payload map[string]interface{}, path string) string {
+	parts := strings.Split(path, ".")
+	current := payload
+
+	for i, part := range parts {
+		val, ok := current[part]
+		if !ok {
+			return ""
+		}
+		if i == len(parts)-1 {
+			if s, ok := val.(string); ok {
+				return s
+			}
+			if n, ok := val.(float64); ok {
+				return fmt.Sprintf("%.0f", n)
+			}
+			return fmt.Sprintf("%v", val)
+		}
+		next, ok := val.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		current = next
+	}
+	return ""
+}
+
+func extractFieldString(payload map[string]interface{}, key string) string {
+	return extractField(payload, key)
+}
+
+func truncateJSON(payload map[string]interface{}, maxLen int) string {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return ""
+	}
+	s := string(data)
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }

@@ -1,0 +1,103 @@
+# Switchboard Example Configuration
+# Copy to ~/.config/switchboard/config.toml and edit values.
+# Secrets can reference environment variables with ${VAR} syntax.
+
+[bridge]
+name = "switchboard"
+data_dir = "~/.local/share/switchboard"  # SQLite, audit logs
+
+[bridge.routing]
+# If true, channels without an explicit [[channels]] entry will use
+# ~/workspace/<channel-name> as the workdir if it exists.
+# Default off; opt in if you understand the rename/typo failure mode.
+workspace_fallback = false
+
+[bridge.audit]
+retention_days = 30
+verbose = false
+
+[bridge.files]
+max_inbound_mb = 25
+max_outbound_mb = 50
+
+[slack]
+app_token = "${SLACK_APP_TOKEN}"      # xapp-... (Socket Mode)
+bot_token = "${SLACK_BOT_TOKEN}"      # xoxb-...
+signing_secret = "${SLACK_SIGNING_SECRET}"
+
+[jcode]
+socket_path = ""  # empty = use $XDG_RUNTIME_DIR/jcode.sock (default)
+auto_spawn = true
+spawn_command = "jcode serve --quiet --no-update"
+
+# Bot identities (used via chat:write.customize scope)
+[identities.pm]
+display_name = "PM"
+icon_url = "https://example.com/pm.png"
+
+[identities.notifier]
+display_name = "Switchboard"
+icon_url = "https://example.com/switchboard.png"
+
+# Channels are keyed by Slack channel_id (immutable).
+# Get IDs via `slack conversations.list` or the Slack URL bar.
+# `name` is display-only and refreshed from Slack on startup.
+
+[[channels]]
+id = "C0123ABCDEF"
+name = "impex-scraper"
+workdir = "~/workspace/impex-scraper"
+identity = "Partseeker Worker"
+icon_url = "https://example.com/partseeker.png"
+
+[[channels]]
+id = "C0456GHIJKL"
+name = "slopwatch"
+workdir = "~/workspace/slopwatch"
+identity = "Slopwatch Worker"
+icon_url = "https://example.com/slopwatch.png"
+
+[ingest]
+listen_addr = "127.0.0.1:8765"  # behind Cloudflare Tunnel
+fallback_channel_id = "C0789MNOPQR"  # #notifications, by ID
+durable_inbox = true
+max_body_kb = 1024
+max_attempts = 5
+
+[ingest.sources.github]
+secret = "${GITHUB_WEBHOOK_SECRET}"
+signature_header = "X-Hub-Signature-256"
+
+[ingest.sources.temporal]
+secret = "${TEMPORAL_WEBHOOK_SECRET}"
+signature_header = "X-Switchboard-Signature"
+
+[ingest.sources.cron]
+secret = "${CRON_WEBHOOK_SECRET}"
+signature_header = "X-Switchboard-Signature"
+
+# Routing rules (v1: deterministic matching only)
+# Destination uses channel_id, not name.
+
+[[routes]]
+source = "github"
+template = "github_pr"
+[routes.match]
+event_type = "pull_request"
+repo = "format5/partseeker"
+[routes.destination]
+channel_id = "C0123ABCDEF"
+[routes.correlation]
+field = "pull_request.html_url"
+ttl_days = 7
+
+[[routes]]
+source = "temporal"
+template = "workflow_status"
+[routes.match]
+workflow_id_prefix = "slopwatch-eval-"
+[routes.destination]
+channel_id = "C0456GHIJKL"
+[routes.correlation]
+field = "workflow_id"
+ttl_days = 1

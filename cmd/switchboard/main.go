@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/ingest"
 	"github.com/format5/switchboard/internal/jcode"
+	"github.com/format5/switchboard/internal/outbound"
 	"github.com/format5/switchboard/internal/router"
 	"github.com/format5/switchboard/internal/slack"
 	"github.com/format5/switchboard/internal/store"
@@ -22,10 +24,14 @@ import (
 
 func main() {
 	configPath := flag.String("config", defaultConfigPath(), "path to config file")
+	debug := flag.Bool("debug", false, "enable debug logging (overrides SWITCHBOARD_LOG_LEVEL)")
 	flag.Parse()
 
 	// Set up structured JSON logging.
 	level := parseLogLevel(os.Getenv("SWITCHBOARD_LOG_LEVEL"))
+	if *debug {
+		level = slog.LevelDebug
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
@@ -37,7 +43,7 @@ func main() {
 	}
 	slog.Info("config loaded", "path", *configPath, "bridge_name", cfg.Bridge.Name)
 
-	// Initialize components in order.
+	// Initialize components in dependency order.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -49,7 +55,7 @@ func main() {
 	}
 	defer st.Close()
 
-	// 2. Jcode client
+	// 2. jcode client
 	jc, err := jcode.NewClient(cfg.Jcode.SocketPath, cfg.Jcode.AutoSpawn, cfg.Jcode.SpawnCommand)
 	if err != nil {
 		slog.Error("failed to initialize jcode client", "error", err)
@@ -58,28 +64,47 @@ func main() {
 	defer jc.Close()
 
 	// 3. Slack edge
-	se, err := slack.NewEdge(cfg.Slack, cfg.Channels, cfg.Identities)
+	edge, err := slack.NewEdge(cfg.Slack, cfg.Channels, cfg.Identities)
 	if err != nil {
 		slog.Error("failed to initialize slack edge", "error", err)
 		os.Exit(1)
 	}
+	edge.SetBotAllowlist(cfg.Bridge.BotAllowlist)
 
-	// 4. Ingest server
-	ing, err := ingest.NewServer(cfg.Ingest)
-	if err != nil {
-		slog.Error("failed to initialize ingest server", "error", err)
-		os.Exit(1)
-	}
+	// 4. Outbound queue (backed by Slack edge)
+	out := outbound.NewQueue(edge)
 
-	// 5. Router
-	rt := router.New(cfg.Routes, se, jc, st, ing)
+	// 5. Ingest server
+	ing := ingest.NewServer(cfg.Ingest, st)
+
+	// 6. Router (wires everything together)
+	rt := router.New(cfg, st, jc, edge, out)
+
+	// Wire ingest -> router.
+	ing.SetHandler(func(item *store.WebhookInboxItem) {
+		// Parse the webhook body and dispatch to router.
+		rt.EnqueueWebhook(webhookFromInbox(item))
+	})
 
 	// Start all components.
-	go se.Run(ctx)
-	go ing.Run(ctx)
-	go rt.Run(ctx)
+	go edge.Run(ctx)
+	go out.Run(ctx)
+	go func() {
+		if err := ing.Run(ctx); err != nil {
+			slog.Error("ingest server error", "error", err)
+		}
+	}()
+	go func() {
+		if err := rt.Run(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("router error", "error", err)
+		}
+	}()
 
-	slog.Info("switchboard started", "listen_addr", cfg.Ingest.ListenAddr)
+	slog.Info("switchboard started",
+		"listen_addr", cfg.Ingest.ListenAddr,
+		"channels", len(cfg.Channels),
+		"routes", len(cfg.Routes),
+	)
 
 	// Signal handling: SIGHUP for config reload, SIGINT/SIGTERM for shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -125,4 +150,27 @@ func parseLogLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// webhookFromInbox converts a persisted webhook inbox item to a router WebhookEvent.
+func webhookFromInbox(item *store.WebhookInboxItem) *router.WebhookEvent {
+	evt := &router.WebhookEvent{
+		Source:      item.Source,
+		RawBody:     item.BodyBlob,
+		Idempotency: item.IdempotencyKey,
+	}
+
+	// Try to parse body as JSON to extract event_type and payload.
+	var payload map[string]interface{}
+	if err := json.Unmarshal(item.BodyBlob, &payload); err == nil {
+		evt.Payload = payload
+		// Try to extract event_type from common fields.
+		if et, ok := payload["event_type"].(string); ok {
+			evt.EventType = et
+		} else if et, ok := payload["action"].(string); ok {
+			evt.EventType = et
+		}
+	}
+
+	return evt
 }
