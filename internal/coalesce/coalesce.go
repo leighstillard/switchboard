@@ -443,10 +443,10 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	workdirBase := filepath.Base(sc.workdir)
 	sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 
-	// Text content.
+	// Text content (convert standard Markdown → Slack mrkdwn).
 	text := sc.textBuffer.String()
 	if text != "" {
-		sb.WriteString(text)
+		sb.WriteString(MarkdownToMrkdwn(text))
 		sb.WriteString("\n")
 	}
 

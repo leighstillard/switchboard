@@ -229,9 +229,9 @@ func TestThreadContinuation(t *testing.T) {
 	t.Log("Thread continuation works! Both turns produced bot replies.")
 }
 
-// TestMrkdwnFormatting verifies Slack mrkdwn is used (not Markdown).
+// TestMrkdwnFormatting verifies Markdown→Slack mrkdwn conversion.
 func TestMrkdwnFormatting(t *testing.T) {
-	text := "Respond with the word BOLD wrapped in asterisks like *BOLD*. Only output that, nothing else."
+	text := "Respond with exactly this text and nothing else: **BOLD** and _ITALIC_"
 	t.Logf("Injecting formatting test: %s", text)
 	inject(t, channelID, "", "U_E2E_TESTER", text)
 
@@ -256,9 +256,11 @@ func TestMrkdwnFormatting(t *testing.T) {
 	}
 	t.Logf("Bot reply text: %s", botReply.Text)
 
-	// The header should use *bold* not **bold**
+	// After Markdown→mrkdwn conversion:
+	// **BOLD** should become *BOLD* (Slack bold)
+	// The header already uses *bold*, so no ** should remain in the output.
 	if strings.Contains(botReply.Text, "**") {
-		t.Errorf("Reply contains Markdown ** instead of Slack *bold*: %s", botReply.Text)
+		t.Errorf("Reply contains unconverted Markdown **: %s", botReply.Text)
 	}
 }
 
