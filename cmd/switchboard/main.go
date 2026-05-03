@@ -50,7 +50,7 @@ func main() {
 	defer st.Close()
 
 	// 2. Jcode client
-	jc, err := jcode.NewClient(cfg.Jcode)
+	jc, err := jcode.NewClient(cfg.Jcode.SocketPath, cfg.Jcode.AutoSpawn, cfg.Jcode.SpawnCommand)
 	if err != nil {
 		slog.Error("failed to initialize jcode client", "error", err)
 		os.Exit(1)
