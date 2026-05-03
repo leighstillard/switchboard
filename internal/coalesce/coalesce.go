@@ -363,9 +363,6 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 		placeholder := ""
 		sc.progressMessageTS = &placeholder
 
-		slog.Debug("coalescer: first flush, posting new message",
-			"session_id", sc.sessionID, "is_final", isFinal, "text_len", len(text),
-			"dirty", sc.dirty, "text_buf_len", sc.textBuffer.Len())
 		tsCh := make(chan string, 1)
 		item := &outbound.OutboundItem{
 			Priority:  3, // chat.postMessage
