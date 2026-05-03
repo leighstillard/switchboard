@@ -166,11 +166,18 @@ func (c *Client) Subscribe(ctx context.Context, workdir string) (string, <-chan 
 }
 
 // SubscribeExisting reconnects to an existing session by ID.
-func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID string) (<-chan *jcodeproto.ServerEvent, error) {
+// workdir is stored for deduplication (Subscribe reuses sessions with matching workdir).
+func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir string) (<-chan *jcodeproto.ServerEvent, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil, errors.New("jcode: client closed")
+	}
+	// Check if we already have this session connected.
+	if sc, ok := c.sessions[targetSessionID]; ok {
+		c.mu.Unlock()
+		slog.Info("jcode: reusing existing connection for session", "session_id", targetSessionID)
+		return sc.events, nil
 	}
 	c.mu.Unlock()
 
@@ -186,6 +193,7 @@ func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID string) 
 	sc := &sessionConn{
 		client:    c,
 		sessionID: targetSessionID,
+		workdir:   workdir,
 		conn:      conn,
 		reader:    bufio.NewReaderSize(conn, readerBufSize),
 		events:    make(chan *jcodeproto.ServerEvent, eventChanSize),

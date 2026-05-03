@@ -41,7 +41,7 @@ type Server struct {
 
 	// Test injection: when set, POST /test/inject routes a simulated
 	// Slack message through the router. Only enabled in debug mode.
-	testInjectHandler func(channelID, threadTS, userID, text string)
+	testInjectHandler func(channelID, threadTS, userID, text string) string
 
 	// Per-source rate limiters.
 	mu       sync.Mutex
@@ -81,7 +81,7 @@ func (s *Server) SetHandler(h WebhookHandler) {
 
 // SetTestInjectHandler registers a callback for the test injection endpoint.
 // This should only be called in debug mode.
-func (s *Server) SetTestInjectHandler(h func(channelID, threadTS, userID, text string)) {
+func (s *Server) SetTestInjectHandler(h func(channelID, threadTS, userID, text string) string) {
 	s.testInjectHandler = h
 }
 
@@ -249,10 +249,10 @@ func (s *Server) handleTestInject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Debug("ingest: test inject", "channel", req.ChannelID, "user", req.UserID, "text_len", len(req.Text))
-	s.testInjectHandler(req.ChannelID, req.ThreadTS, req.UserID, req.Text)
+	messageTS := s.testInjectHandler(req.ChannelID, req.ThreadTS, req.UserID, req.Text)
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"injected"}`))
+	json.NewEncoder(w).Encode(map[string]string{"status": "injected", "message_ts": messageTS})
 }
 
 // ---------------------------------------------------------------------------

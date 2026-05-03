@@ -48,6 +48,9 @@ type Router struct {
 	mu         sync.RWMutex
 	routes     []config.RouteConfig
 	coalescers map[string]*coalesce.SessionCoalescer // key: "channelID:threadTS"
+	// activeCoalescer maps jcode session ID to the coalescer that should
+	// receive events. Updated when a new thread is started on a reused session.
+	activeCoalescer map[string]string // jcodeSessionID -> coalescerKey
 
 	inboundCh chan *slack.InboundMessage
 	webhookCh chan *WebhookEvent
@@ -71,6 +74,7 @@ func New(
 		outbound:           out,
 		routes:             cfg.Routes,
 		coalescers:         make(map[string]*coalesce.SessionCoalescer),
+		activeCoalescer:    make(map[string]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
@@ -133,11 +137,12 @@ func (r *Router) EnqueueWebhook(evt *WebhookEvent) {
 
 // InjectMessage simulates an inbound Slack message for testing.
 // This bypasses the Slack edge entirely and injects directly into the router.
-func (r *Router) InjectMessage(channelID, threadTS, userID, text string) {
+func (r *Router) InjectMessage(channelID, threadTS, userID, text string) string {
+	ts := fmt.Sprintf("%d.%06d", time.Now().Unix(), time.Now().Nanosecond()/1000)
 	msg := &slack.InboundMessage{
 		ChannelID:  channelID,
 		ThreadTS:   threadTS,
-		MessageTS:  fmt.Sprintf("%d.%06d", time.Now().Unix(), time.Now().Nanosecond()/1000),
+		MessageTS:  ts,
 		UserID:     userID,
 		Text:       text,
 		IsTopLevel: threadTS == "",
@@ -147,6 +152,7 @@ func (r *Router) InjectMessage(channelID, threadTS, userID, text string) {
 	default:
 		slog.Warn("router: inject message dropped (channel full)")
 	}
+	return ts
 }
 
 // Reload updates the routing rules (called on SIGHUP).
@@ -256,6 +262,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	key := coalescerKey(msg.ChannelID, threadTS)
 	r.mu.Lock()
 	r.coalescers[key] = coal
+	r.activeCoalescer[sessionID] = key
 	r.mu.Unlock()
 
 	// Add 👀 reaction to acknowledge receipt.
@@ -273,7 +280,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Only start event consumer if this is a fresh session (not reused).
 	// Reused sessions already have an event consumer from recovery or first use.
 	if !isReused {
-		go r.consumeEvents(ctx, sessionID, msg.ChannelID, threadTS, events)
+		go r.consumeEvents(ctx, sessionID, events)
 	} else {
 		slog.Info("router: reusing existing jcode session", "session_id", sessionID, "new_thread", threadTS)
 	}
@@ -314,10 +321,8 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 		// Ensure we have a coalescer and event consumer for this session.
 		key := coalescerKey(msg.ChannelID, threadTS)
-		r.mu.RLock()
+		r.mu.Lock()
 		_, hasCoalescer := r.coalescers[key]
-		r.mu.RUnlock()
-
 		if !hasCoalescer {
 			// Re-create coalescer (e.g., after bridge restart).
 			_, identity := r.resolveChannel(msg.ChannelID)
@@ -326,10 +331,11 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				msg.ChannelID, threadTS, session.Workdir,
 				identity, r.outbound, r.handleImage,
 			)
-			r.mu.Lock()
 			r.coalescers[key] = coal
-			r.mu.Unlock()
 		}
+		// Point the event consumer at this coalescer.
+		r.activeCoalescer[session.JcodeSession] = key
+		r.mu.Unlock()
 	} else if session.Status == "processing" {
 		// Session is busy: enqueue the message.
 		count, _ := r.store.CountTurns(msg.ChannelID, threadTS)
@@ -413,9 +419,7 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 // ---------------------------------------------------------------------------
 
 // consumeEvents reads from a jcode session event channel and dispatches to coalescer.
-func (r *Router) consumeEvents(ctx context.Context, sessionID, channelID, threadTS string, events <-chan *jcodeproto.ServerEvent) {
-	key := coalescerKey(channelID, threadTS)
-
+func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-chan *jcodeproto.ServerEvent) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -424,11 +428,12 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID, channelID, thread
 			if !ok {
 				// Channel closed (session disconnected).
 				slog.Info("router: event channel closed", "session_id", sessionID)
-				r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 				return
 			}
 
+			// Look up the active coalescer for this jcode session.
 			r.mu.RLock()
+			key := r.activeCoalescer[sessionID]
 			coal := r.coalescers[key]
 			r.mu.RUnlock()
 
@@ -442,7 +447,6 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID, channelID, thread
 				var sessEv jcodeproto.SessionEvent
 				if json.Unmarshal(ev.Raw, &sessEv) == nil {
 					coal.SetFriendlyName(sessEv.SessionID)
-					r.store.SetSessionFriendlyName(channelID, threadTS, sessEv.SessionID)
 				}
 				continue
 			}
@@ -463,16 +467,20 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID, channelID, thread
 
 			// Handle turn completion.
 			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
-				r.handleTurnEnd(ctx, sessionID, channelID, threadTS)
+				r.handleTurnEnd(ctx, sessionID, key)
 			}
 		}
 	}
 }
 
 // handleTurnEnd drains the turn queue and either sends the next batch or marks idle.
-func (r *Router) handleTurnEnd(ctx context.Context, sessionID, channelID, threadTS string) {
-	// Remove 👀 reaction (best effort).
-	// We'd need the original message TS for this - skip for now.
+func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
+	// Parse channelID and threadTS from the coalescer key.
+	channelID, threadTS := parseCoalescerKey(coalKey)
+	if channelID == "" {
+		slog.Error("router: invalid coalescer key in handleTurnEnd", "key", coalKey)
+		return
+	}
 
 	// Drain queued turns.
 	turns, err := r.store.DrainTurns(channelID, threadTS)
@@ -652,9 +660,12 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 
 	slog.Info("router: recovering sessions", "count", len(sessions))
 
+	// Track which jcode sessions we've already started consumers for.
+	startedConsumers := make(map[string]bool)
+
 	for _, sess := range sessions {
 		// Try to re-attach to the jcode session.
-		events, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession)
+		events, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
 		if err != nil {
 			slog.Warn("router: failed to recover session",
 				"session_id", sess.JcodeSession,
@@ -676,10 +687,17 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
 		r.coalescers[key] = coal
+		r.activeCoalescer[sess.JcodeSession] = key
 		r.mu.Unlock()
 
-		// Start consuming events.
-		go r.consumeEvents(ctx, sess.JcodeSession, sess.ChannelID, sess.ThreadTS, events)
+		// Start consuming events (only one consumer per jcode session).
+		if !startedConsumers[sess.JcodeSession] {
+			startedConsumers[sess.JcodeSession] = true
+			go r.consumeEvents(ctx, sess.JcodeSession, events)
+		}
+
+		// Mark session as idle (will be activated on next user message).
+		r.store.UpdateSessionStatus(sess.ChannelID, sess.ThreadTS, "idle")
 
 		slog.Info("router: recovered session",
 			"session_id", sess.JcodeSession,
@@ -760,6 +778,13 @@ func coalescerKey(channelID, threadTS string) string {
 	return channelID + ":" + threadTS
 }
 
+func parseCoalescerKey(key string) (channelID, threadTS string) {
+	parts := strings.SplitN(key, ":", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
 // extractField extracts a dotted path from a nested map.
 func extractField(payload map[string]interface{}, path string) string {
 	parts := strings.Split(path, ".")

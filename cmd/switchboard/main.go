@@ -88,8 +88,8 @@ func main() {
 
 	// Enable test injection in debug mode.
 	if *debug {
-		ing.SetTestInjectHandler(func(channelID, threadTS, userID, text string) {
-			rt.InjectMessage(channelID, threadTS, userID, text)
+		ing.SetTestInjectHandler(func(channelID, threadTS, userID, text string) string {
+			return rt.InjectMessage(channelID, threadTS, userID, text)
 		})
 	}
 
