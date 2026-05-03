@@ -343,6 +343,14 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 		return
 	}
 
+	// Don't create a new Slack message if there's no meaningful content.
+	// This avoids posting header-only messages during recovery when a
+	// stale "done" event arrives for a turn that already completed.
+	if sc.progressMessageTS == nil && sc.textBuffer.Len() == 0 && len(sc.pendingTools) == 0 && len(sc.completedTools) == 0 {
+		sc.dirty = false
+		return
+	}
+
 	priority := 2 // chat.update
 	if isFinal {
 		priority = 1 // terminal flush
@@ -350,8 +358,14 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 
 	if sc.progressMessageTS == nil {
 		// First flush: PostMessage to create the progress message.
-		// Post synchronously via OnPosted callback to capture TS before
-		// any subsequent flushes try to update.
+		// Mark as "awaiting TS" immediately to prevent concurrent flushes
+		// (e.g. timer goroutine) from also posting while we wait.
+		placeholder := ""
+		sc.progressMessageTS = &placeholder
+
+		slog.Debug("coalescer: first flush, posting new message",
+			"session_id", sc.sessionID, "is_final", isFinal, "text_len", len(text),
+			"dirty", sc.dirty, "text_buf_len", sc.textBuffer.Len())
 		tsCh := make(chan string, 1)
 		item := &outbound.OutboundItem{
 			Priority:  3, // chat.postMessage
@@ -388,6 +402,8 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 		}
 		sc.outbound.Enqueue(item)
 	}
+	// else: progressMessageTS is placeholder ("") — still waiting for initial
+	// PostMessage TS. Skip this flush; the pending post will include latest content.
 
 	sc.dirty = false
 	sc.lastFlush = time.Now()
