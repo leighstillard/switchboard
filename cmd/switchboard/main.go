@@ -86,6 +86,13 @@ func main() {
 		rt.EnqueueWebhook(webhookFromInbox(item))
 	})
 
+	// Enable test injection in debug mode.
+	if *debug {
+		ing.SetTestInjectHandler(func(channelID, threadTS, userID, text string) {
+			rt.InjectMessage(channelID, threadTS, userID, text)
+		})
+	}
+
 	// Start all components.
 	go edge.Run(ctx)
 	go out.Run(ctx)

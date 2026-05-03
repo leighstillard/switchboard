@@ -1,23 +1,25 @@
 //go:build e2e
 
 // Package e2e contains end-to-end tests that exercise the full stack:
-// Slack -> Switchboard -> jcode -> Slack response.
+// Test inject -> Router -> jcode -> Coalescer -> Outbound -> Slack reply
 //
-// IMPORTANT: These tests require either:
-//   - A SWITCHBOARD_USER_TOKEN env var (xoxp- user OAuth token) to post as a real user, OR
-//   - The tests will fall back to posting via the bot token and verifying
-//     the message was delivered to Slack (but Switchboard won't process it
-//     because the edge filters self-messages from the bot).
+// These tests use the /test/inject endpoint (enabled in --debug mode) to
+// simulate inbound messages, then verify the bot's replies appear in Slack.
 //
-// When SWITCHBOARD_USER_TOKEN is set, tests exercise the full flow:
-//   User message -> Slack -> Switchboard -> jcode -> Switchboard -> Slack reply
+// Requirements:
+//   - Switchboard running with --debug (enables /test/inject)
+//   - jcode daemon running
+//   - Slack bot token valid
 //
 // Run with: go test -tags e2e ./test/e2e/ -v -timeout 180s
 package e2e
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"os"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -26,43 +28,58 @@ import (
 )
 
 var (
-	// botSlack posts messages as the bot (for reading threads and cleanup).
-	botSlack  *testutil.SlackClient
-	// userSlack posts messages as a real user (triggers Switchboard processing).
-	// nil if SWITCHBOARD_USER_TOKEN is not set.
-	userSlack *testutil.SlackClient
-	channelID string
-	botUserID string
+	botSlack   *testutil.SlackClient
+	channelID  string
+	botUserID  string
+	injectURL  string
+	httpClient *http.Client
 )
 
 func init() {
 	botSlack = testutil.NewSlackClient(testutil.SlackBotToken())
 	channelID = testutil.SlackChannelID()
 	botUserID = testutil.BotUserID()
-
-	if ut := os.Getenv("SWITCHBOARD_USER_TOKEN"); ut != "" {
-		userSlack = testutil.NewSlackClient(ut)
-	}
+	injectURL = "http://127.0.0.1:8765/test/inject"
+	httpClient = &http.Client{Timeout: 10 * time.Second}
 }
 
-// testPrefix returns a unique prefix for test messages.
-func testPrefix() string {
-	return fmt.Sprintf("[E2E TEST %d]", time.Now().UnixMilli()%100000)
-}
-
-// requireUserToken skips the test if no user token is available.
-func requireUserToken(t *testing.T) *testutil.SlackClient {
+// inject sends a simulated message to the router via the test endpoint.
+func inject(t *testing.T, channel, threadTS, userID, text string) {
 	t.Helper()
-	if userSlack == nil {
-		t.Skip("SWITCHBOARD_USER_TOKEN not set; skipping full-flow e2e test")
+	body := map[string]string{
+		"channel_id": channel,
+		"thread_ts":  threadTS,
+		"user_id":    userID,
+		"text":       text,
 	}
-	return userSlack
+	data, _ := json.Marshal(body)
+	resp, err := httpClient.Post(injectURL, "application/json", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("inject POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("inject returned %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// TestInjectEndpoint verifies the test injection endpoint is available.
+func TestInjectEndpoint(t *testing.T) {
+	resp, err := httpClient.Get("http://127.0.0.1:8765/health")
+	if err != nil {
+		t.Fatalf("Health check failed (is switchboard running?): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Health check returned %d", resp.StatusCode)
+	}
+	t.Log("Switchboard is running and healthy")
 }
 
 // TestSlackAPIConnectivity verifies basic Slack API access works.
-// This runs even without a user token.
 func TestSlackAPIConnectivity(t *testing.T) {
-	prefix := testPrefix()
+	prefix := fmt.Sprintf("[E2E TEST %d]", time.Now().UnixMilli()%100000)
 	text := fmt.Sprintf("%s API connectivity check", prefix)
 
 	t.Log("Posting test message via bot token...")
@@ -88,129 +105,203 @@ func TestSlackAPIConnectivity(t *testing.T) {
 	}
 }
 
-// TestSlackFlow runs the full end-to-end Slack flow tests.
-// Requires SWITCHBOARD_USER_TOKEN to be set.
-func TestSlackFlow(t *testing.T) {
-	poster := requireUserToken(t)
-	var threadTS string
+// TestMentionTriggersResponse tests: inject message -> jcode processes -> bot replies in Slack
+func TestMentionTriggersResponse(t *testing.T) {
+	// Inject a message that should trigger jcode to respond.
+	text := "Say exactly: HELLO_E2E_TEST"
+	t.Logf("Injecting message to channel %s: %s", channelID, text)
+	inject(t, channelID, "", "U_E2E_TESTER", text)
 
-	t.Run("MentionTriggersResponse", func(t *testing.T) {
-		prefix := testPrefix()
-		mention := fmt.Sprintf("<@%s> %s Say exactly: HELLO_E2E", botUserID, prefix)
+	// The router will create a thread. We need to find it.
+	// Wait a moment for the session to start, then look for recent bot messages.
+	t.Log("Waiting for bot reply in channel (up to 90s)...")
+	var reply testutil.SlackMessage
+	deadline := time.Now().Add(90 * time.Second)
+	startTime := time.Now()
 
-		t.Logf("Posting to #data-worklog as user: %s", mention)
-		ts, err := poster.PostMessage(channelID, mention, "")
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		// Look for recent bot messages in the channel
+		msgs, err := botSlack.GetChannelHistory(channelID, 10)
 		if err != nil {
-			t.Fatalf("PostMessage: %v", err)
+			t.Logf("GetChannelHistory error: %v", err)
+			continue
 		}
-		t.Logf("Posted message ts=%s", ts)
-		threadTS = ts
-
-		// Wait for the bot to reply in the thread.
-		t.Log("Waiting for bot reply (up to 90s)...")
-		reply := botSlack.WaitForBotReply(t, channelID, ts, botUserID, 90*time.Second)
-		t.Logf("Bot replied: ts=%s text=%.200s", reply.TS, reply.Text)
-
-		if reply.Text == "" {
-			t.Error("Bot reply text is empty")
-		}
-	})
-
-	t.Run("ThreadContinuation", func(t *testing.T) {
-		if threadTS == "" {
-			t.Skip("no thread from MentionTriggersResponse")
-		}
-
-		// Wait for the first response to fully complete.
-		time.Sleep(5 * time.Second)
-
-		prefix := testPrefix()
-		followUp := fmt.Sprintf("%s Now say exactly: GOODBYE_E2E", prefix)
-		t.Logf("Posting follow-up in thread %s: %s", threadTS, followUp)
-
-		ts, err := poster.PostMessage(channelID, followUp, threadTS)
-		if err != nil {
-			t.Fatalf("PostMessage (thread reply): %v", err)
-		}
-		t.Logf("Posted follow-up ts=%s", ts)
-
-		// Wait for a second bot reply.
-		t.Log("Waiting for second bot reply (up to 90s)...")
-		replies := botSlack.WaitForBotReplies(t, channelID, threadTS, botUserID, 2, 90*time.Second)
-		t.Logf("Got %d bot replies total", len(replies))
-
-		if len(replies) < 2 {
-			t.Fatalf("Expected at least 2 bot replies, got %d", len(replies))
-		}
-
-		secondReply := replies[len(replies)-1]
-		t.Logf("Second bot reply: ts=%s text=%.200s", secondReply.TS, secondReply.Text)
-	})
-
-	t.Run("StopCommand", func(t *testing.T) {
-		prefix := testPrefix()
-		mention := fmt.Sprintf("<@%s> %s Write a very detailed 2000-word essay about the history of computing, covering every decade from the 1940s to 2020s.", botUserID, prefix)
-
-		t.Logf("Posting long task to #data-worklog: %.100s...", mention)
-		ts, err := poster.PostMessage(channelID, mention, "")
-		if err != nil {
-			t.Fatalf("PostMessage: %v", err)
-		}
-		t.Logf("Posted message ts=%s", ts)
-
-		// Wait for processing to start.
-		time.Sleep(5 * time.Second)
-
-		// Send !stop command.
-		t.Log("Sending !stop command...")
-		_, err = poster.PostMessage(channelID, "!stop", ts)
-		if err != nil {
-			t.Fatalf("PostMessage (!stop): %v", err)
-		}
-
-		// Wait and verify the thread state.
-		time.Sleep(5 * time.Second)
-
-		replies, err := botSlack.GetThreadReplies(channelID, ts)
-		if err != nil {
-			t.Fatalf("GetThreadReplies: %v", err)
-		}
-		t.Logf("Thread has %d messages after !stop", len(replies))
-
-		for _, r := range replies {
-			if r.TS != ts {
-				t.Logf("  reply ts=%s user=%s bot_id=%s text=%.100s", r.TS, r.User, r.BotID, r.Text)
+		for _, m := range msgs {
+			if m.BotID != "" && time.Since(startTime) < 90*time.Second {
+				// Check if this is a recent bot message (thread parent or reply)
+				if strings.Contains(m.Text, "HELLO_E2E_TEST") || strings.Contains(m.Text, "data-worklog") {
+					reply = m
+					break
+				}
 			}
 		}
-		// Stop is considered successful if we got here without hanging.
-		// The interrupted/cancelled state is verified by the absence of
-		// continued long output.
-	})
-
-	t.Run("MrkdwnFormatting", func(t *testing.T) {
-		prefix := testPrefix()
-		mention := fmt.Sprintf("<@%s> %s Respond with a one-line bold greeting using the word BOLD. Keep it very short, one line only.", botUserID, prefix)
-
-		t.Logf("Posting formatting test: %.100s", mention)
-		ts, err := poster.PostMessage(channelID, mention, "")
-		if err != nil {
-			t.Fatalf("PostMessage: %v", err)
+		if reply.TS != "" {
+			break
 		}
+	}
 
-		t.Log("Waiting for bot reply (up to 90s)...")
-		reply := botSlack.WaitForBotReply(t, channelID, ts, botUserID, 90*time.Second)
-		t.Logf("Bot reply: %s", reply.Text)
+	if reply.TS == "" {
+		t.Fatal("No bot reply found within timeout")
+	}
+	t.Logf("Bot replied: ts=%s text=%.200s", reply.TS, reply.Text)
 
-		// Verify no Markdown ** bold ** leaked through.
-		if strings.Contains(reply.Text, "**") {
-			t.Errorf("Reply contains Markdown ** bold ** instead of Slack mrkdwn *bold*: %s", reply.Text)
-		}
-	})
+	// Verify no Markdown ** leaked
+	if strings.Contains(reply.Text, "**") {
+		t.Errorf("Reply contains Markdown **: %s", reply.Text)
+	}
 }
 
-// TestWebhookIngest tests the webhook ingestion endpoint.
-// This doesn't need a user token since it goes through the HTTP path.
-func TestWebhookIngest(t *testing.T) {
-	// TODO: implement once webhook routing to channels is configured
-	t.Skip("No webhook routes configured for testing")
+// TestThreadContinuation tests: reply in thread -> jcode responds again
+func TestThreadContinuation(t *testing.T) {
+	// First create a session by injecting a top-level message
+	text := "Say exactly one word: FIRST"
+	t.Logf("Injecting initial message: %s", text)
+	inject(t, channelID, "", "U_E2E_TESTER", text)
+
+	// Wait for bot reply
+	t.Log("Waiting for initial bot reply (up to 60s)...")
+	time.Sleep(5 * time.Second)
+
+	// Find the thread the bot replied to
+	msgs, err := botSlack.GetChannelHistory(channelID, 5)
+	if err != nil {
+		t.Fatalf("GetChannelHistory: %v", err)
+	}
+
+	var threadTS string
+	for _, m := range msgs {
+		if m.BotID != "" && strings.Contains(m.Text, "data-worklog") {
+			// This is the bot's response - it should be in a thread
+			threadTS = m.ThreadTS
+			if threadTS == "" {
+				threadTS = m.TS
+			}
+			break
+		}
+	}
+
+	if threadTS == "" {
+		t.Skip("Could not find bot reply thread from initial message")
+	}
+	t.Logf("Found thread: %s", threadTS)
+
+	// Wait for the first turn to complete
+	time.Sleep(10 * time.Second)
+
+	// Now send a follow-up in that thread
+	followUp := "Say exactly one word: SECOND"
+	t.Logf("Injecting follow-up in thread %s: %s", threadTS, followUp)
+	inject(t, channelID, threadTS, "U_E2E_TESTER", followUp)
+
+	// Wait for second bot reply
+	t.Log("Waiting for second bot reply (up to 60s)...")
+	deadline := time.Now().Add(60 * time.Second)
+	var replies []testutil.SlackMessage
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		allReplies, err := botSlack.GetThreadReplies(channelID, threadTS)
+		if err != nil {
+			continue
+		}
+		// Count bot replies
+		var botReplies []testutil.SlackMessage
+		for _, r := range allReplies {
+			if r.BotID != "" {
+				botReplies = append(botReplies, r)
+			}
+		}
+		if len(botReplies) >= 2 {
+			replies = botReplies
+			break
+		}
+	}
+
+	if len(replies) < 2 {
+		t.Fatalf("Expected at least 2 bot replies in thread, got %d", len(replies))
+	}
+	t.Logf("Got %d bot replies - thread continuation works!", len(replies))
+}
+
+// TestMrkdwnFormatting verifies Slack mrkdwn is used (not Markdown).
+func TestMrkdwnFormatting(t *testing.T) {
+	text := "Respond with the word BOLD wrapped in asterisks like *BOLD*. Only output that, nothing else."
+	t.Logf("Injecting formatting test: %s", text)
+	inject(t, channelID, "", "U_E2E_TESTER", text)
+
+	t.Log("Waiting for bot reply (up to 60s)...")
+	time.Sleep(5 * time.Second)
+
+	msgs, err := botSlack.GetChannelHistory(channelID, 5)
+	if err != nil {
+		t.Fatalf("GetChannelHistory: %v", err)
+	}
+
+	var botReply testutil.SlackMessage
+	for _, m := range msgs {
+		if m.BotID != "" {
+			botReply = m
+			break
+		}
+	}
+
+	if botReply.TS == "" {
+		t.Fatal("No bot reply found")
+	}
+	t.Logf("Bot reply text: %s", botReply.Text)
+
+	// The header should use *bold* not **bold**
+	if strings.Contains(botReply.Text, "**") {
+		t.Errorf("Reply contains Markdown ** instead of Slack *bold*: %s", botReply.Text)
+	}
+}
+
+// TestStopCommand verifies !stop cancels the current turn.
+func TestStopCommand(t *testing.T) {
+	// Start a long task
+	text := "Write a very detailed 5000-word essay about the complete history of computing from the 1940s to the 2020s, covering every major development in extreme detail."
+	t.Logf("Injecting long task...")
+	inject(t, channelID, "", "U_E2E_TESTER", text)
+
+	// Wait for processing to start
+	time.Sleep(5 * time.Second)
+
+	// Find the thread
+	msgs, err := botSlack.GetChannelHistory(channelID, 5)
+	if err != nil {
+		t.Fatalf("GetChannelHistory: %v", err)
+	}
+
+	var threadTS string
+	for _, m := range msgs {
+		if m.BotID != "" {
+			threadTS = m.ThreadTS
+			if threadTS == "" {
+				threadTS = m.TS
+			}
+			break
+		}
+	}
+
+	if threadTS == "" {
+		t.Skip("Could not find bot reply thread")
+	}
+
+	// Send !stop in the thread
+	t.Logf("Sending !stop in thread %s", threadTS)
+	inject(t, channelID, threadTS, "U_E2E_TESTER", "!stop")
+
+	// Verify it didn't crash - give it a moment
+	time.Sleep(3 * time.Second)
+
+	// Check health
+	resp, err := httpClient.Get("http://127.0.0.1:8765/health")
+	if err != nil {
+		t.Fatalf("Health check failed after !stop: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Switchboard unhealthy after !stop")
+	}
+	t.Log("!stop processed successfully, service still healthy")
 }

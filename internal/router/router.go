@@ -131,6 +131,24 @@ func (r *Router) EnqueueWebhook(evt *WebhookEvent) {
 	}
 }
 
+// InjectMessage simulates an inbound Slack message for testing.
+// This bypasses the Slack edge entirely and injects directly into the router.
+func (r *Router) InjectMessage(channelID, threadTS, userID, text string) {
+	msg := &slack.InboundMessage{
+		ChannelID:  channelID,
+		ThreadTS:   threadTS,
+		MessageTS:  fmt.Sprintf("%d.%06d", time.Now().Unix(), time.Now().Nanosecond()/1000),
+		UserID:     userID,
+		Text:       text,
+		IsTopLevel: threadTS == "",
+	}
+	select {
+	case r.inboundCh <- msg:
+	default:
+		slog.Warn("router: inject message dropped (channel full)")
+	}
+}
+
 // Reload updates the routing rules (called on SIGHUP).
 func (r *Router) Reload(routes []config.RouteConfig) {
 	r.mu.Lock()
@@ -200,13 +218,17 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		"workdir", workdir,
 	)
 
-	// Subscribe to a new jcode session.
+	// Subscribe to a new jcode session (may reuse existing for same workdir).
 	sessionID, events, err := r.jcode.Subscribe(ctx, workdir)
 	if err != nil {
 		slog.Error("router: failed to subscribe to jcode", "err", err, "workdir", workdir)
 		r.postError(msg.ChannelID, threadTS, "Failed to start agent session: "+err.Error())
 		return
 	}
+
+	// Check if this session already has a consumer running (reused workdir).
+	existingSession, _ := r.store.GetSessionByJcodeID(sessionID)
+	isReused := existingSession != nil
 
 	// Persist session.
 	now := time.Now().Unix()
@@ -225,9 +247,10 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		slog.Error("router: failed to persist session", "err", err)
 	}
 
-	// Create coalescer.
+	// Create coalescer for this thread.
+	friendlyName := extractFriendlyName(sessionID)
 	coal := coalesce.NewSessionCoalescer(
-		sessionID, "", msg.ChannelID, threadTS, workdir,
+		sessionID, friendlyName, msg.ChannelID, threadTS, workdir,
 		identity, r.outbound, r.handleImage,
 	)
 	key := coalescerKey(msg.ChannelID, threadTS)
@@ -247,8 +270,13 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		return
 	}
 
-	// Start consuming events.
-	go r.consumeEvents(ctx, sessionID, msg.ChannelID, threadTS, events)
+	// Only start event consumer if this is a fresh session (not reused).
+	// Reused sessions already have an event consumer from recovery or first use.
+	if !isReused {
+		go r.consumeEvents(ctx, sessionID, msg.ChannelID, threadTS, events)
+	} else {
+		slog.Info("router: reusing existing jcode session", "session_id", sessionID, "new_thread", threadTS)
+	}
 }
 
 // handleContinuation routes a message to an existing session.
@@ -774,4 +802,14 @@ func truncateJSON(payload map[string]interface{}, maxLen int) string {
 		return s[:maxLen] + "..."
 	}
 	return s
+}
+
+// extractFriendlyName extracts the animal name from a jcode session ID.
+// Session IDs follow the pattern: session_<animal>_<timestamp>_<hash>
+func extractFriendlyName(sessionID string) string {
+	parts := strings.SplitN(sessionID, "_", 4)
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return ""
 }

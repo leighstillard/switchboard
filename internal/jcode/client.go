@@ -99,11 +99,22 @@ func defaultSocketPath() string {
 // session ID and a channel that will receive all events for that session.
 // The channel is closed when the session disconnects permanently or the client
 // is closed.
+//
+// If the workdir already has an active session in the daemon, Subscribe returns
+// the existing session (jcode won't create duplicates for the same workdir).
 func (c *Client) Subscribe(ctx context.Context, workdir string) (string, <-chan *jcodeproto.ServerEvent, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return "", nil, errors.New("jcode: client closed")
+	}
+	// Check if we already have a session for this workdir.
+	for _, sc := range c.sessions {
+		if sc.workdir == workdir {
+			c.mu.Unlock()
+			slog.Info("jcode: reusing existing session for workdir", "session_id", sc.sessionID, "workdir", workdir)
+			return sc.sessionID, sc.events, nil
+		}
 	}
 	c.mu.Unlock()
 
@@ -464,6 +475,8 @@ func (sc *sessionConn) waitForSession(ctx context.Context) (string, error) {
 			slog.Warn("jcode: parse error during session wait", "err", err)
 			continue
 		}
+
+		slog.Debug("jcode: waitForSession event", "type", evType, "raw_len", len(raw))
 
 		switch evType {
 		case jcodeproto.EventSwarmStatus:

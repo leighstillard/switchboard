@@ -154,6 +154,27 @@ func (c *SlackClient) DeleteMessage(channel, ts string) error {
 	return nil
 }
 
+// GetChannelHistory fetches the most recent messages from a channel.
+func (c *SlackClient) GetChannelHistory(channel string, limit int) ([]SlackMessage, error) {
+	params := url.Values{
+		"channel": {channel},
+		"limit":   {fmt.Sprintf("%d", limit)},
+	}
+
+	var resp struct {
+		OK       bool           `json:"ok"`
+		Error    string         `json:"error"`
+		Messages []SlackMessage `json:"messages"`
+	}
+	if err := c.apiCall("conversations.history", params, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("slack: conversations.history: %s", resp.Error)
+	}
+	return resp.Messages, nil
+}
+
 func (c *SlackClient) apiCall(method string, params url.Values, result interface{}) error {
 	req, err := http.NewRequest("POST", c.BaseURL+"/"+method, strings.NewReader(params.Encode()))
 	if err != nil {

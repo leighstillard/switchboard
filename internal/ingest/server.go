@@ -9,6 +9,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,6 +39,10 @@ type Server struct {
 	srv      *http.Server
 	listener net.Listener
 
+	// Test injection: when set, POST /test/inject routes a simulated
+	// Slack message through the router. Only enabled in debug mode.
+	testInjectHandler func(channelID, threadTS, userID, text string)
+
 	// Per-source rate limiters.
 	mu       sync.Mutex
 	limiters map[string]*rateLimiter
@@ -57,6 +62,7 @@ func NewServer(cfg config.IngestConfig, st *store.Store) *Server {
 	mux.HandleFunc("/webhook/cron", s.handleWebhook("cron"))
 	mux.HandleFunc("/webhook/generic", s.handleWebhookGeneric)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/test/inject", s.handleTestInject)
 
 	s.srv = &http.Server{
 		Handler:      mux,
@@ -71,6 +77,12 @@ func NewServer(cfg config.IngestConfig, st *store.Store) *Server {
 // SetHandler registers the callback for processed webhooks.
 func (s *Server) SetHandler(h WebhookHandler) {
 	s.handler = h
+}
+
+// SetTestInjectHandler registers a callback for the test injection endpoint.
+// This should only be called in debug mode.
+func (s *Server) SetTestInjectHandler(h func(channelID, threadTS, userID, text string)) {
+	s.testInjectHandler = h
 }
 
 // Run starts the HTTP server and webhook worker. Blocks until ctx is cancelled.
@@ -203,6 +215,44 @@ func (s *Server) handleWebhookGeneric(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleTestInject accepts simulated Slack messages for e2e testing.
+// POST /test/inject with JSON body: {"channel_id", "thread_ts", "user_id", "text"}
+// Only works when SetTestInjectHandler has been called (debug mode).
+func (s *Server) handleTestInject(w http.ResponseWriter, r *http.Request) {
+	if s.testInjectHandler == nil {
+		http.Error(w, "test injection not enabled (start with --debug)", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ChannelID string `json:"channel_id"`
+		ThreadTS  string `json:"thread_ts"`
+		UserID    string `json:"user_id"`
+		Text      string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ChannelID == "" || req.Text == "" {
+		http.Error(w, "channel_id and text are required", http.StatusBadRequest)
+		return
+	}
+	if req.UserID == "" {
+		req.UserID = "U_E2E_TEST"
+	}
+
+	slog.Debug("ingest: test inject", "channel", req.ChannelID, "user", req.UserID, "text_len", len(req.Text))
+	s.testInjectHandler(req.ChannelID, req.ThreadTS, req.UserID, req.Text)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"injected"}`))
 }
 
 // ---------------------------------------------------------------------------
