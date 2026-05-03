@@ -480,6 +480,17 @@ func (sc *sessionConn) waitForSession(ctx context.Context) (string, error) {
 				)
 			}
 
+		case jcodeproto.EventHistory:
+			// Resume flow: history event contains the session_id.
+			// Only extract session_id (the event can be very large).
+			var partial struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal(raw, &partial); err == nil && partial.SessionID != "" {
+				sessionID = partial.SessionID
+				slog.Debug("jcode: got session from history event", "session_id", sessionID)
+			}
+
 		case jcodeproto.EventSession:
 			// Legacy path: some versions may still emit "session" events.
 			var sessEv jcodeproto.SessionEvent

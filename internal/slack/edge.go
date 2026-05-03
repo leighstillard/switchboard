@@ -252,11 +252,10 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 		return
 	}
 
-	// Top-level in channel: only process if @mentions our bot.
+	// Top-level in channel: let app_mention handler deal with these.
+	// This avoids double-dispatching when both message and app_mention events fire.
 	if !isDM && isTopLevel {
-		if !e.textMentionsBot(ev.Text) {
-			return
-		}
+		return
 	}
 
 	// Reply in owned thread: always process (no mention needed).

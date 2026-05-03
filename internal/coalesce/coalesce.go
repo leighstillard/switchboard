@@ -253,21 +253,25 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventDone:
 		sc.finalized = true
 		sc.flushLocked(true)
+		// Reset state for the next turn (same session, new response).
+		sc.resetForNextTurn()
 
 	case jcodeproto.EventError:
 		var e jcodeproto.ErrorEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.textBuffer.WriteString(fmt.Sprintf("\n\n❌ **Error:** %s", e.Message))
+			sc.textBuffer.WriteString(fmt.Sprintf("\n\n❌ *Error:* %s", e.Message))
 			sc.dirty = true
 		}
 		sc.finalized = true
 		sc.flushLocked(true)
+		sc.resetForNextTurn()
 
 	case jcodeproto.EventInterrupted:
 		sc.textBuffer.WriteString("\n\n⚠️ _Agent interrupted_")
 		sc.dirty = true
 		sc.finalized = true
 		sc.flushLocked(true)
+		sc.resetForNextTurn()
 
 	case jcodeproto.EventNotification:
 		var e jcodeproto.NotificationEvent
@@ -287,6 +291,17 @@ func (sc *SessionCoalescer) SetFriendlyName(name string) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.friendlyName = name
+}
+
+// resetForNextTurn clears per-turn state so the coalescer is ready for
+// subsequent messages on the same session. Must be called with mu held.
+func (sc *SessionCoalescer) resetForNextTurn() {
+	sc.textBuffer.Reset()
+	sc.pendingTools = nil
+	sc.completedTools = nil
+	sc.progressMessageTS = nil // next turn gets a new Slack message
+	sc.finalized = false
+	sc.dirty = false
 }
 
 // ProgressMessageTS returns the current progress message timestamp, if any.
@@ -392,17 +407,20 @@ func (sc *SessionCoalescer) checkOverflow() {
 }
 
 // renderMessage constructs the Slack message text from current state.
+// Uses Slack mrkdwn format (not standard Markdown).
 func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	var sb strings.Builder
 
-	// Header.
+	// Header (Slack mrkdwn: *bold*).
 	emoji := "🤖"
 	name := sc.friendlyName
-	if name == "" {
+	if name == "" && len(sc.sessionID) > 8 {
 		name = sc.sessionID[:8]
+	} else if name == "" {
+		name = sc.sessionID
 	}
 	workdirBase := filepath.Base(sc.workdir)
-	sb.WriteString(fmt.Sprintf("**%s %s @ %s**\n\n", emoji, name, workdirBase))
+	sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 
 	// Text content.
 	text := sc.textBuffer.String()
