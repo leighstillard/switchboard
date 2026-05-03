@@ -56,6 +56,10 @@ type OutboundItem struct {
 
 	// Dedup: content hash for 60s dedup window on PostMessage.
 	ContentHash string
+
+	// OnPosted is called after a successful PostMessage with the returned TS.
+	// Used by the coalescer to switch from post to update mode.
+	OnPosted func(ts string)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +461,11 @@ func (q *Queue) execute(ctx context.Context, item *OutboundItem) {
 	switch item.Action {
 	case ActionPostMessage:
 		opts := buildPostOpts(item)
-		_, err = q.slack.PostMessage(item.ChannelID, item.Text, opts...)
+		ts, postErr := q.slack.PostMessage(item.ChannelID, item.Text, opts...)
+		if postErr == nil && item.OnPosted != nil {
+			item.OnPosted(ts)
+		}
+		err = postErr
 	case ActionUpdateMessage:
 		opts := buildPostOpts(item)
 		err = q.slack.UpdateMessage(item.ChannelID, item.MessageTS, item.Text, opts...)

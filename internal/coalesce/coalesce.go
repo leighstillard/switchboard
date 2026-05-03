@@ -350,6 +350,9 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 
 	if sc.progressMessageTS == nil {
 		// First flush: PostMessage to create the progress message.
+		// Post synchronously via OnPosted callback to capture TS before
+		// any subsequent flushes try to update.
+		tsCh := make(chan string, 1)
 		item := &outbound.OutboundItem{
 			Priority:  3, // chat.postMessage
 			ChannelID: sc.channelID,
@@ -358,15 +361,20 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			Text:      text,
 			Username:  sc.identity.DisplayName,
 			IconURL:   sc.identity.IconURL,
+			OnPosted: func(ts string) {
+				sc.SetProgressMessageTS(ts)
+				tsCh <- ts
+			},
 		}
-		// We need the TS back to switch to updates. Use a callback approach:
-		// Actually, the outbound queue doesn't return the TS to us.
-		// We need a different approach: post directly and capture TS.
-		// For now, enqueue as PostMessage - the router will handle TS capture.
 		sc.outbound.Enqueue(item)
-		// Mark as "awaiting TS" - next flushes will be queued until we get it.
-		placeholder := ""
-		sc.progressMessageTS = &placeholder
+		// Wait for the TS to come back (unlock mu while waiting to avoid deadlock).
+		sc.mu.Unlock()
+		select {
+		case <-tsCh:
+		case <-time.After(10 * time.Second):
+			slog.Warn("coalescer: timed out waiting for PostMessage TS", "session_id", sc.sessionID)
+		}
+		sc.mu.Lock()
 	} else if *sc.progressMessageTS != "" {
 		// Subsequent flush: UpdateMessage.
 		item := &outbound.OutboundItem{

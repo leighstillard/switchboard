@@ -2,6 +2,7 @@ package coalesce
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,11 @@ func (m *mockOutbound) Enqueue(item *outbound.OutboundItem) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.items = append(m.items, item)
+	// Simulate the real outbound worker: call OnPosted for PostMessage items.
+	if item.Action == outbound.ActionPostMessage && item.OnPosted != nil {
+		ts := fmt.Sprintf("mock-%d.%06d", len(m.items), len(m.items))
+		go item.OnPosted(ts)
+	}
 }
 
 func (m *mockOutbound) getItems() []*outbound.OutboundItem {
