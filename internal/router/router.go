@@ -420,9 +420,11 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 
 // consumeEvents reads from a jcode session event channel and dispatches to coalescer.
 func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-chan *jcodeproto.ServerEvent) {
+	slog.Info("router: consumeEvents started", "session_id", sessionID)
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("router: consumeEvents exiting (ctx done)", "session_id", sessionID)
 			return
 		case ev, ok := <-events:
 			if !ok {
@@ -436,6 +438,8 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 			key := r.activeCoalescer[sessionID]
 			coal := r.coalescers[key]
 			r.mu.RUnlock()
+
+			slog.Debug("router: consumeEvents got event", "session_id", sessionID, "type", ev.Type, "key", key, "has_coal", coal != nil)
 
 			if coal == nil {
 				slog.Debug("router: no coalescer for event", "session_id", sessionID, "type", ev.Type)

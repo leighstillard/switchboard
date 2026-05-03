@@ -133,6 +133,7 @@ func (c *Client) Subscribe(ctx context.Context, workdir string) (string, <-chan 
 		conn:    conn,
 		reader:  bufio.NewReaderSize(conn, readerBufSize),
 		events:  make(chan *jcodeproto.ServerEvent, eventChanSize),
+		pongCh:  make(chan struct{}, 1),
 	}
 	sc.ctx, sc.cancel = context.WithCancel(context.Background())
 
@@ -197,6 +198,7 @@ func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir
 		conn:      conn,
 		reader:    bufio.NewReaderSize(conn, readerBufSize),
 		events:    make(chan *jcodeproto.ServerEvent, eventChanSize),
+		pongCh:    make(chan struct{}, 1),
 	}
 	sc.ctx, sc.cancel = context.WithCancel(context.Background())
 
@@ -428,6 +430,7 @@ type sessionConn struct {
 
 	writeMu sync.Mutex // serialize writes to the socket
 	events  chan *jcodeproto.ServerEvent
+	pongCh  chan struct{} // signaled by readLoop when pong received
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -582,7 +585,16 @@ func (sc *sessionConn) readLoop() {
 			return // handleDisconnect will attempt reconnect
 		}
 
+		// Signal keepalive loop on pong.
+		if evType == jcodeproto.EventPong {
+			select {
+			case sc.pongCh <- struct{}{}:
+			default:
+			}
+		}
+
 		ev := &jcodeproto.ServerEvent{Type: evType, Raw: raw}
+		slog.Debug("jcode: readLoop event", "session_id", sc.sessionID, "type", evType, "raw_len", len(raw), "chan_len", len(sc.events), "chan_cap", cap(sc.events))
 		select {
 		case sc.events <- ev:
 		case <-sc.ctx.Done():
@@ -594,21 +606,33 @@ func (sc *sessionConn) readLoop() {
 }
 
 // keepaliveLoop sends periodic pings to detect dead connections.
+// It also checks that we received a pong since the last ping (detects half-open connections).
 func (sc *sessionConn) keepaliveLoop() {
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()
+
+	var awaitingPong bool
 
 	for {
 		select {
 		case <-sc.ctx.Done():
 			return
 		case <-ticker.C:
+			if awaitingPong {
+				// We sent a ping last cycle and never got a pong back.
+				slog.Warn("jcode: no pong received, connection appears dead", "session_id", sc.sessionID)
+				sc.conn.Close() // Force readLoop to exit and trigger reconnect.
+				return
+			}
+
 			reqID := sc.client.idGen.Next()
 			if err := sc.writeJSON(jcodeproto.NewPing(reqID)); err != nil {
 				slog.Warn("jcode: keepalive ping failed", "session_id", sc.sessionID, "err", err)
-				// The read loop will detect the broken connection.
 				return
 			}
+			awaitingPong = true
+		case <-sc.pongCh:
+			awaitingPong = false
 		}
 	}
 }
