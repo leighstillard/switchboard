@@ -1,0 +1,7 @@
+{{/* github_pr.tmpl - GitHub pull request event template */}}
+{{ if eq .Action "opened" }}:new: {{ else if eq .Action "merged" }}:merged: {{ else }}:pull_request: {{ end }}**PR {{ .Action }}** in `{{ .Repo }}`
+
+*{{ .Title }}* (#{{ .Number }})
+by {{ .Author }}
+
+{{ if .URL }}> <{{ .URL }}>{{ end }}

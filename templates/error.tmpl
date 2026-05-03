@@ -1,0 +1,10 @@
+{{/* error.tmpl - Error notification template */}}
+:warning: **Switchboard Error**
+
+**Source:** {{ .Source }}
+**Error:** {{ .Message }}
+**Time:** {{ .Timestamp }}
+
+{{ if .Details }}```
+{{ .Details }}
+```{{ end }}

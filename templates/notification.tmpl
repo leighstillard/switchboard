@@ -1,0 +1,6 @@
+{{/* notification.tmpl - Default notification template for webhook events */}}
+**[{{ .Source }}]** {{ .Title }}
+
+{{ .Body }}
+
+{{ if .URL }}> <{{ .URL }}>{{ end }}
