@@ -1,12 +1,12 @@
 {
   "display_information": {
     "name": "Switchboard",
-    "description": "Bridges Slack channels to jcode agent sessions with webhook ingestion",
+    "description": "Slack ↔ jcode bridge with webhook routing",
     "background_color": "#1a1a2e"
   },
   "features": {
     "app_home": {
-      "home_tab_enabled": true,
+      "home_tab_enabled": false,
       "messages_tab_enabled": true,
       "messages_tab_read_only_enabled": false
     },
@@ -30,9 +30,7 @@
         "im:history",
         "im:read",
         "im:write",
-        "reactions:read",
-        "reactions:write",
-        "users:read"
+        "reactions:write"
       ]
     }
   },
@@ -42,9 +40,7 @@
         "app_mention",
         "message.channels",
         "message.groups",
-        "message.im",
-        "reaction_added",
-        "reaction_removed"
+        "message.im"
       ]
     },
     "interactivity": {

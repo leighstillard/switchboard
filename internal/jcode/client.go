@@ -436,14 +436,16 @@ func (sc *sessionConn) writeJSON(v any) error {
 	return err
 }
 
-// waitForSession reads events until we get a "session" event, returning the
-// session_id. Non-session events received during this phase are buffered into
-// the events channel.
+// waitForSession reads events until we get a "swarm_status" event containing
+// the session_id, or the "done" event for our subscribe request.
+// The session_id is extracted from the first member in swarm_status.
 func (sc *sessionConn) waitForSession(ctx context.Context) (string, error) {
-	// Give the daemon up to 30s to respond with a session event.
+	// Give the daemon up to 30s to respond.
 	deadline := time.Now().Add(30 * time.Second)
 	sc.conn.SetReadDeadline(deadline)
 	defer sc.conn.SetReadDeadline(time.Time{})
+
+	var sessionID string
 
 	for {
 		select {
@@ -463,20 +465,54 @@ func (sc *sessionConn) waitForSession(ctx context.Context) (string, error) {
 			continue
 		}
 
-		if evType == jcodeproto.EventSession {
-			var sessEv jcodeproto.SessionEvent
-			if err := json.Unmarshal(raw, &sessEv); err != nil {
-				return "", fmt.Errorf("unmarshal session event: %w", err)
+		switch evType {
+		case jcodeproto.EventSwarmStatus:
+			var swarmEv jcodeproto.SwarmStatusEvent
+			if err := json.Unmarshal(raw, &swarmEv); err != nil {
+				slog.Warn("jcode: failed to parse swarm_status", "err", err)
+				continue
 			}
-			return sessEv.SessionID, nil
-		}
+			if len(swarmEv.Members) > 0 {
+				sessionID = swarmEv.Members[0].SessionID
+				slog.Debug("jcode: got session from swarm_status",
+					"session_id", sessionID,
+					"friendly_name", swarmEv.Members[0].FriendlyName,
+				)
+			}
 
-		// Buffer non-session events that arrive before the session event.
-		ev := &jcodeproto.ServerEvent{Type: evType, Raw: raw}
-		select {
-		case sc.events <- ev:
+		case jcodeproto.EventSession:
+			// Legacy path: some versions may still emit "session" events.
+			var sessEv jcodeproto.SessionEvent
+			if err := json.Unmarshal(raw, &sessEv); err == nil && sessEv.SessionID != "" {
+				sessionID = sessEv.SessionID
+			}
+
+		case jcodeproto.EventDone:
+			// Subscribe is complete. Return whatever session_id we found.
+			if sessionID != "" {
+				return sessionID, nil
+			}
+			return "", fmt.Errorf("subscribe completed but no session_id received")
+
+		case jcodeproto.EventError:
+			var errEv jcodeproto.ErrorEvent
+			if json.Unmarshal(raw, &errEv) == nil {
+				return "", fmt.Errorf("server error: %s", errEv.Message)
+			}
+			return "", fmt.Errorf("server error (unparseable)")
+
+		case jcodeproto.EventAck:
+			// Expected; continue waiting for swarm_status and done.
+			continue
+
 		default:
-			slog.Warn("jcode: event channel full during session wait, dropping", "type", evType)
+			// Buffer other events that arrive before subscribe completes.
+			ev := &jcodeproto.ServerEvent{Type: evType, Raw: raw}
+			select {
+			case sc.events <- ev:
+			default:
+				slog.Warn("jcode: event channel full during session wait, dropping", "type", evType)
+			}
 		}
 	}
 }

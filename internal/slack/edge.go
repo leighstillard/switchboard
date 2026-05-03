@@ -163,11 +163,14 @@ func (e *Edge) handleEvents(ctx context.Context) {
 
 // routeEvent dispatches a Socket Mode event to the appropriate handler.
 func (e *Edge) routeEvent(evt socketmode.Event) {
+	slog.Debug("slack edge: received event", "type", string(evt.Type))
+
 	switch evt.Type {
 	case socketmode.EventTypeEventsAPI:
 		e.socket.Ack(*evt.Request)
 		evtAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 		if !ok {
+			slog.Debug("slack edge: events API data type mismatch", "data_type", fmt.Sprintf("%T", evt.Data))
 			return
 		}
 		e.handleEventsAPI(evtAPI)
@@ -194,6 +197,8 @@ func (e *Edge) handleEventsAPI(evt slackevents.EventsAPIEvent) {
 
 // handleInnerEvent dispatches the inner event by type.
 func (e *Edge) handleInnerEvent(inner slackevents.EventsAPIInnerEvent) {
+	slog.Debug("slack edge: inner event", "type", inner.Type)
+
 	switch ev := inner.Data.(type) {
 	case *slackevents.MessageEvent:
 		e.handleMessage(ev)
@@ -211,6 +216,10 @@ func (e *Edge) handleInnerEvent(inner slackevents.EventsAPIInnerEvent) {
 // ---------------------------------------------------------------------------
 
 func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
+	slog.Debug("slack edge: message event",
+		"channel", ev.Channel, "user", ev.User, "subtype", ev.SubType,
+		"bot_id", ev.BotID, "text_len", len(ev.Text))
+
 	// Drop subtypes we never process.
 	switch ev.SubType {
 	case "message_changed", "message_deleted":
@@ -285,6 +294,9 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 }
 
 func (e *Edge) handleAppMention(ev *slackevents.AppMentionEvent) {
+	slog.Debug("slack edge: app_mention received",
+		"channel", ev.Channel, "user", ev.User, "text", ev.Text)
+
 	threadTS := ev.ThreadTimeStamp
 	messageTS := ev.TimeStamp
 	isTopLevel := (threadTS == "" || threadTS == messageTS)

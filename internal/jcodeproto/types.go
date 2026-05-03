@@ -157,7 +157,10 @@ const (
 	EventDone     = "done"
 	EventError    = "error"
 	EventPong     = "pong"
-	EventSession  = "session"
+	EventSession  = "session" // legacy, may not be emitted
+
+	// Swarm/session status (primary way to get session_id)
+	EventSwarmStatus = "swarm_status"
 
 	// Streaming content events
 	EventTextDelta   = "text_delta"
@@ -178,12 +181,15 @@ const (
 
 	// Infrastructure events
 	EventUpstreamProvider = "upstream_provider"
+	EventConnectionType   = "connection_type"
+	EventConnectionPhase  = "connection_phase"
+	EventTokens           = "tokens"
 	EventReloading        = "reloading"
 	EventHistory          = "history"
 
-	// Events we receive but ignore (log at debug level):
+	// Events we receive but pass through (log at debug level):
 	// side_panel_state, memory_activity, compaction, batch_progress,
-	// mcp_status, swarm_status, swarm_plan, model_changed, token_usage, etc.
+	// mcp_status, swarm_plan, model_changed, token_usage, etc.
 )
 
 // ---------------------------------------------------------------------------
@@ -212,9 +218,35 @@ type PongEvent struct {
 	ID uint64 `json:"id"`
 }
 
-// SessionEvent provides the session ID after subscribing.
+// SessionEvent provides the session ID after subscribing (legacy).
 type SessionEvent struct {
 	SessionID string `json:"session_id"`
+}
+
+// SwarmStatusEvent reports the current session(s) state.
+// After a subscribe, the first member's session_id is the active session.
+type SwarmStatusEvent struct {
+	Members []SwarmMember `json:"members"`
+}
+
+// SwarmMember is a single session within the swarm.
+type SwarmMember struct {
+	SessionID       string `json:"session_id"`
+	FriendlyName    string `json:"friendly_name"`
+	Status          string `json:"status"` // "ready", "running", etc.
+	Detail          string `json:"detail,omitempty"`
+	Role            string `json:"role"`
+	IsHeadless      bool   `json:"is_headless"`
+	LiveAttachments int    `json:"live_attachments"`
+	StatusAgeSecs   int    `json:"status_age_secs"`
+}
+
+// TokensEvent reports token usage for a turn.
+type TokensEvent struct {
+	Input             int `json:"input"`
+	Output            int `json:"output"`
+	CacheReadInput    int `json:"cache_read_input"`
+	CacheCreationInput int `json:"cache_creation_input"`
 }
 
 // TextDeltaEvent is an incremental text append.
