@@ -22,6 +22,7 @@ func SlackBotToken() string {
 	if t := os.Getenv("SWITCHBOARD_BOT_TOKEN"); t != "" {
 		return t
 	}
+	// No hardcoded fallback - must be set via env or config.
 	return ""
 }
 
