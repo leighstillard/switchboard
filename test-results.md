@@ -83,6 +83,13 @@
 
 ---
 
+## §3. Interactive Slack message flow
+
+### 3.1 Full round trip
+- [x] **PASS** - Messages sent in `#sw-test-alpha`, `#sw-test-beta`, `#sw-test-noise`. Sessions created (crow, panda, ox), jcode responded, replies delivered back to Slack threads. Full Slack -> switchboard -> jcode -> switchboard -> Slack round trip confirmed.
+
+---
+
 ## §4. GitHub webhook routing
 
 ### 4.1 Known repo routes to correct channel
