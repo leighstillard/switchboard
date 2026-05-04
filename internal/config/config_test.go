@@ -11,7 +11,7 @@ func TestLoadConfig(t *testing.T) {
 	os.Setenv("SLACK_APP_TOKEN", "xapp-test-token")
 	os.Setenv("SLACK_BOT_TOKEN", "xoxb-test-token")
 	os.Setenv("SLACK_SIGNING_SECRET", "test-secret")
-	os.Setenv("GITHUB_WEBHOOK_SECRET", "gh-secret")
+	os.Setenv("GITHUB_WEBHOOK_SECRET", "gh-secret-long-enough-for-validation")
 	defer func() {
 		os.Unsetenv("SLACK_APP_TOKEN")
 		os.Unsetenv("SLACK_BOT_TOKEN")
@@ -53,7 +53,7 @@ max_inbound_mb = 10
 max_outbound_mb = 25
 
 [[channels]]
-id = "C0123ABC"
+id = "C0123ABCDEF"
 name = "test-channel"
 workdir = "` + dir + `/workspace/test"
 identity = "Test Worker"
@@ -76,7 +76,7 @@ source = "github"
 event_type = "pull_request"
 repo = "format5/test"
 [routes.destination]
-channel_id = "C0123ABC"
+channel_id = "C0123ABCDEF"
 [routes.correlation]
 field = "pull_request.html_url"
 ttl_days = 7
@@ -117,7 +117,7 @@ ttl_days = 7
 		t.Fatalf("channels = %d, want 1", len(cfg.Channels))
 	}
 	ch := cfg.Channels[0]
-	if ch.ID != "C0123ABC" {
+	if ch.ID != "C0123ABCDEF" {
 		t.Errorf("channel id = %q", ch.ID)
 	}
 	if ch.Identity != "Test Worker" {
@@ -148,7 +148,7 @@ ttl_days = 7
 	if route.Match["event_type"] != "pull_request" {
 		t.Errorf("route match event_type = %q", route.Match["event_type"])
 	}
-	if route.Destination.ChannelID != "C0123ABC" {
+	if route.Destination.ChannelID != "C0123ABCDEF" {
 		t.Errorf("route destination channel_id = %q", route.Destination.ChannelID)
 	}
 	if route.Correlation.Field != "pull_request.html_url" {

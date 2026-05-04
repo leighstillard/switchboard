@@ -12,6 +12,10 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// slackIDRe matches a Slack channel/user ID: starts with C, D, G, U, or W
+// followed by alphanumerics.
+var slackIDRe = regexp.MustCompile(`^[CDGUW][A-Z0-9]{8,12}$`)
+
 // Config is the top-level configuration structure matching the Switchboard spec §5.
 type Config struct {
 	Bridge     BridgeConfig                `toml:"bridge"`
@@ -160,7 +164,7 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// validate checks that required fields are set.
+// validate checks that required fields are set and values are sane.
 func (c *Config) validate() error {
 	if c.Slack.BotToken == "" {
 		return fmt.Errorf("config: slack.bot_token is required")
@@ -168,6 +172,29 @@ func (c *Config) validate() error {
 	if c.Slack.AppToken == "" {
 		return fmt.Errorf("config: slack.app_token is required")
 	}
+
+	// Validate channel IDs and check for duplicates.
+	seen := make(map[string]string) // id -> name
+	for _, ch := range c.Channels {
+		if ch.ID == "" {
+			return fmt.Errorf("config: channel %q has empty id", ch.Name)
+		}
+		if !slackIDRe.MatchString(ch.ID) {
+			return fmt.Errorf("config: channel %q has invalid Slack ID %q (expected C/D/G + 8-12 alphanumerics)", ch.Name, ch.ID)
+		}
+		if prevName, dup := seen[ch.ID]; dup {
+			return fmt.Errorf("config: duplicate channel id %q (used by %q and %q)", ch.ID, prevName, ch.Name)
+		}
+		seen[ch.ID] = ch.Name
+	}
+
+	// Validate HMAC secrets are not trivially short.
+	for name, src := range c.Ingest.Sources {
+		if src.Secret != "" && len(src.Secret) < 16 {
+			return fmt.Errorf("config: ingest source %q secret is too short (%d chars, minimum 16)", name, len(src.Secret))
+		}
+	}
+
 	return nil
 }
 
