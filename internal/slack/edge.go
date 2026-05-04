@@ -467,6 +467,10 @@ func (e *Edge) stripBotMention(text string) string {
 	}
 	mention := "<@" + e.botUserID + ">"
 	text = strings.ReplaceAll(text, mention, "")
+	// Strip Slack MCP "Sent using" suffix (e.g. "*Sent using* <@UXXXXXXX>").
+	if idx := strings.Index(text, "*Sent using*"); idx >= 0 {
+		text = text[:idx]
+	}
 	return strings.TrimSpace(text)
 }
 
