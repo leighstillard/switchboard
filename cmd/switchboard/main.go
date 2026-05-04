@@ -22,10 +22,24 @@ import (
 	"github.com/format5/switchboard/internal/store"
 )
 
+// Set at build time via -ldflags.
+var (
+	version   = "dev"
+	buildTime = "unknown"
+	gitCommit = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", defaultConfigPath(), "path to config file")
 	debug := flag.Bool("debug", false, "enable debug logging (overrides SWITCHBOARD_LOG_LEVEL)")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	validateConfig := flag.Bool("validate-config", false, "validate config and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("switchboard %s (commit %s, built %s)\n", version, gitCommit, buildTime)
+		return
+	}
 
 	// Set up structured JSON logging.
 	level := parseLogLevel(os.Getenv("SWITCHBOARD_LOG_LEVEL"))
@@ -38,9 +52,20 @@ func main() {
 	// Load configuration.
 	cfg, err := config.Load(*configPath)
 	if err != nil {
+		if *validateConfig {
+			fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
+			os.Exit(1)
+		}
 		slog.Error("failed to load config", "error", err, "path", *configPath)
 		os.Exit(1)
 	}
+
+	if *validateConfig {
+		fmt.Printf("OK: config valid (%d channels, %d routes, ingest=%s)\n",
+			len(cfg.Channels), len(cfg.Routes), cfg.Ingest.ListenAddr)
+		return
+	}
+
 	slog.Info("config loaded", "path", *configPath, "bridge_name", cfg.Bridge.Name)
 
 	// Initialize components in dependency order.
