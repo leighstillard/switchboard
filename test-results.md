@@ -15,18 +15,18 @@
 - [x] `switchboard -version` prints version info
 
 ### 0.2 Slack workspace
-- [ ] Test channels created: `#sw-test-alpha`, `#sw-test-beta`, `#sw-test-noise`, `#sw-test-fallback`
-- [ ] Channel IDs recorded below
-- [ ] Bot invited to all channels
+- [x] Test channels created: `#sw-test-alpha`, `#sw-test-beta`, `#sw-test-noise`, `#sw-test-fallback`
+- [x] Channel IDs recorded below
+- [x] Bot invited to all channels
 - [ ] DM conversation with bot exists
 - [ ] Second user available
 
 | Channel | ID |
 |---------|-----|
-| #sw-test-alpha | |
-| #sw-test-beta | |
-| #sw-test-noise | |
-| #sw-test-fallback | |
+| #sw-test-alpha | C0B17DC35QT |
+| #sw-test-beta | C0B283F8VR6 |
+| #sw-test-noise | C0B17DDAQ67 |
+| #sw-test-fallback | C0B283J5SHW |
 
 ### 0.3 Workdirs
 - [x] ~/workspace/sw-test-alpha/ - small Go repo with README.md, main.go, util.go
