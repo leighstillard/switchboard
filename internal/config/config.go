@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,12 +37,13 @@ type GitHubConfig struct {
 
 // BridgeConfig holds top-level bridge settings.
 type BridgeConfig struct {
-	Name         string        `toml:"name"`
-	DataDir      string        `toml:"data_dir"`
-	Routing      RoutingConfig `toml:"routing"`
-	Audit        AuditConfig   `toml:"audit"`
-	Files        FilesConfig   `toml:"files"`
-	BotAllowlist []string      `toml:"bot_allowlist"`
+	Name           string        `toml:"name"`
+	DataDir        string        `toml:"data_dir"`
+	DefaultWorkdir string        `toml:"default_workdir"`
+	Routing        RoutingConfig `toml:"routing"`
+	Audit          AuditConfig   `toml:"audit"`
+	Files          FilesConfig   `toml:"files"`
+	BotAllowlist   []string      `toml:"bot_allowlist"`
 }
 
 // RoutingConfig controls message routing behaviour.
@@ -153,6 +155,7 @@ func Load(path string) (*Config, error) {
 
 	// Expand paths.
 	cfg.Bridge.DataDir = expandPath(cfg.Bridge.DataDir)
+	cfg.Bridge.DefaultWorkdir = expandPath(cfg.Bridge.DefaultWorkdir)
 	for i := range cfg.Channels {
 		cfg.Channels[i].Workdir = expandPath(cfg.Channels[i].Workdir)
 	}
@@ -192,6 +195,19 @@ func (c *Config) validate() error {
 	for name, src := range c.Ingest.Sources {
 		if src.Secret != "" && len(src.Secret) < 16 {
 			return fmt.Errorf("config: ingest source %q secret is too short (%d chars, minimum 16)", name, len(src.Secret))
+		}
+	}
+
+	// Warn (but don't fail) if route destinations reference unknown channels.
+	for _, route := range c.Routes {
+		destID := route.Destination.ChannelID
+		if destID != "" {
+			if _, known := seen[destID]; !known {
+				slog.Warn("config: route destination references unknown channel",
+					"route_source", route.Source,
+					"channel_id", destID,
+				)
+			}
 		}
 	}
 

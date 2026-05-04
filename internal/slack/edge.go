@@ -126,6 +126,19 @@ func (e *Edge) SetBotAllowlist(ids []string) {
 	}
 }
 
+// ReloadConfig updates channels and identities on SIGHUP.
+func (e *Edge) ReloadConfig(channels []config.ChannelConfig, identities map[string]config.IdentityConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.channels = channels
+	e.identities = identities
+	e.channelSet = make(map[string]bool, len(channels))
+	for _, ch := range channels {
+		e.channelSet[ch.ID] = true
+	}
+	slog.Info("slack edge: config reloaded", "channels", len(channels), "identities", len(identities))
+}
+
 // Run starts the Slack Socket Mode event loop. Blocks until ctx is cancelled.
 func (e *Edge) Run(ctx context.Context) {
 	// Resolve our own bot user ID for self-message filtering.

@@ -152,7 +152,9 @@ func main() {
 				slog.Error("config reload failed", "error", err)
 				continue
 			}
-			rt.Reload(newCfg.Routes)
+			rt.Reload(newCfg)
+			edge.ReloadConfig(newCfg.Channels, newCfg.Identities)
+			edge.SetBotAllowlist(newCfg.Bridge.BotAllowlist)
 			slog.Info("config reloaded successfully")
 		case syscall.SIGINT, syscall.SIGTERM:
 			slog.Info("shutdown signal received", "signal", sig.String())

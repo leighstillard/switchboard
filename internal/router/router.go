@@ -157,12 +157,18 @@ func (r *Router) InjectMessage(channelID, threadTS, userID, text string) string 
 	return ts
 }
 
-// Reload updates the routing rules (called on SIGHUP).
-func (r *Router) Reload(routes []config.RouteConfig) {
+// Reload updates the full configuration (called on SIGHUP).
+// This replaces routes, channels, GitHub config, and identities.
+func (r *Router) Reload(newCfg *config.Config) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.routes = routes
-	slog.Info("router: routes reloaded", "count", len(routes))
+	r.cfg = newCfg
+	r.routes = newCfg.Routes
+	slog.Info("router: config reloaded",
+		"routes", len(newCfg.Routes),
+		"channels", len(newCfg.Channels),
+		"github_repos", len(newCfg.GitHub.Repos),
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -601,16 +607,47 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 
 	// No correlation: post to channel root (creates new thread).
 	text := r.formatWebhookMessage(evt)
-	r.outbound.Enqueue(&outbound.OutboundItem{
+	item := &outbound.OutboundItem{
 		Priority:  3,
 		ChannelID: destChannelID,
 		Action:    outbound.ActionPostMessage,
 		Text:      text,
 		Username:  "Switchboard",
-	})
+	}
 
-	// TODO: capture the resulting thread_ts and create a correlation entry.
-	// This requires the outbound queue to support a callback on PostMessage success.
+	// If we have a correlation field, capture the new thread_ts via callback.
+	if correlationField != "" {
+		externalKey := extractField(evt.Payload, correlationField)
+		if externalKey != "" {
+			src := evt.Source
+			item.OnPosted = func(ts string) {
+				ttlDays := matchedRoute.Correlation.TTLDays
+				if ttlDays == 0 {
+					ttlDays = 7 // default 7 days
+				}
+				now := time.Now().Unix()
+				expiresAt := now + int64(ttlDays)*86400
+				corr := &store.ThreadCorrelation{
+					Source:      src,
+					ExternalKey: externalKey,
+					ChannelID:   destChannelID,
+					ThreadTS:    ts,
+					CreatedAt:   now,
+					ExpiresAt:   &expiresAt,
+					CreatedBy:   "webhook",
+				}
+				if err := r.store.UpsertCorrelation(corr); err != nil {
+					slog.Error("router: failed to create correlation",
+						"source", src, "key", externalKey, "error", err)
+				} else {
+					slog.Info("router: correlation created",
+						"source", src, "key", externalKey, "thread_ts", ts)
+				}
+			}
+		}
+	}
+
+	r.outbound.Enqueue(item)
 }
 
 // handleGitHubWebhook routes a GitHub webhook using the repo->channel mapping
@@ -784,6 +821,11 @@ func (r *Router) resolveChannel(channelID string) (string, coalesce.Identity) {
 				IconURL:     ch.IconURL,
 			}
 		}
+	}
+
+	// DMs: use default workdir if configured.
+	if strings.HasPrefix(channelID, "D") && r.cfg.Bridge.DefaultWorkdir != "" {
+		return r.cfg.Bridge.DefaultWorkdir, coalesce.Identity{DisplayName: "Assistant"}
 	}
 
 	// Workspace fallback.
