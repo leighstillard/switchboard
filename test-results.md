@@ -73,6 +73,84 @@
 
 ---
 
+## §2. Unit tests
+
+### 2.1 All packages pass
+- [x] **PASS** - `go test ./...` all green (coalesce, config, ingest, jcodeproto, outbound, router, store).
+
+### 2.2 Race detector
+- [x] **PASS** - `go test -race ./...` all green, no races detected.
+
+---
+
+## §4. GitHub webhook routing
+
+### 4.1 Known repo routes to correct channel
+- [x] **PASS** - `format5/switchboard` routed to `C0B0Y0WQYQP` (#switchboard-test), `routed_by=github_config`.
+
+### 4.2 Second known repo
+- [x] **PASS** - `format5/partseeker-infra` routed to `C0AR5HNQQ68` (#partseeker-infra), `routed_by=github_config`.
+
+### 4.3 Unknown repo falls back
+- [x] **PASS** - `unknown/mystery` routed to `C0AL12WCNBG` (#data-worklog fallback), `routed_by=github_config`.
+
+---
+
+## §5. GitHub event formatting
+
+### 5.1 Push event
+- [x] **PASS** - Push to `format5/switchboard` accepted (202), formatted with commit list.
+
+### 5.2 Issue comment
+- [x] **PASS** - `issue_comment` (created) accepted (202).
+
+### 5.3 PR review
+- [x] **PASS** - `pull_request_review` (submitted) accepted (202).
+
+### 5.4 Force push
+- [x] **PASS** - Force push accepted (202), formatted with warning emoji.
+
+### 5.5 Unknown event type (generic fallback)
+- [x] **PASS** - `deployment_status` accepted (202), falls back to generic formatter.
+
+---
+
+## §6. Session management
+
+### 6.1 Active sessions
+- [x] **PASS** - 29 active sessions tracked. 1 processing (current scorpion session on #switchboard-test), rest idle.
+
+### 6.2 Session status tracking
+- [x] **PASS** - Status correctly reflects `idle` vs `processing`. Channels: data-worklog (25 idle), switchboard-test (3 idle + 1 processing).
+
+### 6.3 Turn queue
+- [x] **PASS** - Turn queue depth = 1 (normal for active session).
+
+### 6.4 All webhooks processed
+- [x] **PASS** - 0 pending webhooks. All 500+ test webhooks processed to `done`.
+
+---
+
+## §7. Audit log integrity
+
+### 7.1 Required fields populated
+- [x] **PASS** - 0 audit entries with null `source` or `event_type`.
+
+### 7.2 Coverage
+- [x] **PASS** - 578 GitHub audit entries, 7 Slack audit entries covering all test events.
+
+### 7.3 Payload hash
+- [x] **PASS** - 0 audit entries missing `payload_hash`.
+
+---
+
+## §8a. Cron webhook source
+
+### 8a.1 Cron webhook accepted and processed
+- [x] **PASS** - Cron webhook with idempotency key accepted (202), status=done after processing.
+
+---
+
 ## §8. Webhook ingest - durability and dedup
 
 ### 8.2 Persistence before ack
