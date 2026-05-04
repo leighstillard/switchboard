@@ -522,7 +522,13 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 // ---------------------------------------------------------------------------
 
 func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
-	slog.Debug("router: webhook event", "source", evt.Source, "event_type", evt.EventType)
+	slog.Info("router: webhook event", "source", evt.Source, "event_type", evt.EventType)
+
+	// GitHub gets its own routing logic based on repo->channel mapping.
+	if evt.Source == "github" {
+		r.handleGitHubWebhook(ctx, evt)
+		return
+	}
 
 	r.mu.RLock()
 	routes := r.routes
@@ -593,6 +599,44 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 
 	// TODO: capture the resulting thread_ts and create a correlation entry.
 	// This requires the outbound queue to support a callback on PostMessage success.
+}
+
+// handleGitHubWebhook routes a GitHub webhook using the repo->channel mapping
+// from config, formats the message with GitHub-aware rendering, and posts to
+// the appropriate channel (or fallback).
+func (r *Router) handleGitHubWebhook(ctx context.Context, evt *WebhookEvent) {
+	repo := ghRepoName(evt.Payload)
+	destChannelID := ""
+
+	// Look up repo in the github.repos mapping.
+	if repo != "" && r.cfg.GitHub.Repos != nil {
+		destChannelID = r.cfg.GitHub.Repos[repo]
+	}
+
+	// Fallback to configured fallback channel.
+	if destChannelID == "" {
+		destChannelID = r.cfg.Ingest.FallbackChannelID
+	}
+
+	if destChannelID == "" {
+		slog.Warn("router: no channel for GitHub webhook",
+			"repo", repo, "event", evt.EventType)
+		return
+	}
+
+	slog.Info("router: routing GitHub webhook",
+		"repo", repo, "event", evt.EventType,
+		"channel", destChannelID)
+
+	text := formatGitHubWebhook(evt)
+
+	r.outbound.Enqueue(&outbound.OutboundItem{
+		Priority:  3,
+		ChannelID: destChannelID,
+		Action:    outbound.ActionPostMessage,
+		Text:      text,
+		Username:  "Switchboard",
+	})
 }
 
 // matchRoute checks if a webhook event matches a route's criteria.

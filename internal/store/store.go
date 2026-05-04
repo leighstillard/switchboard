@@ -647,14 +647,28 @@ func (s *Store) ClaimPendingWebhook(source string) (*WebhookInboxItem, error) {
 	}
 	defer tx.Rollback()
 
-	row := tx.QueryRow(`
-		SELECT id, received_at, source, idempotency_key, headers_json,
-		       body_blob, status, attempts, last_error
-		FROM webhook_inbox
-		WHERE source = ? AND status = 'pending'
-		ORDER BY received_at ASC
-		LIMIT 1`, source,
-	)
+	var query string
+	var args []interface{}
+	if source != "" {
+		query = `
+			SELECT id, received_at, source, idempotency_key, headers_json,
+			       body_blob, status, attempts, last_error
+			FROM webhook_inbox
+			WHERE source = ? AND status = 'pending'
+			ORDER BY received_at ASC
+			LIMIT 1`
+		args = []interface{}{source}
+	} else {
+		query = `
+			SELECT id, received_at, source, idempotency_key, headers_json,
+			       body_blob, status, attempts, last_error
+			FROM webhook_inbox
+			WHERE status = 'pending'
+			ORDER BY received_at ASC
+			LIMIT 1`
+	}
+
+	row := tx.QueryRow(query, args...)
 
 	w := &WebhookInboxItem{}
 	err = row.Scan(&w.ID, &w.ReceivedAt, &w.Source, &w.IdempotencyKey,

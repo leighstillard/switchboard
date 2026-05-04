@@ -398,19 +398,16 @@ func scrubHeaders(h http.Header) http.Header {
 }
 
 func headersToJSON(h http.Header) string {
-	// Simple JSON encoding of headers.
-	var sb strings.Builder
-	sb.WriteString("{")
-	first := true
+	// Flatten multi-valued headers to single string, then marshal.
+	flat := make(map[string]string, len(h))
 	for key, values := range h {
-		if !first {
-			sb.WriteString(",")
-		}
-		first = false
-		sb.WriteString(fmt.Sprintf("%q:%q", key, strings.Join(values, ", ")))
+		flat[key] = strings.Join(values, ", ")
 	}
-	sb.WriteString("}")
-	return sb.String()
+	data, err := json.Marshal(flat)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 // ---------------------------------------------------------------------------

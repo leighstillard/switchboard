@@ -165,17 +165,41 @@ func webhookFromInbox(item *store.WebhookInboxItem) *router.WebhookEvent {
 		Source:      item.Source,
 		RawBody:     item.BodyBlob,
 		Idempotency: item.IdempotencyKey,
+		Headers:     make(map[string]string),
 	}
 
-	// Try to parse body as JSON to extract event_type and payload.
+	// Parse persisted headers.
+	if item.HeadersJSON != "" {
+		var headers map[string]string
+		if err := json.Unmarshal([]byte(item.HeadersJSON), &headers); err == nil {
+			evt.Headers = headers
+		}
+	}
+
+	// Try to parse body as JSON to extract payload.
 	var payload map[string]interface{}
 	if err := json.Unmarshal(item.BodyBlob, &payload); err == nil {
 		evt.Payload = payload
-		// Try to extract event_type from common fields.
-		if et, ok := payload["event_type"].(string); ok {
-			evt.EventType = et
-		} else if et, ok := payload["action"].(string); ok {
-			evt.EventType = et
+	}
+
+	// Determine event type based on source.
+	switch item.Source {
+	case "github":
+		// GitHub uses X-GitHub-Event header as the canonical event type
+		// (e.g., "issues", "pull_request", "push").
+		if ghEvent := evt.Headers["X-Github-Event"]; ghEvent != "" {
+			evt.EventType = ghEvent
+		} else if ghEvent := evt.Headers["X-GitHub-Event"]; ghEvent != "" {
+			evt.EventType = ghEvent
+		}
+	default:
+		// Generic: try common body fields.
+		if evt.Payload != nil {
+			if et, ok := evt.Payload["event_type"].(string); ok {
+				evt.EventType = et
+			} else if et, ok := evt.Payload["action"].(string); ok {
+				evt.EventType = et
+			}
 		}
 	}
 

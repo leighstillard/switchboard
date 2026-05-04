@@ -14,13 +14,20 @@ import (
 
 // Config is the top-level configuration structure matching the Switchboard spec §5.
 type Config struct {
-	Bridge  BridgeConfig   `toml:"bridge"`
-	Slack   SlackConfig    `toml:"slack"`
-	Jcode   JcodeConfig    `toml:"jcode"`
-	Ingest  IngestConfig   `toml:"ingest"`
-	Channels []ChannelConfig `toml:"channels"`
-	Routes  []RouteConfig  `toml:"routes"`
-	Identities map[string]IdentityConfig `toml:"identities"`
+	Bridge     BridgeConfig                `toml:"bridge"`
+	Slack      SlackConfig                 `toml:"slack"`
+	Jcode      JcodeConfig                 `toml:"jcode"`
+	Ingest     IngestConfig                `toml:"ingest"`
+	GitHub     GitHubConfig                `toml:"github"`
+	Channels   []ChannelConfig             `toml:"channels"`
+	Routes     []RouteConfig               `toml:"routes"`
+	Identities map[string]IdentityConfig   `toml:"identities"`
+}
+
+// GitHubConfig holds GitHub-specific routing configuration.
+type GitHubConfig struct {
+	// Repos maps "owner/repo" to a Slack channel ID for webhook routing.
+	Repos map[string]string `toml:"repos"`
 }
 
 // BridgeConfig holds top-level bridge settings.
