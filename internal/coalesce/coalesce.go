@@ -92,6 +92,7 @@ type SessionCoalescer struct {
 
 	upstreamProvider *string // captured for footer on final flush
 
+	firstTurn bool // true until the first turn completes (show header)
 	lastFlush time.Time
 	dirty     bool
 	finalized bool // true after Done/Error/Interrupted
@@ -122,6 +123,7 @@ func NewSessionCoalescer(
 		identity:     identity,
 		outbound:     out,
 		onImage:      onImage,
+		firstTurn:    true,
 		lastFlush:    time.Now(),
 		done:         make(chan struct{}),
 	}
@@ -300,6 +302,7 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	sc.pendingTools = nil
 	sc.completedTools = nil
 	sc.progressMessageTS = nil // next turn gets a new Slack message
+	sc.firstTurn = false       // header only on the first turn
 	sc.finalized = false
 	sc.dirty = false
 }
@@ -432,16 +435,18 @@ func (sc *SessionCoalescer) checkOverflow() {
 func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	var sb strings.Builder
 
-	// Header (Slack mrkdwn: *bold*).
-	emoji := "🤖"
-	name := sc.friendlyName
-	if name == "" && len(sc.sessionID) > 8 {
-		name = sc.sessionID[:8]
-	} else if name == "" {
-		name = sc.sessionID
+	// Header only on the first turn of a new session.
+	if sc.firstTurn {
+		emoji := "🤖"
+		name := sc.friendlyName
+		if name == "" && len(sc.sessionID) > 8 {
+			name = sc.sessionID[:8]
+		} else if name == "" {
+			name = sc.sessionID
+		}
+		workdirBase := filepath.Base(sc.workdir)
+		sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 	}
-	workdirBase := filepath.Base(sc.workdir)
-	sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 
 	// Text content (convert standard Markdown → Slack mrkdwn).
 	text := sc.textBuffer.String()
