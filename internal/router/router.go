@@ -6,6 +6,8 @@ package router
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -224,6 +226,9 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		"workdir", workdir,
 	)
 
+	// Audit the inbound message.
+	r.auditSlackMessage(msg, threadTS)
+
 	// Subscribe to a new jcode session (may reuse existing for same workdir).
 	sessionID, events, err := r.jcode.Subscribe(ctx, workdir)
 	if err != nil {
@@ -288,6 +293,9 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 
 // handleContinuation routes a message to an existing session.
 func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessage, session *store.Session, threadTS string) {
+	// Audit the inbound message.
+	r.auditSlackMessage(msg, threadTS)
+
 	// Check if expired.
 	if session.Status == "closed" {
 		r.outbound.Enqueue(&outbound.OutboundItem{
@@ -556,6 +564,7 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 				Text:      text,
 			})
 		}
+		r.auditWebhookRouting(evt, "fallback", r.cfg.Ingest.FallbackChannelID)
 		return
 	}
 
@@ -564,6 +573,9 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 		slog.Warn("router: route has no destination channel_id", "source", evt.Source)
 		return
 	}
+
+	// Audit the successful route match.
+	r.auditWebhookRouting(evt, "rule", destChannelID)
 
 	// Check for existing correlation.
 	correlationField := matchedRoute.Correlation.Field
@@ -627,6 +639,9 @@ func (r *Router) handleGitHubWebhook(ctx context.Context, evt *WebhookEvent) {
 	slog.Info("router: routing GitHub webhook",
 		"repo", repo, "event", evt.EventType,
 		"channel", destChannelID)
+
+	// Audit the GitHub routing decision.
+	r.auditWebhookRouting(evt, "github_config", destChannelID)
 
 	text := formatGitHubWebhook(evt)
 
@@ -885,4 +900,72 @@ func extractFriendlyName(sessionID string) string {
 		return parts[1]
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Audit helpers
+// ---------------------------------------------------------------------------
+
+// sha256Hex returns the hex-encoded SHA-256 of data.
+func sha256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+// auditSlackMessage writes an audit entry for an inbound Slack message.
+func (r *Router) auditSlackMessage(msg *slack.InboundMessage, threadTS string) {
+	eventType := "message"
+	if msg.IsAppMention {
+		eventType = "app_mention"
+	}
+
+	summary, _ := json.Marshal(map[string]string{
+		"channel_id": msg.ChannelID,
+		"user_id":    msg.UserID,
+		"thread_ts":  threadTS,
+	})
+
+	channelID := msg.ChannelID
+	entry := &store.AuditEntry{
+		TS:                 time.Now().Unix(),
+		Source:             "slack",
+		EventType:          eventType,
+		ChannelID:          &channelID,
+		ThreadTS:           &threadTS,
+		PayloadSummaryJSON: string(summary),
+		PayloadHash:        sha256Hex([]byte(msg.Text)),
+	}
+
+	if err := r.store.InsertAudit(entry); err != nil {
+		slog.Error("router: audit insert failed", "err", err)
+	}
+}
+
+// auditWebhookRouting writes an audit entry for a webhook routing decision.
+func (r *Router) auditWebhookRouting(evt *WebhookEvent, routedBy string, channelID string) {
+	summary, _ := json.Marshal(map[string]string{
+		"source":     evt.Source,
+		"event_type": evt.EventType,
+		"channel_id": channelID,
+		"routed_by":  routedBy,
+	})
+
+	var chPtr *string
+	if channelID != "" {
+		chPtr = &channelID
+	}
+
+	entry := &store.AuditEntry{
+		TS:                 time.Now().Unix(),
+		Source:             evt.Source,
+		EventType:          evt.EventType,
+		ChannelID:          chPtr,
+		RoutedBy:           &routedBy,
+		PayloadSummaryJSON: string(summary),
+		PayloadHash:        sha256Hex(evt.RawBody),
+	}
+
+	if err := r.store.InsertAudit(entry); err != nil {
+		slog.Error("router: audit insert failed", "err", err)
+	}
 }

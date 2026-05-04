@@ -25,15 +25,16 @@ import (
 // InboundMessage is the normalized representation of a Slack message event
 // after eligibility filtering and @mention stripping.
 type InboundMessage struct {
-	ChannelID  string
-	ThreadTS   string // empty if top-level
-	MessageTS  string // the message's own timestamp
-	UserID     string
-	BotID      string // empty if from human
-	Text       string // with @mention stripped
-	Files      []SlackFile
-	IsTopLevel bool // thread_ts == ts or empty
-	IsDM       bool
+	ChannelID    string
+	ThreadTS     string // empty if top-level
+	MessageTS    string // the message's own timestamp
+	UserID       string
+	BotID        string // empty if from human
+	Text         string // with @mention stripped
+	Files        []SlackFile
+	IsTopLevel   bool // thread_ts == ts or empty
+	IsDM         bool
+	IsAppMention bool // true if originated from app_mention event
 }
 
 // SlackFile describes a file attachment on an inbound message.
@@ -314,15 +315,16 @@ func (e *Edge) handleAppMention(ev *slackevents.AppMentionEvent) {
 	}
 
 	msg := &InboundMessage{
-		ChannelID:  ev.Channel,
-		ThreadTS:   threadTS,
-		MessageTS:  messageTS,
-		UserID:     ev.User,
-		BotID:      ev.BotID,
-		Text:       text,
-		Files:      files,
-		IsTopLevel: isTopLevel,
-		IsDM:       false,
+		ChannelID:    ev.Channel,
+		ThreadTS:     threadTS,
+		MessageTS:    messageTS,
+		UserID:       ev.User,
+		BotID:        ev.BotID,
+		Text:         text,
+		Files:        files,
+		IsTopLevel:   isTopLevel,
+		IsDM:         false,
+		IsAppMention: true,
 	}
 
 	e.dispatch(msg)

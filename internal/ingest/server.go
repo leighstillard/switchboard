@@ -196,6 +196,22 @@ func (s *Server) handleWebhook(source string) http.HandlerFunc {
 		if !inserted {
 			// Duplicate (idempotency key already exists) - that's fine.
 			slog.Debug("ingest: duplicate webhook ignored", "source", source, "key", idempotencyKey)
+		} else {
+			// Write audit entry for the newly ingested webhook.
+			hash := sha256.Sum256(body)
+			summary, _ := json.Marshal(map[string]string{
+				"source":          source,
+				"idempotency_key": idempotencyKey,
+			})
+			routedBy := "ingested"
+			s.store.InsertAudit(&store.AuditEntry{
+				TS:                 time.Now().Unix(),
+				Source:             source,
+				EventType:          "webhook_received",
+				RoutedBy:           &routedBy,
+				PayloadSummaryJSON: string(summary),
+				PayloadHash:        hex.EncodeToString(hash[:]),
+			})
 		}
 
 		w.WriteHeader(http.StatusAccepted)
