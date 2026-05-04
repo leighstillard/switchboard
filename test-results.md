@@ -73,6 +73,53 @@
 
 ---
 
-## §2-§13 Test Results
+## §8. Webhook ingest - durability and dedup
 
-_To be filled during test execution._
+### 8.2 Persistence before ack
+- [x] **PASS** - POST returns 202, row immediately visible in `webhook_inbox` with status `pending`.
+
+### 8.3 Idempotency dedup
+- [x] **PASS** - 3 identical requests with same delivery ID produce exactly 1 row.
+
+### 8.5 HMAC failure
+- [x] **PASS** - Bad HMAC signature returns 401.
+
+### 8.7 Body too large
+- [x] **PASS** - 2MB+ body returns 413.
+
+### 8.8 Missing idempotency key
+- [x] **PASS** - Missing `X-Switchboard-Idempotency-Key` on cron source returns 400.
+
+---
+
+## §9. Notification routing and correlations
+
+### 9.6 No matching route -> fallback channel
+- [x] **PASS** - Webhook for `unknown/unrouted-repo` accepted (202), routes to fallback.
+
+---
+
+## §10. Bridge restart guarantees
+
+### 10.5 Pending webhooks survive restart
+- **DEFERRED** - Cannot restart switchboard while it's carrying the active Slack test session (crocodile). Restarting kills the bridge and interrupts the session. Need isolated test window.
+
+---
+
+## §11. Audit, logging, and data handling
+
+### 11.4 Secrets scrubbing on inbox
+- [x] **PASS** - No sensitive headers (xoxb-, Bearer, authorization) found in `webhook_inbox`. HMAC signature stored as `[REDACTED]`.
+
+### 11.5 slog never logs secrets
+- [x] **PASS** - 0 secret leaks found in journalctl logs from last hour.
+
+---
+
+## §13. Adversarial / robustness
+
+### 13.6 Webhook flood
+- [x] **PASS** - 100 webhooks sent in rapid succession (10 concurrent batches). All persisted. Bridge remained healthy (200 health check, service active).
+
+### 13.8 Health check after all tests
+- [x] **PASS** - `GET /health` returns 200.
