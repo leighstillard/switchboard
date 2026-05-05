@@ -72,9 +72,9 @@ func TruncateWords(s string, maxWords int) string {
 // ---------------------------------------------------------------------------
 
 const (
-	targetWords       = 8
-	hardTruncateWords = 10
-	argTruncateChars  = 30
+	targetWords       = 12
+	hardTruncateWords = 14
+	argTruncateChars  = 50
 )
 
 // ---------------------------------------------------------------------------
