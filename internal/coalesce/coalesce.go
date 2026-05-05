@@ -366,8 +366,18 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 	}
 
 	text := sc.renderMessage(isFinal)
-	if text == "" && !isFinal {
+	if text == "" && len(sc.directiveBlocks) == 0 && !isFinal {
 		return
+	}
+
+	// If text is empty but we have directive blocks, use the fallback text
+	// so Slack notifications show something meaningful.
+	if text == "" && len(sc.directiveBlocks) > 0 {
+		if sc.directiveFallback != "" {
+			text = sc.directiveFallback
+		} else {
+			text = " " // Slack requires non-empty text
+		}
 	}
 
 	// Don't create a new Slack message if there's no meaningful content.
@@ -381,6 +391,15 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 	priority := 2 // chat.update
 	if isFinal {
 		priority = 1 // terminal flush
+	}
+
+	// When directive blocks are present, skip username/icon override.
+	// Slack strips Block Kit from messages sent with chat:write.customize.
+	username := sc.identity.DisplayName
+	iconURL := sc.identity.IconURL
+	if len(sc.directiveBlocks) > 0 {
+		username = ""
+		iconURL = ""
 	}
 
 	if sc.progressMessageTS == nil {
@@ -398,8 +417,8 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			Action:    outbound.ActionPostMessage,
 			Text:      text,
 			Blocks:    sc.directiveBlocks,
-			Username:  sc.identity.DisplayName,
-			IconURL:   sc.identity.IconURL,
+			Username:  username,
+			IconURL:   iconURL,
 			OnPosted: func(ts string) {
 				sc.SetProgressMessageTS(ts)
 				tsCh <- ts
@@ -423,8 +442,8 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			Text:      text,
 			Blocks:    sc.directiveBlocks,
 			MessageTS: *sc.progressMessageTS,
-			Username:  sc.identity.DisplayName,
-			IconURL:   sc.identity.IconURL,
+			Username:  username,
+			IconURL:   iconURL,
 		}
 		sc.outbound.Enqueue(item)
 	}

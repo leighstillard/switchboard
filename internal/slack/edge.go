@@ -509,16 +509,54 @@ func buildBlocks(raw []map[string]interface{}) []slackapi.Block {
 	for _, b := range raw {
 		blockType, _ := b["type"].(string)
 		switch blockType {
+		case "header":
+			textObj, _ := b["text"].(map[string]interface{})
+			txt, _ := textObj["text"].(string)
+			blocks = append(blocks, slackapi.NewHeaderBlock(
+				slackapi.NewTextBlockObject(slackapi.PlainTextType, txt, true, false),
+			))
 		case "section":
 			textObj, _ := b["text"].(map[string]interface{})
 			txt, _ := textObj["text"].(string)
+			textType := slackapi.MarkdownType
+			if tp, ok := textObj["type"].(string); ok && tp == "plain_text" {
+				textType = slackapi.PlainTextType
+			}
 			blocks = append(blocks, slackapi.NewSectionBlock(
-				slackapi.NewTextBlockObject(slackapi.MarkdownType, txt, false, false),
+				slackapi.NewTextBlockObject(textType, txt, false, false),
 				nil, nil,
 			))
+		case "context":
+			var elements []slackapi.MixedElement
+			switch elems := b["elements"].(type) {
+			case []map[string]interface{}:
+				for _, elem := range elems {
+					txt, _ := elem["text"].(string)
+					elemType, _ := elem["type"].(string)
+					if elemType == "mrkdwn" {
+						elements = append(elements, slackapi.NewTextBlockObject(slackapi.MarkdownType, txt, false, false))
+					} else {
+						elements = append(elements, slackapi.NewTextBlockObject(slackapi.PlainTextType, txt, false, false))
+					}
+				}
+			case []interface{}:
+				for _, e := range elems {
+					if elem, ok := e.(map[string]interface{}); ok {
+						txt, _ := elem["text"].(string)
+						elemType, _ := elem["type"].(string)
+						if elemType == "mrkdwn" {
+							elements = append(elements, slackapi.NewTextBlockObject(slackapi.MarkdownType, txt, false, false))
+						} else {
+							elements = append(elements, slackapi.NewTextBlockObject(slackapi.PlainTextType, txt, false, false))
+						}
+					}
+				}
+			}
+			blocks = append(blocks, slackapi.NewContextBlock("", elements...))
 		case "divider":
 			blocks = append(blocks, slackapi.NewDividerBlock())
 		default:
+			slog.Warn("buildBlocks: unsupported block type", "type", blockType)
 			blocks = append(blocks, slackapi.NewSectionBlock(
 				slackapi.NewTextBlockObject(slackapi.MarkdownType,
 					fmt.Sprintf("(unsupported block type: %s)", blockType), false, false),
