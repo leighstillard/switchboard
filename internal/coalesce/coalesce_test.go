@@ -533,3 +533,65 @@ func TestCoalescer_PlainCodeBlock_NotIntercepted(t *testing.T) {
 		t.Error("python code should remain in output text")
 	}
 }
+
+func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-dup", "elk", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Elk Worker"}, out, nil)
+	defer coal.Close()
+
+	// Send text with a directive.
+	directiveText := "Here:\n```switchboard\n{\"render\": \"todos\", \"items\": [{\"text\": \"A\", \"done\": false}]}\n```\nMore text."
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta",
+		"text": directiveText,
+	}))
+
+	// Wait for a timer flush (first render).
+	time.Sleep(1500 * time.Millisecond)
+
+	// Append more text (triggers another flush with the same directive still in buffer).
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta",
+		"text": " Even more text.",
+	}))
+
+	// Wait for second timer flush.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Final flush.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done",
+		"id":   1,
+	}))
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+
+	// Check the last item (the final flush) - should have blocks but NOT duplicated.
+	var lastItemWithBlocks *outbound.OutboundItem
+	for i := len(items) - 1; i >= 0; i-- {
+		if len(items[i].Blocks) > 0 {
+			lastItemWithBlocks = items[i]
+			break
+		}
+	}
+
+	if lastItemWithBlocks == nil {
+		t.Fatal("expected at least one item with blocks")
+	}
+
+	// Count header blocks (todos directive produces one header block).
+	headerCount := 0
+	for _, b := range lastItemWithBlocks.Blocks {
+		if b["type"] == "header" {
+			headerCount++
+		}
+	}
+
+	if headerCount > 1 {
+		t.Errorf("directive blocks duplicated: found %d header blocks, want 1", headerCount)
+	}
+}

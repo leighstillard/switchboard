@@ -679,7 +679,7 @@ func TestLLMRoutingDecision_InsertAndRetrieve(t *testing.T) {
 	threadID := "C123:1234567.890"
 	reasoning := "repo name matches workdir"
 	d := &LLMRoutingDecision{
-		WebhookInboxID: w.ID,
+		WebhookInboxID: &w.ID,
 		DecidedAt:      time.Now().Unix(),
 		Model:          "claude-haiku-4-5",
 		ThreadID:       &threadID,
@@ -725,7 +725,7 @@ func TestLLMRoutingDecision_UpdateFeedback(t *testing.T) {
 	s.InsertWebhook(w)
 
 	d := &LLMRoutingDecision{
-		WebhookInboxID: w.ID,
+		WebhookInboxID: &w.ID,
 		DecidedAt:      time.Now().Unix(),
 		Model:          "claude-haiku-4-5",
 		Confidence:     90,
@@ -764,7 +764,7 @@ func TestLLMRoutingStats(t *testing.T) {
 		s.InsertWebhook(w)
 
 		d := &LLMRoutingDecision{
-			WebhookInboxID: w.ID,
+			WebhookInboxID: &w.ID,
 			DecidedAt:      time.Now().Unix(),
 			Model:          "haiku",
 			Confidence:     80 + i,

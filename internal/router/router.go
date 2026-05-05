@@ -181,6 +181,24 @@ func (r *Router) Reload(newCfg *config.Config) {
 	defer r.mu.Unlock()
 	r.cfg = newCfg
 	r.routes = newCfg.Routes
+
+	// Recreate or tear down LLM router based on new config.
+	if newCfg.Routing.LLM.Enabled {
+		llmCfg := llmrouter.Config{
+			Enabled:             true,
+			Model:               newCfg.Routing.LLM.Model,
+			ConfidenceThreshold: newCfg.Routing.LLM.ConfidenceThreshold,
+			MaxInputTokens:      newCfg.Routing.LLM.MaxInputTokens,
+			IncludeThreadCount:  newCfg.Routing.LLM.IncludeThreadCount,
+			APIKey:              newCfg.Routing.LLM.APIKey,
+			MonthlyBudgetUSD:    newCfg.Routing.LLM.MonthlyBudgetUSD,
+		}
+		r.llmRouter = llmrouter.New(llmCfg)
+		slog.Info("router: LLM router (re)enabled on reload", "model", llmCfg.Model)
+	} else {
+		r.llmRouter = nil
+	}
+
 	slog.Info("router: config reloaded",
 		"routes", len(newCfg.Routes),
 		"channels", len(newCfg.Channels),
@@ -869,7 +887,7 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 
 	// Record the decision.
 	decisionRecord := &store.LLMRoutingDecision{
-		WebhookInboxID: 0, // populated if durable inbox is used
+		WebhookInboxID: nil, // set when durable inbox is used
 		DecidedAt:      time.Now().Unix(),
 		Model:          r.cfg.Routing.LLM.Model,
 		ThreadID:       decision.ThreadID,

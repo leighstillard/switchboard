@@ -94,7 +94,7 @@ type MaintenanceConfig struct {
 // LLMRoutingDecision records an LLM routing decision for audit.
 type LLMRoutingDecision struct {
 	ID             int64
-	WebhookInboxID int64
+	WebhookInboxID *int64 // nullable; set when durable inbox is used
 	DecidedAt      int64
 	Model          string
 	ThreadID       *string
@@ -306,7 +306,7 @@ func migrateV2(db *sql.DB) error {
 		// -- LLM routing decisions (v1.1 Feature 2)
 		`CREATE TABLE IF NOT EXISTS llm_routing_decisions (
 			id               INTEGER PRIMARY KEY AUTOINCREMENT,
-			webhook_inbox_id INTEGER NOT NULL,
+			webhook_inbox_id INTEGER,
 			decided_at       INTEGER NOT NULL,
 			model            TEXT NOT NULL,
 			thread_id        TEXT,
@@ -314,10 +314,9 @@ func migrateV2(db *sql.DB) error {
 			reasoning        TEXT,
 			posted_to        TEXT NOT NULL,
 			user_feedback    TEXT,
-			feedback_at      INTEGER,
-			FOREIGN KEY (webhook_inbox_id) REFERENCES webhook_inbox(id)
+			feedback_at      INTEGER
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_llm_routing_inbox ON llm_routing_decisions(webhook_inbox_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_llm_routing_inbox ON llm_routing_decisions(webhook_inbox_id) WHERE webhook_inbox_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_routing_feedback ON llm_routing_decisions(user_feedback, decided_at)`,
 
 		// -- set version

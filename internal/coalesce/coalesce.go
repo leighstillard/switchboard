@@ -462,6 +462,11 @@ func (sc *SessionCoalescer) checkOverflow() {
 func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	var sb strings.Builder
 
+	// Reset directive blocks before re-extracting from the full buffer.
+	// This prevents duplication across incremental flushes.
+	sc.directiveBlocks = nil
+	sc.directiveFallback = ""
+
 	// Header only on the first turn of a new session.
 	if sc.firstTurn {
 		emoji := "🤖"
