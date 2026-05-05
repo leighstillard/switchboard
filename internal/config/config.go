@@ -25,6 +25,7 @@ type Config struct {
 	Ingest     IngestConfig                `toml:"ingest"`
 	GitHub     GitHubConfig                `toml:"github"`
 	Render     RenderConfig                `toml:"render"`
+	Routing    RoutingConfig2              `toml:"routing"`
 	Channels   []ChannelConfig             `toml:"channels"`
 	Routes     []RouteConfig               `toml:"routes"`
 	Identities map[string]IdentityConfig   `toml:"identities"`
@@ -71,6 +72,22 @@ type BridgeConfig struct {
 // RoutingConfig controls message routing behaviour.
 type RoutingConfig struct {
 	WorkspaceFallback bool `toml:"workspace_fallback"`
+}
+
+// RoutingConfig2 holds the top-level [routing] section with LLM router config.
+type RoutingConfig2 struct {
+	LLM LLMRoutingConfig `toml:"llm"`
+}
+
+// LLMRoutingConfig holds settings for the LLM-based notification router.
+type LLMRoutingConfig struct {
+	Enabled             bool    `toml:"enabled"`
+	Model               string  `toml:"model"`
+	ConfidenceThreshold int     `toml:"confidence_threshold"`
+	MaxInputTokens      int     `toml:"max_input_tokens"`
+	IncludeThreadCount  int     `toml:"include_thread_count"`
+	APIKey              string  `toml:"api_key"`
+	MonthlyBudgetUSD    float64 `toml:"monthly_budget_usd"`
 }
 
 // AuditConfig controls audit log settings.

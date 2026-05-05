@@ -91,6 +91,20 @@ type MaintenanceConfig struct {
 	MaxCorrelationRows         int
 }
 
+// LLMRoutingDecision records an LLM routing decision for audit.
+type LLMRoutingDecision struct {
+	ID             int64
+	WebhookInboxID int64
+	DecidedAt      int64
+	Model          string
+	ThreadID       *string
+	Confidence     int
+	Reasoning      *string
+	PostedTo       string // "suggested" or "fallback"
+	UserFeedback   *string // "confirmed", "rejected", nil
+	FeedbackAt     *int64
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -174,6 +188,11 @@ func migrate(db *sql.DB) error {
 	if version < 1 {
 		if err := migrateV1(db); err != nil {
 			return fmt.Errorf("v1: %w", err)
+		}
+	}
+	if version < 2 {
+		if err := migrateV2(db); err != nil {
+			return fmt.Errorf("v2: %w", err)
 		}
 	}
 
@@ -265,6 +284,44 @@ func migrateV1(db *sql.DB) error {
 
 		// -- set version
 		`PRAGMA user_version = 1`,
+	}
+
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("exec %q: %w", stmt[:min(len(stmt), 60)], err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func migrateV2(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		// -- LLM routing decisions (v1.1 Feature 2)
+		`CREATE TABLE IF NOT EXISTS llm_routing_decisions (
+			id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			webhook_inbox_id INTEGER NOT NULL,
+			decided_at       INTEGER NOT NULL,
+			model            TEXT NOT NULL,
+			thread_id        TEXT,
+			confidence       INTEGER NOT NULL,
+			reasoning        TEXT,
+			posted_to        TEXT NOT NULL,
+			user_feedback    TEXT,
+			feedback_at      INTEGER,
+			FOREIGN KEY (webhook_inbox_id) REFERENCES webhook_inbox(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_llm_routing_inbox ON llm_routing_decisions(webhook_inbox_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_llm_routing_feedback ON llm_routing_decisions(user_feedback, decided_at)`,
+
+		// -- set version
+		`PRAGMA user_version = 2`,
 	}
 
 	for _, stmt := range stmts {
@@ -917,4 +974,104 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// LLM Routing Decisions
+// ---------------------------------------------------------------------------
+
+// InsertLLMDecision records an LLM routing decision.
+func (s *Store) InsertLLMDecision(d *LLMRoutingDecision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`
+		INSERT INTO llm_routing_decisions
+			(webhook_inbox_id, decided_at, model, thread_id, confidence,
+			 reasoning, posted_to, user_feedback, feedback_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.WebhookInboxID, d.DecidedAt, d.Model, d.ThreadID,
+		d.Confidence, d.Reasoning, d.PostedTo, d.UserFeedback, d.FeedbackAt,
+	)
+	if err != nil {
+		return fmt.Errorf("store: insert llm decision: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	d.ID = id
+	return nil
+}
+
+// UpdateLLMFeedback records user feedback on an LLM routing decision.
+func (s *Store) UpdateLLMFeedback(id int64, feedback string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`
+		UPDATE llm_routing_decisions
+		SET user_feedback = ?, feedback_at = ?
+		WHERE id = ?`,
+		feedback, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update llm feedback: %w", err)
+	}
+	return nil
+}
+
+// GetLLMDecisionByWebhookID retrieves the routing decision for a webhook.
+func (s *Store) GetLLMDecisionByWebhookID(webhookInboxID int64) (*LLMRoutingDecision, error) {
+	row := s.db.QueryRow(`
+		SELECT id, webhook_inbox_id, decided_at, model, thread_id,
+		       confidence, reasoning, posted_to, user_feedback, feedback_at
+		FROM llm_routing_decisions
+		WHERE webhook_inbox_id = ?`, webhookInboxID)
+
+	d := &LLMRoutingDecision{}
+	err := row.Scan(&d.ID, &d.WebhookInboxID, &d.DecidedAt, &d.Model,
+		&d.ThreadID, &d.Confidence, &d.Reasoning, &d.PostedTo,
+		&d.UserFeedback, &d.FeedbackAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get llm decision: %w", err)
+	}
+	return d, nil
+}
+
+// LLMRoutingStats returns accuracy statistics for the LLM router.
+type LLMRoutingStats struct {
+	Total     int
+	Confirmed int
+	Rejected  int
+	Pending   int
+}
+
+// GetLLMRoutingStats returns feedback statistics for the last N decisions.
+func (s *Store) GetLLMRoutingStats(limit int) (*LLMRoutingStats, error) {
+	rows, err := s.db.Query(`
+		SELECT user_feedback FROM llm_routing_decisions
+		ORDER BY decided_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: get llm stats: %w", err)
+	}
+	defer rows.Close()
+
+	stats := &LLMRoutingStats{}
+	for rows.Next() {
+		var feedback *string
+		if err := rows.Scan(&feedback); err != nil {
+			return nil, fmt.Errorf("store: scan llm stats: %w", err)
+		}
+		stats.Total++
+		if feedback == nil {
+			stats.Pending++
+		} else if *feedback == "confirmed" {
+			stats.Confirmed++
+		} else if *feedback == "rejected" {
+			stats.Rejected++
+		}
+	}
+	return stats, rows.Err()
 }

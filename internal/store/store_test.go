@@ -37,8 +37,8 @@ func TestNew_WALAndIntegrity(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Errorf("user_version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("user_version = %d, want 2", version)
 	}
 }
 
@@ -653,5 +653,148 @@ func TestConcurrentAccess(t *testing.T) {
 		if err := <-errc; err != nil {
 			t.Errorf("concurrent op: %v", err)
 		}
+	}
+}
+
+func TestLLMRoutingDecision_InsertAndRetrieve(t *testing.T) {
+	s := newTestStore(t)
+
+	// First, insert a webhook to satisfy the FK.
+	w := &WebhookInboxItem{
+		ReceivedAt:     time.Now().Unix(),
+		Source:         "test",
+		IdempotencyKey: "test-llm-1",
+		HeadersJSON:    "{}",
+		BodyBlob:       []byte("{}"),
+		Status:         "done",
+	}
+	inserted, err := s.InsertWebhook(w)
+	if err != nil {
+		t.Fatalf("InsertWebhook: %v", err)
+	}
+	if !inserted {
+		t.Fatal("webhook not inserted")
+	}
+
+	threadID := "C123:1234567.890"
+	reasoning := "repo name matches workdir"
+	d := &LLMRoutingDecision{
+		WebhookInboxID: w.ID,
+		DecidedAt:      time.Now().Unix(),
+		Model:          "claude-haiku-4-5",
+		ThreadID:       &threadID,
+		Confidence:     85,
+		Reasoning:      &reasoning,
+		PostedTo:       "suggested",
+	}
+
+	if err := s.InsertLLMDecision(d); err != nil {
+		t.Fatalf("InsertLLMDecision: %v", err)
+	}
+	if d.ID == 0 {
+		t.Error("expected non-zero ID after insert")
+	}
+
+	// Retrieve it.
+	got, err := s.GetLLMDecisionByWebhookID(w.ID)
+	if err != nil {
+		t.Fatalf("GetLLMDecisionByWebhookID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil decision")
+	}
+	if got.Confidence != 85 {
+		t.Errorf("confidence = %d, want 85", got.Confidence)
+	}
+	if got.PostedTo != "suggested" {
+		t.Errorf("posted_to = %q, want 'suggested'", got.PostedTo)
+	}
+}
+
+func TestLLMRoutingDecision_UpdateFeedback(t *testing.T) {
+	s := newTestStore(t)
+
+	w := &WebhookInboxItem{
+		ReceivedAt:     time.Now().Unix(),
+		Source:         "test",
+		IdempotencyKey: "test-llm-fb",
+		HeadersJSON:    "{}",
+		BodyBlob:       []byte("{}"),
+		Status:         "done",
+	}
+	s.InsertWebhook(w)
+
+	d := &LLMRoutingDecision{
+		WebhookInboxID: w.ID,
+		DecidedAt:      time.Now().Unix(),
+		Model:          "claude-haiku-4-5",
+		Confidence:     90,
+		PostedTo:       "suggested",
+	}
+	s.InsertLLMDecision(d)
+
+	// Update feedback.
+	if err := s.UpdateLLMFeedback(d.ID, "confirmed"); err != nil {
+		t.Fatalf("UpdateLLMFeedback: %v", err)
+	}
+
+	// Verify.
+	got, _ := s.GetLLMDecisionByWebhookID(w.ID)
+	if got.UserFeedback == nil || *got.UserFeedback != "confirmed" {
+		t.Errorf("feedback = %v, want 'confirmed'", got.UserFeedback)
+	}
+	if got.FeedbackAt == nil {
+		t.Error("feedback_at should be set")
+	}
+}
+
+func TestLLMRoutingStats(t *testing.T) {
+	s := newTestStore(t)
+
+	// Insert some test decisions.
+	for i := 0; i < 5; i++ {
+		w := &WebhookInboxItem{
+			ReceivedAt:     time.Now().Unix(),
+			Source:         "test",
+			IdempotencyKey: fmt.Sprintf("stats-%d", i),
+			HeadersJSON:    "{}",
+			BodyBlob:       []byte("{}"),
+			Status:         "done",
+		}
+		s.InsertWebhook(w)
+
+		d := &LLMRoutingDecision{
+			WebhookInboxID: w.ID,
+			DecidedAt:      time.Now().Unix(),
+			Model:          "haiku",
+			Confidence:     80 + i,
+			PostedTo:       "suggested",
+		}
+		s.InsertLLMDecision(d)
+
+		// Mark some as confirmed/rejected.
+		if i < 3 {
+			s.UpdateLLMFeedback(d.ID, "confirmed")
+		} else if i == 3 {
+			s.UpdateLLMFeedback(d.ID, "rejected")
+		}
+		// i == 4 stays pending
+	}
+
+	stats, err := s.GetLLMRoutingStats(100)
+	if err != nil {
+		t.Fatalf("GetLLMRoutingStats: %v", err)
+	}
+	if stats.Total != 5 {
+		t.Errorf("total = %d, want 5", stats.Total)
+	}
+	if stats.Confirmed != 3 {
+		t.Errorf("confirmed = %d, want 3", stats.Confirmed)
+	}
+	if stats.Rejected != 1 {
+		t.Errorf("rejected = %d, want 1", stats.Rejected)
+	}
+	if stats.Pending != 1 {
+		t.Errorf("pending = %d, want 1", stats.Pending)
 	}
 }

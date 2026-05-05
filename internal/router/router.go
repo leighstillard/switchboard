@@ -20,6 +20,7 @@ import (
 	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/jcode"
 	"github.com/format5/switchboard/internal/jcodeproto"
+	"github.com/format5/switchboard/internal/llmrouter"
 	"github.com/format5/switchboard/internal/outbound"
 	"github.com/format5/switchboard/internal/slack"
 	"github.com/format5/switchboard/internal/store"
@@ -57,6 +58,7 @@ type Router struct {
 	inboundCh chan *slack.InboundMessage
 	webhookCh chan *WebhookEvent
 
+	llmRouter          *llmrouter.Router
 	maxQueuePerSession int
 }
 
@@ -80,6 +82,21 @@ func New(
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
+	}
+
+	// Initialize LLM router if configured.
+	if cfg.Routing.LLM.Enabled {
+		llmCfg := llmrouter.Config{
+			Enabled:             true,
+			Model:               cfg.Routing.LLM.Model,
+			ConfidenceThreshold: cfg.Routing.LLM.ConfidenceThreshold,
+			MaxInputTokens:      cfg.Routing.LLM.MaxInputTokens,
+			IncludeThreadCount:  cfg.Routing.LLM.IncludeThreadCount,
+			APIKey:              cfg.Routing.LLM.APIKey,
+			MonthlyBudgetUSD:    cfg.Routing.LLM.MonthlyBudgetUSD,
+		}
+		r.llmRouter = llmrouter.New(llmCfg)
+		slog.Info("router: LLM router enabled", "model", llmCfg.Model, "threshold", llmCfg.ConfidenceThreshold)
 	}
 
 	// Register as the inbound handler for Slack events.
@@ -558,7 +575,13 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 	}
 
 	if matchedRoute == nil {
-		// No matching route: post to fallback channel.
+		// No matching route: try LLM router, then fall back.
+		if r.llmRouter != nil {
+			r.handleWebhookLLMRouting(ctx, evt)
+			return
+		}
+
+		// No LLM router: post to fallback channel.
 		fallbackID := r.cfg.Ingest.FallbackChannelID
 		if fallbackID != "" {
 			text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
@@ -806,6 +829,148 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// LLM-based webhook routing
+// ---------------------------------------------------------------------------
+
+// handleWebhookLLMRouting routes an unmatched webhook event via the LLM router.
+func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent) {
+	fallbackID := r.cfg.Ingest.FallbackChannelID
+
+	// Build thread context for the LLM.
+	threads := r.buildThreadContext()
+
+	// Build webhook summary.
+	summary := llmrouter.WebhookSummary{
+		Source:    evt.Source,
+		EventType: evt.EventType,
+		Summary:   truncateJSON(evt.Payload, 500),
+	}
+
+	// Call the LLM router.
+	decision, err := r.llmRouter.Route(ctx, summary, threads)
+	if err != nil || decision == nil {
+		// LLM failed or unavailable: fall back.
+		if fallbackID != "" {
+			text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
+				evt.Source, evt.EventType, truncateJSON(evt.Payload, 500))
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: fallbackID,
+				Action:    outbound.ActionPostMessage,
+				Text:      text,
+			})
+		}
+		r.auditWebhookRouting(evt, "fallback", fallbackID)
+		return
+	}
+
+	// Record the decision.
+	decisionRecord := &store.LLMRoutingDecision{
+		WebhookInboxID: 0, // populated if durable inbox is used
+		DecidedAt:      time.Now().Unix(),
+		Model:          r.cfg.Routing.LLM.Model,
+		ThreadID:       decision.ThreadID,
+		Confidence:     decision.Confidence,
+		Reasoning:      &decision.Reasoning,
+	}
+
+	if r.llmRouter.MeetsThreshold(decision) && decision.ThreadID != nil {
+		// Route to suggested thread.
+		parts := strings.SplitN(*decision.ThreadID, ":", 2)
+		if len(parts) == 2 {
+			channelID, threadTS := parts[0], parts[1]
+			text := r.formatWebhookMessage(evt)
+			text += fmt.Sprintf("\n_routed by AI (confidence %d%%, %s)_", decision.Confidence, decision.Reasoning)
+
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: channelID,
+				ThreadTS:  threadTS,
+				Action:    outbound.ActionPostMessage,
+				Text:      text,
+			})
+
+			decisionRecord.PostedTo = "suggested"
+			r.auditWebhookRouting(evt, "llm", channelID)
+
+			slog.Info("router: LLM routed webhook to thread",
+				"source", evt.Source,
+				"event_type", evt.EventType,
+				"channel", channelID,
+				"thread_ts", threadTS,
+				"confidence", decision.Confidence,
+			)
+		} else {
+			// Malformed thread_id from LLM: fall back.
+			decisionRecord.PostedTo = "fallback"
+			r.postToFallback(evt, fallbackID, decision)
+		}
+	} else {
+		// Below threshold: post to fallback with reasoning.
+		decisionRecord.PostedTo = "fallback"
+		r.postToFallback(evt, fallbackID, decision)
+	}
+
+	// Persist the decision.
+	if err := r.store.InsertLLMDecision(decisionRecord); err != nil {
+		slog.Error("router: failed to persist LLM decision", "error", err)
+	}
+}
+
+// postToFallback posts an unrouted webhook to the fallback channel with LLM reasoning.
+func (r *Router) postToFallback(evt *WebhookEvent, fallbackID string, decision *llmrouter.Decision) {
+	if fallbackID == "" {
+		return
+	}
+
+	text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
+		evt.Source, evt.EventType, truncateJSON(evt.Payload, 500))
+
+	if decision != nil && decision.Reasoning != "" {
+		text += fmt.Sprintf("\n_AI reasoning (confidence %d%%): %s_", decision.Confidence, decision.Reasoning)
+	}
+
+	r.outbound.Enqueue(&outbound.OutboundItem{
+		Priority:  3,
+		ChannelID: fallbackID,
+		Action:    outbound.ActionPostMessage,
+		Text:      text,
+	})
+
+	r.auditWebhookRouting(evt, "fallback_llm", fallbackID)
+}
+
+// buildThreadContext gathers recent active threads for the LLM prompt.
+func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
+	sessions, err := r.store.ListActiveSessions()
+	if err != nil {
+		slog.Error("router: failed to list active sessions for LLM context", "error", err)
+		return nil
+	}
+
+	var threads []llmrouter.ThreadContext
+	for _, sess := range sessions {
+		channelName := r.edge.ChannelName(sess.ChannelID)
+		if channelName == "" {
+			channelName = sess.ChannelID
+		}
+
+		lastActive := time.Since(time.Unix(sess.LastActivity, 0)).Truncate(time.Minute).String() + " ago"
+
+		threads = append(threads, llmrouter.ThreadContext{
+			ChannelID:   sess.ChannelID,
+			ChannelName: "#" + channelName,
+			ThreadTS:    sess.ThreadTS,
+			Topic:       sess.FriendlyName,
+			Workdir:     sess.Workdir,
+			LastActive:  lastActive,
+		})
+	}
+
+	return threads
 }
 
 // ---------------------------------------------------------------------------
