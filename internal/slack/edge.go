@@ -469,6 +469,26 @@ func (e *Edge) DMUser(userID, text string) (string, string, error) {
 	return channelID, ts, nil
 }
 
+// GetChannelInfo retrieves channel name from the Slack API.
+func (e *Edge) GetChannelInfo(channelID string) (string, error) {
+	ch, err := e.api.GetConversationInfo(&slackapi.GetConversationInfoInput{
+		ChannelID: channelID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("slack: get channel info: %w", err)
+	}
+	return ch.Name, nil
+}
+
+// IsUserAdmin checks if a user is a Slack workspace admin or owner.
+func (e *Edge) IsUserAdmin(userID string) (bool, error) {
+	user, err := e.api.GetUserInfo(userID)
+	if err != nil {
+		return false, fmt.Errorf("slack: get user info: %w", err)
+	}
+	return user.IsAdmin || user.IsOwner, nil
+}
+
 // ChannelForWorkdir returns the channel config for a given working directory.
 func (e *Edge) ChannelForWorkdir(workdir string) *config.ChannelConfig {
 	e.mu.RLock()

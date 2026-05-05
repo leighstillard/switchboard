@@ -103,7 +103,7 @@ func main() {
 	ing := ingest.NewServer(cfg.Ingest, st)
 
 	// 6. Router (wires everything together)
-	rt := router.New(cfg, st, jc, edge, out)
+	rt := router.New(cfg, st, jc, edge, out, *configPath)
 
 	// Wire ingest -> router.
 	ing.SetHandler(func(item *store.WebhookInboxItem) {

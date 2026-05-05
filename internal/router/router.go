@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ type Router struct {
 
 	llmRouter          *llmrouter.Router
 	maxQueuePerSession int
+	configPath         string
 }
 
 // New creates a Router with the given dependencies.
@@ -74,6 +76,7 @@ func New(
 	jc *jcode.Client,
 	edge *slack.Edge,
 	out *outbound.Queue,
+	configPath string,
 ) *Router {
 	r := &Router{
 		cfg:                cfg,
@@ -88,6 +91,7 @@ func New(
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
+		configPath:         configPath,
 	}
 
 	// Initialize LLM router if configured.
@@ -232,13 +236,10 @@ func (r *Router) handleInbound(ctx context.Context, msg *slack.InboundMessage) {
 	// Resolve workdir for this channel.
 	workdir, identity := r.resolveChannel(msg.ChannelID)
 	if workdir == "" {
-		slog.Info("router: no workdir for channel, DMing user", "channel", msg.ChannelID, "user", msg.UserID)
-		if msg.UserID != "" {
-			dmText := fmt.Sprintf("Hey! I got your mention in <#%s> but I'm not configured for that channel yet. Ask my admin to add it, or talk to me here in DMs!", msg.ChannelID)
-			_, _, err := r.edge.DMUser(msg.UserID, dmText)
-			if err != nil {
-				slog.Error("router: failed to DM user for unrouted mention", "user", msg.UserID, "err", err)
-			}
+		if msg.IsAppMention && msg.UserID != "" {
+			r.tryAutoOnboard(ctx, msg)
+		} else if msg.UserID != "" {
+			slog.Info("router: no workdir for channel (non-mention), ignoring", "channel", msg.ChannelID, "user", msg.UserID)
 		}
 		return
 	}
@@ -270,6 +271,103 @@ func (r *Router) handleInbound(ctx context.Context, msg *slack.InboundMessage) {
 	}
 
 	r.handleNewSession(ctx, msg, workdir, identity, threadTS)
+}
+
+// tryAutoOnboard attempts to auto-configure a channel when an admin mentions
+// the bot in an unconfigured channel with a matching workspace directory.
+func (r *Router) tryAutoOnboard(ctx context.Context, msg *slack.InboundMessage) {
+	// Check if user is admin.
+	isAdmin, err := r.edge.IsUserAdmin(msg.UserID)
+	if err != nil {
+		slog.Warn("router: auto-onboard: failed to check admin status", "user", msg.UserID, "err", err)
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s> but couldn't verify your permissions. Talk to me here in DMs!",
+			msg.ChannelID))
+		return
+	}
+	if !isAdmin {
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s> but I'm not configured for that channel yet. Only workspace admins can onboard new channels — ask an admin or talk to me here in DMs!",
+			msg.ChannelID))
+		return
+	}
+
+	// Look up channel name from Slack API.
+	channelName, err := r.edge.GetChannelInfo(msg.ChannelID)
+	if err != nil {
+		slog.Error("router: auto-onboard: failed to get channel info", "channel", msg.ChannelID, "err", err)
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s> but couldn't look up the channel info. Talk to me here in DMs!",
+			msg.ChannelID))
+		return
+	}
+
+	// Check for matching workspace directory.
+	home, _ := os.UserHomeDir()
+	workspacePath := filepath.Join(home, "workspace", channelName)
+	if info, err := os.Stat(workspacePath); err != nil || !info.IsDir() {
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s> (`#%s`), and you're an admin, but there's no matching workspace directory (`~/workspace/%s`). Create the directory first, then mention me again!",
+			msg.ChannelID, channelName, channelName))
+		return
+	}
+
+	// Build identity from channel name: "cc-connect" -> "CC Connect"
+	identity := titleCase(channelName)
+
+	newCh := config.ChannelConfig{
+		ID:       msg.ChannelID,
+		Name:     channelName,
+		Workdir:  workspacePath,
+		Identity: identity,
+	}
+
+	// Insert into config file.
+	if err := config.InsertChannel(r.configPath, newCh); err != nil {
+		slog.Error("router: auto-onboard: failed to insert channel", "err", err)
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s> and everything checks out, but I couldn't update my config file. Check the logs!",
+			msg.ChannelID))
+		return
+	}
+
+	// Reload config.
+	newCfg, err := config.Load(r.configPath)
+	if err != nil {
+		slog.Error("router: auto-onboard: config reload failed", "err", err)
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I added <#%s> to my config but couldn't reload. A restart will pick it up!",
+			msg.ChannelID))
+		return
+	}
+
+	r.Reload(newCfg)
+	r.edge.ReloadConfig(newCfg.Channels, newCfg.Identities)
+
+	slog.Info("router: auto-onboarded channel",
+		"channel_id", msg.ChannelID,
+		"channel_name", channelName,
+		"workdir", workspacePath,
+		"onboarded_by", msg.UserID)
+
+	// Confirm in channel then process the original message.
+	r.edge.PostMessage(msg.ChannelID, fmt.Sprintf(
+		"✅ Channel onboarded! `#%s` → `~/workspace/%s`\nProcessing your message now...",
+		channelName, channelName))
+
+	// Re-dispatch the original message now that the channel is configured.
+	r.handleInbound(ctx, msg)
+}
+
+// titleCase converts "foo-bar-baz" to "Foo Bar Baz".
+func titleCase(s string) string {
+	words := strings.Split(s, "-")
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // handleNewSession creates a new jcode session and starts processing.

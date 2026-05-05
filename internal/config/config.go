@@ -263,3 +263,32 @@ func expandPath(path string) string {
 	}
 	return path
 }
+
+// InsertChannel inserts a new [[channels]] entry into the config file.
+// It places the entry before the [ingest] section to maintain file structure.
+func InsertChannel(configPath string, ch ChannelConfig) error {
+	path := expandPath(configPath)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("config: read for insert: %w", err)
+	}
+
+	// Use ~/workspace/<name> format in the file (not expanded path)
+	entry := fmt.Sprintf("\n[[channels]]\nid = %q\nname = %q\nworkdir = \"~/workspace/%s\"\nidentity = %q\nicon_url = \"\"\n",
+		ch.ID, ch.Name, ch.Name, ch.Identity)
+
+	content := string(data)
+
+	// Insert before [ingest] section to maintain file structure
+	ingestIdx := strings.Index(content, "\n[ingest]")
+	if ingestIdx == -1 {
+		content += entry
+	} else {
+		content = content[:ingestIdx] + entry + content[ingestIdx:]
+	}
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("config: write after insert: %w", err)
+	}
+	return nil
+}
