@@ -170,6 +170,7 @@ const (
 
 	// Tool events
 	EventToolStart = "tool_start"
+	EventToolInput = "tool_input"
 	EventToolExec  = "tool_exec"
 	EventToolDone  = "tool_done"
 
@@ -273,6 +274,15 @@ type ToolStartEvent struct {
 	ID    string         `json:"id"`
 	Name  string         `json:"name"`
 	Input map[string]any `json:"input,omitempty"`
+}
+
+// ToolInputEvent streams incremental JSON fragments of tool arguments.
+// The Text field contains a partial JSON string that, when concatenated
+// across all ToolInputEvents for a given ID, forms the complete input object.
+type ToolInputEvent struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Text string `json:"text"`
 }
 
 // ToolExecEvent signals a tool is actively executing.

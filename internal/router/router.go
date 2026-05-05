@@ -841,7 +841,11 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
 		r.coalescers[key] = coal
-		r.coalescerQueue[sess.JcodeSession] = append(r.coalescerQueue[sess.JcodeSession], key)
+		// Only add to the event queue if the session was actively processing.
+		// Idle sessions will be added when a new message arrives.
+		if sess.Status == "processing" {
+			r.coalescerQueue[sess.JcodeSession] = append(r.coalescerQueue[sess.JcodeSession], key)
+		}
 		r.mu.Unlock()
 
 		// Start consuming events (only one consumer per jcode session).

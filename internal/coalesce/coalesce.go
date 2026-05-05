@@ -91,6 +91,7 @@ type SessionCoalescer struct {
 	textBuffer     strings.Builder
 	pendingTools   []ToolProgress
 	completedTools []ToolProgress
+	toolInputAccum map[string]*strings.Builder // tool ID -> accumulated JSON input
 
 	// Block Kit blocks from render directives (accumulated during the turn).
 	directiveBlocks []map[string]interface{}
@@ -204,12 +205,38 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 			sc.dirty = true
 		}
 
+	case jcodeproto.EventToolInput:
+		var e jcodeproto.ToolInputEvent
+		if json.Unmarshal(ev.Raw, &e) == nil && e.ID != "" {
+			if sc.toolInputAccum == nil {
+				sc.toolInputAccum = make(map[string]*strings.Builder)
+			}
+			buf, ok := sc.toolInputAccum[e.ID]
+			if !ok {
+				buf = &strings.Builder{}
+				sc.toolInputAccum[e.ID] = buf
+			}
+			buf.WriteString(e.Text)
+		}
+
 	case jcodeproto.EventToolExec:
 		var e jcodeproto.ToolExecEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
 			for i := range sc.pendingTools {
 				if sc.pendingTools[i].ID == e.ID {
 					sc.pendingTools[i].Exec = true
+					// Try to update description from accumulated tool input.
+					if sc.toolInputAccum != nil {
+						if buf, ok := sc.toolInputAccum[e.ID]; ok {
+							var input map[string]any
+							if json.Unmarshal([]byte(buf.String()), &input) == nil {
+								desc := render.Describe(e.Name, input)
+								sc.driftMonitor.Record(desc)
+								sc.pendingTools[i].Description = desc
+							}
+							delete(sc.toolInputAccum, e.ID)
+						}
+					}
 					break
 				}
 			}
@@ -323,6 +350,7 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	sc.textBuffer.Reset()
 	sc.pendingTools = nil
 	sc.completedTools = nil
+	sc.toolInputAccum = nil
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
 	sc.progressMessageTS = nil // next turn gets a new Slack message
