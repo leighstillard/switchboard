@@ -232,15 +232,13 @@ func (r *Router) handleInbound(ctx context.Context, msg *slack.InboundMessage) {
 	// Resolve workdir for this channel.
 	workdir, identity := r.resolveChannel(msg.ChannelID)
 	if workdir == "" {
-		slog.Debug("router: no workdir for channel, forwarding to fallback", "channel", msg.ChannelID)
-		fallbackID := r.cfg.Ingest.FallbackChannelID
-		if fallbackID != "" && fallbackID != msg.ChannelID {
-			r.outbound.Enqueue(&outbound.OutboundItem{
-				Priority:  3,
-				ChannelID: fallbackID,
-				Action:    outbound.ActionPostMessage,
-				Text:      fmt.Sprintf("📩 Unrouted message from <#%s> by <@%s>:\n> %s", msg.ChannelID, msg.UserID, msg.Text),
-			})
+		slog.Info("router: no workdir for channel, DMing user", "channel", msg.ChannelID, "user", msg.UserID)
+		if msg.UserID != "" {
+			dmText := fmt.Sprintf("Hey! I got your mention in <#%s> but I'm not configured for that channel yet. Ask my admin to add it, or talk to me here in DMs!", msg.ChannelID)
+			_, _, err := r.edge.DMUser(msg.UserID, dmText)
+			if err != nil {
+				slog.Error("router: failed to DM user for unrouted mention", "user", msg.UserID, "err", err)
+			}
 		}
 		return
 	}

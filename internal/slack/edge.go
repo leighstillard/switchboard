@@ -450,6 +450,25 @@ func (e *Edge) RemoveReaction(channelID, ts, emoji string) error {
 	return nil
 }
 
+// DMUser opens a DM conversation with the given user ID and sends a message.
+// Returns the DM channel ID and message timestamp on success.
+func (e *Edge) DMUser(userID, text string) (string, string, error) {
+	// Open (or retrieve) a DM channel with this user.
+	ch, _, _, err := e.api.OpenConversation(&slackapi.OpenConversationParameters{
+		Users: []string{userID},
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("slack: open DM conversation: %w", err)
+	}
+
+	channelID := ch.ID
+	_, ts, err := e.api.PostMessage(channelID, slackapi.MsgOptionText(text, false))
+	if err != nil {
+		return channelID, "", fmt.Errorf("slack: post DM: %w", err)
+	}
+	return channelID, ts, nil
+}
+
 // ChannelForWorkdir returns the channel config for a given working directory.
 func (e *Edge) ChannelForWorkdir(workdir string) *config.ChannelConfig {
 	e.mu.RLock()
