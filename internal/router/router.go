@@ -51,9 +51,10 @@ type Router struct {
 	mu         sync.RWMutex
 	routes     []config.RouteConfig
 	coalescers map[string]*coalesce.SessionCoalescer // key: "channelID:threadTS"
-	// activeCoalescer maps jcode session ID to the coalescer that should
-	// receive events. Updated when a new thread is started on a reused session.
-	activeCoalescer map[string]string // jcodeSessionID -> coalescerKey
+	// coalescerQueue maps jcode session ID to an ordered queue of coalescer keys.
+	// Events are routed to the first entry. On "done", the front is popped so
+	// subsequent turns route to the next waiting coalescer (thread).
+	coalescerQueue map[string][]string // jcodeSessionID -> []coalescerKey
 
 	inboundCh chan *slack.InboundMessage
 	webhookCh chan *WebhookEvent
@@ -78,7 +79,7 @@ func New(
 		outbound:           out,
 		routes:             cfg.Routes,
 		coalescers:         make(map[string]*coalesce.SessionCoalescer),
-		activeCoalescer:    make(map[string]string),
+		coalescerQueue:     make(map[string][]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
@@ -308,7 +309,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	key := coalescerKey(msg.ChannelID, threadTS)
 	r.mu.Lock()
 	r.coalescers[key] = coal
-	r.activeCoalescer[sessionID] = key
+	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], key)
 	r.mu.Unlock()
 
 	// Add 👀 reaction to acknowledge receipt.
@@ -382,8 +383,8 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 			)
 			r.coalescers[key] = coal
 		}
-		// Point the event consumer at this coalescer.
-		r.activeCoalescer[session.JcodeSession] = key
+		// Ensure event consumer routes to this coalescer for the next turn.
+		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
 		r.mu.Unlock()
 	} else if session.Status == "processing" {
 		// Session is busy: enqueue the message.
@@ -482,9 +483,13 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				return
 			}
 
-			// Look up the active coalescer for this jcode session.
+			// Look up the active coalescer for this jcode session (front of queue).
 			r.mu.RLock()
-			key := r.activeCoalescer[sessionID]
+			queue := r.coalescerQueue[sessionID]
+			var key string
+			if len(queue) > 0 {
+				key = queue[0]
+			}
 			coal := r.coalescers[key]
 			r.mu.RUnlock()
 
@@ -520,6 +525,14 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 
 			// Handle turn completion.
 			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
+				// Pop the front of the coalescer queue so subsequent events
+				// route to the next waiting thread.
+				r.mu.Lock()
+				if q := r.coalescerQueue[sessionID]; len(q) > 0 {
+					r.coalescerQueue[sessionID] = q[1:]
+				}
+				r.mu.Unlock()
+
 				r.handleTurnEnd(ctx, sessionID, key)
 			}
 		}
@@ -828,7 +841,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
 		r.coalescers[key] = coal
-		r.activeCoalescer[sess.JcodeSession] = key
+		r.coalescerQueue[sess.JcodeSession] = append(r.coalescerQueue[sess.JcodeSession], key)
 		r.mu.Unlock()
 
 		// Start consuming events (only one consumer per jcode session).
