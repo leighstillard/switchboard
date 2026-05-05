@@ -24,6 +24,7 @@ type Config struct {
 	Jcode      JcodeConfig                 `toml:"jcode"`
 	Ingest     IngestConfig                `toml:"ingest"`
 	GitHub     GitHubConfig                `toml:"github"`
+	Render     RenderConfig                `toml:"render"`
 	Channels   []ChannelConfig             `toml:"channels"`
 	Routes     []RouteConfig               `toml:"routes"`
 	Identities map[string]IdentityConfig   `toml:"identities"`
@@ -33,6 +34,25 @@ type Config struct {
 type GitHubConfig struct {
 	// Repos maps "owner/repo" to a Slack channel ID for webhook routing.
 	Repos map[string]string `toml:"repos"`
+}
+
+// RenderConfig holds rendering settings for agent output.
+type RenderConfig struct {
+	Descriptions DescriptionsConfig `toml:"descriptions"`
+}
+
+// DescriptionsConfig controls terse tool description generation (Feature 1c).
+type DescriptionsConfig struct {
+	// TargetWords is the soft word-count target for descriptions (default 8).
+	TargetWords int `toml:"target_words"`
+	// HardTruncateWords is the hard word-count limit; descriptions exceeding
+	// this are truncated with an ellipsis (default 10).
+	HardTruncateWords int `toml:"hard_truncate_words"`
+	// LogTruncations enables logging when a description is truncated (default true).
+	LogTruncations bool `toml:"log_truncations"`
+	// LogDriftThreshold is the rolling-average word count above which a warning
+	// is logged (default 7).
+	LogDriftThreshold float64 `toml:"log_drift_threshold"`
 }
 
 // BridgeConfig holds top-level bridge settings.

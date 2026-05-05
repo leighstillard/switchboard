@@ -15,6 +15,7 @@ import (
 
 	"github.com/format5/switchboard/internal/jcodeproto"
 	"github.com/format5/switchboard/internal/outbound"
+	"github.com/format5/switchboard/internal/render"
 )
 
 // ---------------------------------------------------------------------------
@@ -38,12 +39,13 @@ const (
 
 // ToolProgress tracks a single tool invocation.
 type ToolProgress struct {
-	ID       string
-	Name     string
-	Output   string // only populated on done
-	Error    string // only populated on done with error
-	Done     bool
-	Exec     bool // true after tool_exec (actively running)
+	ID          string
+	Name        string
+	Description string // human-friendly, e.g. "Reading `auth.go`"
+	Output      string // only populated on done
+	Error       string // only populated on done with error
+	Done        bool
+	Exec        bool // true after tool_exec (actively running)
 }
 
 // Identity holds the display name and icon for a session's Slack messages.
@@ -101,6 +103,9 @@ type SessionCoalescer struct {
 	outbound OutboundEnqueuer
 	onImage  ImageHandler
 
+	// Drift monitor for tool description word count (Feature 1c).
+	driftMonitor *render.DriftMonitor
+
 	// Flush timer
 	timer  *time.Timer
 	done   chan struct{}
@@ -125,6 +130,7 @@ func NewSessionCoalescer(
 		onImage:      onImage,
 		firstTurn:    true,
 		lastFlush:    time.Now(),
+		driftMonitor: render.NewDriftMonitor(7), // default threshold
 		done:         make(chan struct{}),
 	}
 
@@ -177,9 +183,18 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventToolStart:
 		var e jcodeproto.ToolStartEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
+			desc := render.Describe(e.Name, e.Input)
+			sc.driftMonitor.Record(desc)
+			if sc.driftMonitor.IsAboveThreshold() {
+				slog.Warn("tool description drift above threshold",
+					"session_id", sc.sessionID,
+					"avg_words", sc.driftMonitor.Average(),
+				)
+			}
 			sc.pendingTools = append(sc.pendingTools, ToolProgress{
-				ID:   e.ID,
-				Name: e.Name,
+				ID:          e.ID,
+				Name:        e.Name,
+				Description: desc,
 			})
 			sc.dirty = true
 		}
@@ -214,15 +229,17 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 			} else {
 				tp.Output = e.Output
 			}
-			sc.completedTools = append(sc.completedTools, tp)
 
-			// Remove from pending.
+			// Carry description from the pending tool entry.
 			for i := range sc.pendingTools {
 				if sc.pendingTools[i].ID == e.ID {
+					tp.Description = sc.pendingTools[i].Description
 					sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
 					break
 				}
 			}
+
+			sc.completedTools = append(sc.completedTools, tp)
 			sc.dirty = true
 		}
 
@@ -459,10 +476,14 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	if len(sc.completedTools) > 0 {
 		sb.WriteString("\n")
 		for _, t := range sc.completedTools {
+			label := t.Description
+			if label == "" {
+				label = t.Name
+			}
 			if t.Error != "" {
-				sb.WriteString(fmt.Sprintf("❌ %s\n", t.Name))
+				sb.WriteString(fmt.Sprintf("❌ %s\n", label))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s %s\n", toolCheckmark, t.Name))
+				sb.WriteString(fmt.Sprintf("%s %s\n", toolCheckmark, label))
 			}
 		}
 	}
@@ -471,11 +492,15 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	if len(sc.pendingTools) > 0 {
 		sb.WriteString("\n")
 		for _, t := range sc.pendingTools {
+			label := t.Description
+			if label == "" {
+				label = t.Name
+			}
 			status := "starting"
 			if t.Exec {
 				status = "running"
 			}
-			sb.WriteString(fmt.Sprintf("%s %s (%s)\n", toolSpinner, t.Name, status))
+			sb.WriteString(fmt.Sprintf("%s %s (%s)\n", toolSpinner, label, status))
 		}
 	}
 

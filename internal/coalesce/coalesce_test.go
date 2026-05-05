@@ -242,3 +242,146 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// Feature 1c: Terse tool descriptions
+// ---------------------------------------------------------------------------
+
+func TestCoalescer_ToolDescription_Read(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-desc-1", "fox", "C100", "ts100", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// ToolStart with input containing file_path.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type":  "tool_start",
+		"id":    "t1",
+		"name":  "Read",
+		"input": map[string]interface{}{"file_path": "/home/user/workspace/auth.go"},
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+		"type": "tool_done", "id": "t1", "name": "Read", "output": "contents",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	items := out.getItems()
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Reading `auth.go`") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'Reading `auth.go`' in output")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_ToolDescription_Bash(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-desc-2", "fox", "C101", "ts101", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type":  "tool_start",
+		"id":    "t2",
+		"name":  "Bash",
+		"input": map[string]interface{}{"command": "go test ./..."},
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolExec, map[string]interface{}{
+		"type": "tool_exec", "id": "t2", "name": "Bash",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+		"type": "tool_done", "id": "t2", "name": "Bash", "output": "ok",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	items := out.getItems()
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Running `go test ./...`") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'Running `go test ./...`' in output")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_ToolDescription_Fallback(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-desc-3", "fox", "C102", "ts102", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Tool with no input -- should fall back to "Running Read".
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type": "tool_start", "id": "t3", "name": "Read",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+		"type": "tool_done", "id": "t3", "name": "Read", "output": "ok",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	items := out.getItems()
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Running Read") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'Running Read' fallback in output")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_ToolDescription_PendingShowsDescription(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-desc-4", "fox", "C103", "ts103", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type":  "tool_start",
+		"id":    "t4",
+		"name":  "Grep",
+		"input": map[string]interface{}{"pattern": "TODO"},
+	}))
+
+	// Wait for timer flush so we see the pending tool.
+	time.Sleep(1500 * time.Millisecond)
+
+	items := out.getItems()
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Find `TODO` uses") && contains(item.Text, toolSpinner) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected pending tool with description 'Find `TODO` uses'")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}

@@ -266,9 +266,13 @@ type MessageEndEvent struct{}
 type InterruptedEvent struct{}
 
 // ToolStartEvent signals the start of a tool invocation.
+// The Input field captures tool arguments from the wire JSON for generating
+// human-friendly descriptions (Feature 1c). It is nil if the wire event
+// doesn't include an "input" object.
 type ToolStartEvent struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Input map[string]any `json:"input,omitempty"`
 }
 
 // ToolExecEvent signals a tool is actively executing.
