@@ -277,12 +277,11 @@ type ToolStartEvent struct {
 }
 
 // ToolInputEvent streams incremental JSON fragments of tool arguments.
-// The Text field contains a partial JSON string that, when concatenated
-// across all ToolInputEvents for a given ID, forms the complete input object.
+// The Delta field contains a partial JSON string that, when concatenated
+// across all ToolInputEvents for a given tool, forms the complete input object.
+// Note: tool_input events do NOT include id/name fields on the wire.
 type ToolInputEvent struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Text string `json:"text"`
+	Delta string `json:"delta"`
 }
 
 // ToolExecEvent signals a tool is actively executing.
