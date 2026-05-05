@@ -335,6 +335,16 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 
 // handleContinuation routes a message to an existing session.
 func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessage, session *store.Session, threadTS string) {
+	// If the message @mentions another user and does NOT mention the bot,
+	// treat it as directed at that other user and ignore it. This prevents
+	// the bot from responding to e.g. "@alice can you review this?" in an
+	// owned thread. DMs are exempt (always process).
+	if !msg.IsDM && msg.MentionsOther && !msg.MentionsBot {
+		slog.Debug("router: ignoring thread reply mentioning other user",
+			"channel", msg.ChannelID, "thread_ts", threadTS, "user", msg.UserID)
+		return
+	}
+
 	// Audit the inbound message.
 	r.auditSlackMessage(msg, threadTS)
 

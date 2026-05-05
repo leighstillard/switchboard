@@ -35,6 +35,8 @@ type InboundMessage struct {
 	IsTopLevel   bool // thread_ts == ts or empty
 	IsDM         bool
 	IsAppMention bool // true if originated from app_mention event
+	MentionsBot  bool // true if the original text contained our @mention
+	MentionsOther bool // true if the text contains @mentions of other users
 }
 
 // SlackFile describes a file attachment on an inbound message.
@@ -275,6 +277,8 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	// Reply in owned thread: always process (no mention needed).
 	// DM to bot: always process.
 
+	mentionsBot := strings.Contains(ev.Text, "<@"+e.botUserID+">")
+	mentionsOther := hasMentionOtherThan(ev.Text, e.botUserID)
 	text := e.stripBotMention(ev.Text)
 
 	// Extract files from the Message field (populated by custom UnmarshalJSON).
@@ -292,15 +296,17 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	}
 
 	msg := &InboundMessage{
-		ChannelID:  channelID,
-		ThreadTS:   threadTS,
-		MessageTS:  messageTS,
-		UserID:     ev.User,
-		BotID:      ev.BotID,
-		Text:       text,
-		Files:      files,
-		IsTopLevel: isTopLevel,
-		IsDM:       isDM,
+		ChannelID:     channelID,
+		ThreadTS:      threadTS,
+		MessageTS:     messageTS,
+		UserID:        ev.User,
+		BotID:         ev.BotID,
+		Text:          text,
+		Files:         files,
+		IsTopLevel:    isTopLevel,
+		IsDM:          isDM,
+		MentionsBot:   mentionsBot,
+		MentionsOther: mentionsOther,
 	}
 
 	e.dispatch(msg)
@@ -328,16 +334,18 @@ func (e *Edge) handleAppMention(ev *slackevents.AppMentionEvent) {
 	}
 
 	msg := &InboundMessage{
-		ChannelID:    ev.Channel,
-		ThreadTS:     threadTS,
-		MessageTS:    messageTS,
-		UserID:       ev.User,
-		BotID:        ev.BotID,
-		Text:         text,
-		Files:        files,
-		IsTopLevel:   isTopLevel,
-		IsDM:         false,
-		IsAppMention: true,
+		ChannelID:     ev.Channel,
+		ThreadTS:      threadTS,
+		MessageTS:     messageTS,
+		UserID:        ev.User,
+		BotID:         ev.BotID,
+		Text:          text,
+		Files:         files,
+		IsTopLevel:    isTopLevel,
+		IsDM:          false,
+		IsAppMention:  true,
+		MentionsBot:   true, // by definition: it's an app_mention event
+		MentionsOther: hasMentionOtherThan(ev.Text, e.botUserID),
 	}
 
 	e.dispatch(msg)
@@ -487,6 +495,21 @@ func (e *Edge) stripBotMention(text string) string {
 		text = text[:idx]
 	}
 	return strings.TrimSpace(text)
+}
+
+// userMentionRe matches Slack user mentions like <@U12345ABC>.
+var userMentionRe = regexp.MustCompile(`<@(U[A-Z0-9]+)>`)
+
+// hasMentionOtherThan returns true if the text contains an @mention of any
+// user other than the specified one (typically the bot's own user ID).
+func hasMentionOtherThan(text, excludeUserID string) bool {
+	matches := userMentionRe.FindAllStringSubmatch(text, -1)
+	for _, m := range matches {
+		if m[1] != excludeUserID {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Edge) hasChannel(channelID string) bool {

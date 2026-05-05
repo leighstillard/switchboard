@@ -250,16 +250,13 @@ func TestDescribeWithDirective_Empty(t *testing.T) {
 }
 
 func TestDescribeWithDirective_TruncatesLong(t *testing.T) {
-	longDirective := "Reading the entire authentication module to understand the flow of tokens through the system"
+	longDirective := "Reading the entire authentication module to understand the flow of tokens through the system and verifying correctness of the implementation"
 	desc := DescribeWithDirective("Read", map[string]any{}, longDirective)
 	words := strings.Fields(desc)
-	if len(words) > 10 {
-		t.Errorf("directive should be truncated to 10 words, got %d: %q", len(words), desc)
+	// hardTruncateWords is 14; with ellipsis appended to last word the count stays at 14.
+	if len(words) > 15 {
+		t.Errorf("directive should be truncated to ~14 words, got %d: %q", len(words), desc)
 	}
-	if len(words) == 10 {
-		// No ellipsis needed if exactly 10 words after truncation
-	}
-	// With the ellipsis word, should be <=10 real words + ...
 	if !strings.HasSuffix(desc, "...") {
 		t.Errorf("long directive should end with ..., got %q", desc)
 	}
