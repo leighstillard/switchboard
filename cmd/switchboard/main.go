@@ -158,6 +158,7 @@ func main() {
 			slog.Info("config reloaded successfully")
 		case syscall.SIGINT, syscall.SIGTERM:
 			slog.Info("shutdown signal received", "signal", sig.String())
+			rt.NotifyShutdown()
 			cancel()
 			slog.Info("switchboard stopped")
 			return

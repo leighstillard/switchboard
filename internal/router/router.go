@@ -56,6 +56,10 @@ type Router struct {
 	// subsequent turns route to the next waiting coalescer (thread).
 	coalescerQueue map[string][]string // jcodeSessionID -> []coalescerKey
 
+	// turnRequester tracks which user triggered the current active turn,
+	// keyed by coalescerKey. Used to @mention them when the turn completes.
+	turnRequester map[string]string // coalescerKey -> userID
+
 	inboundCh chan *slack.InboundMessage
 	webhookCh chan *WebhookEvent
 
@@ -80,6 +84,7 @@ func New(
 		routes:             cfg.Routes,
 		coalescers:         make(map[string]*coalesce.SessionCoalescer),
 		coalescerQueue:     make(map[string][]string),
+		turnRequester:      make(map[string]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
@@ -310,6 +315,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	r.mu.Lock()
 	r.coalescers[key] = coal
 	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], key)
+	r.turnRequester[key] = msg.UserID
 	r.mu.Unlock()
 
 	// Add 👀 reaction to acknowledge receipt.
@@ -395,6 +401,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		}
 		// Ensure event consumer routes to this coalescer for the next turn.
 		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		r.turnRequester[key] = msg.UserID
 		r.mu.Unlock()
 	} else if session.Status == "processing" {
 		// Session is busy: enqueue the message.
@@ -568,6 +575,21 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 
 	if len(turns) == 0 {
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
+
+		// Notify the requesting user that the turn is complete.
+		r.mu.Lock()
+		requester := r.turnRequester[coalKey]
+		delete(r.turnRequester, coalKey)
+		r.mu.Unlock()
+		if requester != "" {
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  2,
+				ChannelID: channelID,
+				ThreadTS:  threadTS,
+				Action:    outbound.ActionPostMessage,
+				Text:      fmt.Sprintf("<@%s> ✅", requester),
+			})
+		}
 		return
 	}
 
@@ -1072,6 +1094,34 @@ func (r *Router) closeAllCoalescers() {
 		coal.Close()
 		delete(r.coalescers, key)
 	}
+}
+
+// NotifyShutdown posts a message to all threads with active turns informing
+// the requesting user that the service is restarting.
+func (r *Router) NotifyShutdown() {
+	r.mu.RLock()
+	requesters := make(map[string]string, len(r.turnRequester))
+	for k, v := range r.turnRequester {
+		requesters[k] = v
+	}
+	r.mu.RUnlock()
+
+	for coalKey, userID := range requesters {
+		channelID, threadTS := parseCoalescerKey(coalKey)
+		if channelID == "" {
+			continue
+		}
+		r.outbound.Enqueue(&outbound.OutboundItem{
+			Priority:  1,
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			Action:    outbound.ActionPostMessage,
+			Text:      fmt.Sprintf("<@%s> 🔄 Service restarting - send your message again in a moment to resume.", userID),
+		})
+	}
+
+	// Give the outbound queue a moment to flush.
+	time.Sleep(500 * time.Millisecond)
 }
 
 func (r *Router) runMaintenance() {
