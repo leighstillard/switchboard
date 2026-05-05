@@ -219,11 +219,15 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 					sc.pendingTools[i].Exec = true
 					// Parse accumulated tool input and update description.
 					if sc.toolInputBuf.Len() > 0 {
+						rawInput := sc.toolInputBuf.String()
 						var input map[string]any
-						if json.Unmarshal([]byte(sc.toolInputBuf.String()), &input) == nil {
+						if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
 							desc := render.Describe(e.Name, input)
 							sc.driftMonitor.Record(desc)
 							sc.pendingTools[i].Description = desc
+						} else {
+							slog.Debug("coalescer: failed to parse tool input",
+								"tool", e.Name, "err", err, "raw_len", len(rawInput))
 						}
 						sc.toolInputBuf.Reset()
 					}

@@ -25,9 +25,20 @@ func Describe(tool string, input map[string]any) string {
 		return "Running tool"
 	}
 
+	// Try exact match first, then case-insensitive title case.
 	if fn, ok := heuristics[tool]; ok {
 		if desc := fn(input); desc != "" {
 			return TruncateWords(desc, hardTruncateWords)
+		}
+	}
+
+	// Try title-cased version (jcode sends "bash", heuristics use "Bash").
+	titleTool := strings.Title(strings.ToLower(tool))
+	if titleTool != tool {
+		if fn, ok := heuristics[titleTool]; ok {
+			if desc := fn(input); desc != "" {
+				return TruncateWords(desc, hardTruncateWords)
+			}
 		}
 	}
 
