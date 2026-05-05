@@ -308,13 +308,13 @@ func TestCoalescer_ToolDescription_Bash(t *testing.T) {
 	items := out.getItems()
 	found := false
 	for _, item := range items {
-		if contains(item.Text, "Running `go test ./...`") {
+		if contains(item.Text, "Testing ./...") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("expected 'Running `go test ./...`' in output")
+		t.Error("expected 'Testing ./...' in output")
 		for _, item := range items {
 			t.Logf("  item text: %s", item.Text)
 		}

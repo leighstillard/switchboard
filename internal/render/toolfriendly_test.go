@@ -27,7 +27,7 @@ func TestDescribe_ReadNestedPath(t *testing.T) {
 
 func TestDescribe_Bash(t *testing.T) {
 	got := Describe("Bash", map[string]any{"command": "npm test"})
-	want := "Running `npm test`"
+	want := "Running npm test"
 	if got != want {
 		t.Errorf("Describe(Bash) = %q, want %q", got, want)
 	}
@@ -36,17 +36,13 @@ func TestDescribe_Bash(t *testing.T) {
 func TestDescribe_BashLongCommand(t *testing.T) {
 	long := "find /home/user/workspace -name '*.go' -exec grep -l 'handleAuth' {} \\;"
 	got := Describe("Bash", map[string]any{"command": long})
-	// Command should be truncated to 30 chars.
-	if !strings.HasPrefix(got, "Running `") {
-		t.Errorf("Describe(Bash long) = %q, expected prefix 'Running `'", got)
+	// "find" is handled by the ls/find heuristic
+	if got == "" {
+		t.Error("expected non-empty description for find command")
 	}
-	// Extract the command portion between backticks.
-	cmdPart := extractBacktickContent(got)
-	if len(cmdPart) > 33 { // 30 chars + "..."
-		t.Errorf("command part too long: %q (%d chars)", cmdPart, len(cmdPart))
-	}
-	if !strings.HasSuffix(cmdPart, "...") {
-		t.Errorf("long command should end with ..., got %q", cmdPart)
+	// Should be a meaningful description, not just raw command
+	if strings.Contains(got, "find /home") {
+		t.Errorf("description should be human-friendly, got %q", got)
 	}
 }
 
@@ -341,10 +337,10 @@ func TestDescribe_Corpus(t *testing.T) {
 		{"Read", map[string]any{"file_path": "/home/user/project/main.go"}, "Reading `main.go`"},
 		{"Read", map[string]any{"file_path": "internal/config/config.go"}, "Reading `config.go`"},
 		{"Read", map[string]any{"file_path": "README.md"}, "Reading `README.md`"},
-		{"Bash", map[string]any{"command": "go test ./..."}, "Running `go test ./...`"},
-		{"Bash", map[string]any{"command": "docker compose up -d"}, "Running `docker compose up -d`"},
-		{"Bash", map[string]any{"command": "cat /etc/hostname"}, "Running `cat /etc/hostname`"},
-		{"Bash", map[string]any{"command": "git log --oneline -10"}, "Running `git log --oneline -10`"},
+		{"Bash", map[string]any{"command": "go test ./..."}, "Testing ./..."},
+		{"Bash", map[string]any{"command": "docker compose up -d"}, "Docker compose"},
+		{"Bash", map[string]any{"command": "cat /etc/hostname"}, "Reading hostname"},
+		{"Bash", map[string]any{"command": "git log --oneline -10"}, "Viewing git history"},
 		{"Grep", map[string]any{"pattern": "TODO"}, "Find `TODO` uses"},
 		{"Grep", map[string]any{"pattern": "func handleAuth"}, "Find `func handleAuth` uses"},
 		{"Edit", map[string]any{"file_path": "src/components/Button.tsx"}, "Editing `Button.tsx`"},
@@ -395,4 +391,35 @@ func extractBacktickContent(s string) string {
 		return ""
 	}
 	return s[start+1 : end]
+}
+
+func TestDescribe_BashSmartHeuristics(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"go build", "go build -o switchboard ./cmd/switchboard/", "Building switchboard"},
+		{"go test", "go test ./... -count=1", "Testing ./..."},
+		{"go test pkg", "go test ./internal/render/ -v", "Testing ./internal/render/"},
+		{"git commit", "git commit -m 'fix: stuff'", "Committing changes"},
+		{"git push", "git push origin main", "Pushing to remote"},
+		{"systemctl restart", "systemctl --user restart switchboard", "Restarting switchboard service"},
+		{"curl api", "curl -s -X POST https://slack.com/api/chat.postMessage -H 'Auth: x'", "Calling slack.com API"},
+		{"grep pattern", "grep -rn 'buildBlocks' internal/", "Searching for `buildBlocks`"},
+		{"cat file", "cat /home/leigh/.config/switchboard/config.toml", "Reading config.toml"},
+		{"cd then go", "cd /home/leigh/workspace/switchboard && go build ./...", "Building ./..."},
+		{"journalctl", "journalctl --user -u switchboard --since '5min ago'", "Checking service logs"},
+		{"sleep", "sleep 30", "Waiting"},
+		{"make target", "make install", "Running make install"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Describe("Bash", map[string]any{"command": tc.command})
+			if got != tc.want {
+				t.Errorf("Describe(Bash, %q) = %q, want %q", tc.command, got, tc.want)
+			}
+		})
+	}
 }
