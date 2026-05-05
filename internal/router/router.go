@@ -232,7 +232,16 @@ func (r *Router) handleInbound(ctx context.Context, msg *slack.InboundMessage) {
 	// Resolve workdir for this channel.
 	workdir, identity := r.resolveChannel(msg.ChannelID)
 	if workdir == "" {
-		slog.Debug("router: no workdir for channel", "channel", msg.ChannelID)
+		slog.Debug("router: no workdir for channel, forwarding to fallback", "channel", msg.ChannelID)
+		fallbackID := r.cfg.Ingest.FallbackChannelID
+		if fallbackID != "" && fallbackID != msg.ChannelID {
+			r.outbound.Enqueue(&outbound.OutboundItem{
+				Priority:  3,
+				ChannelID: fallbackID,
+				Action:    outbound.ActionPostMessage,
+				Text:      fmt.Sprintf("📩 Unrouted message from <#%s> by <@%s>:\n> %s", msg.ChannelID, msg.UserID, msg.Text),
+			})
+		}
 		return
 	}
 
