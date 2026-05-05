@@ -385,3 +385,151 @@ func TestCoalescer_ToolDescription_PendingShowsDescription(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Directive integration tests (Feature 1a)
+// ---------------------------------------------------------------------------
+
+func TestCoalescer_DirectiveExtraction(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-dir", "owl", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Owl Worker"}, out, nil)
+	defer coal.Close()
+
+	// Send text that includes a render directive.
+	directiveText := "Here's the plan:\n```switchboard\n{\"render\": \"plan\", \"title\": \"Deploy\", \"tasks\": [{\"id\": \"1\", \"title\": \"Build\", \"status\": \"complete\"}, {\"id\": \"2\", \"title\": \"Test\", \"status\": \"pending\"}]}\n```\nDone explaining."
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta",
+		"text": directiveText,
+	}))
+
+	// Trigger a final flush.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done",
+		"id":   1,
+	}))
+
+	// Wait for flush.
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected at least one outbound item")
+	}
+
+	// Find the item with blocks.
+	var hasBlocks bool
+	var hasCleanText bool
+	for _, item := range items {
+		if len(item.Blocks) > 0 {
+			hasBlocks = true
+		}
+		// Directive should be removed from visible text
+		if contains(item.Text, "Done explaining") && !contains(item.Text, "switchboard") {
+			hasCleanText = true
+		}
+	}
+
+	if !hasBlocks {
+		t.Error("expected blocks from plan directive in outbound item")
+		for _, item := range items {
+			t.Logf("  item: text=%q blocks=%d", item.Text[:min(len(item.Text), 100)], len(item.Blocks))
+		}
+	}
+	if !hasCleanText {
+		t.Error("directive should be removed from text, leaving surrounding content")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_DirectiveInvalid_LeftInText(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-dir2", "bear", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Bear Worker"}, out, nil)
+	defer coal.Close()
+
+	// Send text with an invalid directive (unknown type).
+	directiveText := "Check this:\n```switchboard\n{\"render\": \"unknown_type\", \"data\": 123}\n```\nEnd."
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta",
+		"text": directiveText,
+	}))
+
+	// Final flush.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done",
+		"id":   1,
+	}))
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected at least one outbound item")
+	}
+
+	// Invalid directives should remain visible in text.
+	var foundInText bool
+	for _, item := range items {
+		if contains(item.Text, "unknown_type") {
+			foundInText = true
+			break
+		}
+	}
+	if !foundInText {
+		t.Error("invalid directive should remain visible in text")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_PlainCodeBlock_NotIntercepted(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-dir3", "cat", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Cat Worker"}, out, nil)
+	defer coal.Close()
+
+	// Send text with a plain code block (python).
+	text := "Here's code:\n```python\ndef hello():\n    print('hi')\n```\nDone."
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta",
+		"text": text,
+	}))
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done",
+		"id":   1,
+	}))
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected at least one outbound item")
+	}
+
+	// No blocks should be produced from a python code block.
+	for _, item := range items {
+		if len(item.Blocks) > 0 {
+			t.Error("python code block should NOT produce blocks")
+		}
+	}
+
+	// The code should remain in the text.
+	var found bool
+	for _, item := range items {
+		if contains(item.Text, "def hello") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("python code should remain in output text")
+	}
+}

@@ -92,6 +92,11 @@ type SessionCoalescer struct {
 	pendingTools   []ToolProgress
 	completedTools []ToolProgress
 
+	// Block Kit blocks from render directives (accumulated during the turn).
+	directiveBlocks []map[string]interface{}
+	// Fallback text from directives (for clients that can't render blocks).
+	directiveFallback string
+
 	upstreamProvider *string // captured for footer on final flush
 
 	firstTurn bool // true until the first turn completes (show header)
@@ -318,6 +323,8 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	sc.textBuffer.Reset()
 	sc.pendingTools = nil
 	sc.completedTools = nil
+	sc.directiveBlocks = nil
+	sc.directiveFallback = ""
 	sc.progressMessageTS = nil // next turn gets a new Slack message
 	sc.firstTurn = false       // header only on the first turn
 	sc.finalized = false
@@ -390,6 +397,7 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			ThreadTS:  sc.threadTS,
 			Action:    outbound.ActionPostMessage,
 			Text:      text,
+			Blocks:    sc.directiveBlocks,
 			Username:  sc.identity.DisplayName,
 			IconURL:   sc.identity.IconURL,
 			OnPosted: func(ts string) {
@@ -413,6 +421,7 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			ChannelID: sc.channelID,
 			Action:    outbound.ActionUpdateMessage,
 			Text:      text,
+			Blocks:    sc.directiveBlocks,
 			MessageTS: *sc.progressMessageTS,
 			Username:  sc.identity.DisplayName,
 			IconURL:   sc.identity.IconURL,
@@ -449,6 +458,7 @@ func (sc *SessionCoalescer) checkOverflow() {
 
 // renderMessage constructs the Slack message text from current state.
 // Uses Slack mrkdwn format (not standard Markdown).
+// Also processes any render directives in the text buffer, accumulating blocks.
 func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	var sb strings.Builder
 
@@ -465,11 +475,25 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 		sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 	}
 
-	// Text content (convert standard Markdown → Slack mrkdwn).
+	// Text content: extract directives, then convert remaining Markdown → mrkdwn.
 	text := sc.textBuffer.String()
 	if text != "" {
-		sb.WriteString(MarkdownToMrkdwn(text))
-		sb.WriteString("\n")
+		// Process render directives if any are present.
+		if render.HasDirectives(text) {
+			result := render.ExtractDirectives(text, false)
+			text = result.CleanText
+			if len(result.Blocks) > 0 {
+				sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)
+			}
+			if result.FallbackText != "" {
+				sc.directiveFallback = result.FallbackText
+			}
+		}
+
+		if text != "" {
+			sb.WriteString(MarkdownToMrkdwn(text))
+			sb.WriteString("\n")
+		}
 	}
 
 	// Tool summary (completed).

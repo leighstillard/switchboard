@@ -38,7 +38,9 @@ type GitHubConfig struct {
 
 // RenderConfig holds rendering settings for agent output.
 type RenderConfig struct {
-	Descriptions DescriptionsConfig `toml:"descriptions"`
+	Descriptions              DescriptionsConfig `toml:"descriptions"`
+	MarkdownSplitChars        int                `toml:"markdown_split_chars"`
+	StrictDirectiveValidation bool               `toml:"strict_directive_validation"`
 }
 
 // DescriptionsConfig controls terse tool description generation (Feature 1c).
