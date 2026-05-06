@@ -68,14 +68,25 @@ func TruncateWords(s string, maxWords int) string {
 }
 
 // ---------------------------------------------------------------------------
-// Configuration constants (match [render.descriptions] config)
+// Configuration (match [render.descriptions] config)
 // ---------------------------------------------------------------------------
 
-const (
+var (
 	targetWords       = 12
 	hardTruncateWords = 14
 	argTruncateChars  = 50
 )
+
+// ConfigureDescriptions updates the description length limits from config.
+// Values of 0 retain the defaults.
+func ConfigureDescriptions(target, hardTruncate int) {
+	if target > 0 {
+		targetWords = target
+	}
+	if hardTruncate > 0 {
+		hardTruncateWords = hardTruncate
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Heuristic table

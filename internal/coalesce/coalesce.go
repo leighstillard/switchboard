@@ -526,6 +526,10 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	if text != "" {
 		// Process render directives if any are present.
 		if render.HasDirectives(text) {
+			// TODO: pass config's StrictDirectiveValidation setting through
+			// to the coalescer. For now, non-strict mode is safer as it
+			// preserves unknown directives in the text rather than silently
+			// dropping them.
 			result := render.ExtractDirectives(text, false)
 			text = result.CleanText
 			if len(result.Blocks) > 0 {

@@ -96,14 +96,23 @@ func New(
 
 	// Initialize LLM router if configured.
 	if cfg.Routing.LLM.Enabled {
-		llmCfg := llmrouter.Config{
-			Enabled:             true,
-			Model:               cfg.Routing.LLM.Model,
-			ConfidenceThreshold: cfg.Routing.LLM.ConfidenceThreshold,
-			MaxInputTokens:      cfg.Routing.LLM.MaxInputTokens,
-			IncludeThreadCount:  cfg.Routing.LLM.IncludeThreadCount,
-			APIKey:              cfg.Routing.LLM.APIKey,
-			MonthlyBudgetUSD:    cfg.Routing.LLM.MonthlyBudgetUSD,
+		llmCfg := llmrouter.DefaultConfig()
+		llmCfg.Enabled = true
+		llmCfg.APIKey = cfg.Routing.LLM.APIKey
+		if cfg.Routing.LLM.Model != "" {
+			llmCfg.Model = cfg.Routing.LLM.Model
+		}
+		if cfg.Routing.LLM.ConfidenceThreshold > 0 {
+			llmCfg.ConfidenceThreshold = cfg.Routing.LLM.ConfidenceThreshold
+		}
+		if cfg.Routing.LLM.MaxInputTokens > 0 {
+			llmCfg.MaxInputTokens = cfg.Routing.LLM.MaxInputTokens
+		}
+		if cfg.Routing.LLM.IncludeThreadCount > 0 {
+			llmCfg.IncludeThreadCount = cfg.Routing.LLM.IncludeThreadCount
+		}
+		if cfg.Routing.LLM.MonthlyBudgetUSD > 0 {
+			llmCfg.MonthlyBudgetUSD = cfg.Routing.LLM.MonthlyBudgetUSD
 		}
 		r.llmRouter = llmrouter.New(llmCfg)
 		slog.Info("router: LLM router enabled", "model", llmCfg.Model, "threshold", llmCfg.ConfidenceThreshold)
@@ -194,14 +203,23 @@ func (r *Router) Reload(newCfg *config.Config) {
 
 	// Recreate or tear down LLM router based on new config.
 	if newCfg.Routing.LLM.Enabled {
-		llmCfg := llmrouter.Config{
-			Enabled:             true,
-			Model:               newCfg.Routing.LLM.Model,
-			ConfidenceThreshold: newCfg.Routing.LLM.ConfidenceThreshold,
-			MaxInputTokens:      newCfg.Routing.LLM.MaxInputTokens,
-			IncludeThreadCount:  newCfg.Routing.LLM.IncludeThreadCount,
-			APIKey:              newCfg.Routing.LLM.APIKey,
-			MonthlyBudgetUSD:    newCfg.Routing.LLM.MonthlyBudgetUSD,
+		llmCfg := llmrouter.DefaultConfig()
+		llmCfg.Enabled = true
+		llmCfg.APIKey = newCfg.Routing.LLM.APIKey
+		if newCfg.Routing.LLM.Model != "" {
+			llmCfg.Model = newCfg.Routing.LLM.Model
+		}
+		if newCfg.Routing.LLM.ConfidenceThreshold > 0 {
+			llmCfg.ConfidenceThreshold = newCfg.Routing.LLM.ConfidenceThreshold
+		}
+		if newCfg.Routing.LLM.MaxInputTokens > 0 {
+			llmCfg.MaxInputTokens = newCfg.Routing.LLM.MaxInputTokens
+		}
+		if newCfg.Routing.LLM.IncludeThreadCount > 0 {
+			llmCfg.IncludeThreadCount = newCfg.Routing.LLM.IncludeThreadCount
+		}
+		if newCfg.Routing.LLM.MonthlyBudgetUSD > 0 {
+			llmCfg.MonthlyBudgetUSD = newCfg.Routing.LLM.MonthlyBudgetUSD
 		}
 		r.llmRouter = llmrouter.New(llmCfg)
 		slog.Info("router: LLM router (re)enabled on reload", "model", llmCfg.Model)
@@ -744,7 +762,10 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 
 	if matchedRoute == nil {
 		// No matching route: try LLM router, then fall back.
-		if r.llmRouter != nil {
+		r.mu.RLock()
+		llm := r.llmRouter
+		r.mu.RUnlock()
+		if llm != nil {
 			r.handleWebhookLLMRouting(ctx, evt)
 			return
 		}
@@ -1009,7 +1030,14 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 
 // handleWebhookLLMRouting routes an unmatched webhook event via the LLM router.
 func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent) {
+	r.mu.RLock()
+	llm := r.llmRouter
 	fallbackID := r.cfg.Ingest.FallbackChannelID
+	r.mu.RUnlock()
+
+	if llm == nil {
+		return
+	}
 
 	// Build thread context for the LLM.
 	threads := r.buildThreadContext()
@@ -1022,7 +1050,7 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 	}
 
 	// Call the LLM router.
-	decision, err := r.llmRouter.Route(ctx, summary, threads)
+	decision, err := llm.Route(ctx, summary, threads)
 	if err != nil || decision == nil {
 		// LLM failed or unavailable: fall back.
 		if fallbackID != "" {
@@ -1049,11 +1077,22 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 		Reasoning:      &decision.Reasoning,
 	}
 
-	if r.llmRouter.MeetsThreshold(decision) && decision.ThreadID != nil {
+	if llm.MeetsThreshold(decision) && decision.ThreadID != nil {
 		// Route to suggested thread.
 		parts := strings.SplitN(*decision.ThreadID, ":", 2)
 		if len(parts) == 2 {
 			channelID, threadTS := parts[0], parts[1]
+
+			// Validate that the channel is one we actually manage.
+			if workdir, _ := r.resolveChannel(channelID); workdir == "" {
+				slog.Warn("router: LLM suggested unknown channel, falling back",
+					"thread_id", *decision.ThreadID, "channel", channelID)
+				decisionRecord.PostedTo = "fallback"
+				r.postToFallback(evt, fallbackID, decision)
+				r.store.InsertLLMDecision(decisionRecord)
+				return
+			}
+
 			text := r.formatWebhookMessage(evt)
 			text += fmt.Sprintf("\n_routed by AI (confidence %d%%, %s)_", decision.Confidence, decision.Reasoning)
 

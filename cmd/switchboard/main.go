@@ -17,6 +17,7 @@ import (
 	"github.com/format5/switchboard/internal/ingest"
 	"github.com/format5/switchboard/internal/jcode"
 	"github.com/format5/switchboard/internal/outbound"
+	"github.com/format5/switchboard/internal/render"
 	"github.com/format5/switchboard/internal/router"
 	"github.com/format5/switchboard/internal/slack"
 	"github.com/format5/switchboard/internal/store"
@@ -59,6 +60,9 @@ func main() {
 		slog.Error("failed to load config", "error", err, "path", *configPath)
 		os.Exit(1)
 	}
+
+	// Apply render description settings from config.
+	render.ConfigureDescriptions(cfg.Render.Descriptions.TargetWords, cfg.Render.Descriptions.HardTruncateWords)
 
 	if *validateConfig {
 		fmt.Printf("OK: config valid (%d channels, %d routes, ingest=%s)\n",
@@ -155,6 +159,7 @@ func main() {
 			rt.Reload(newCfg)
 			edge.ReloadConfig(newCfg.Channels, newCfg.Identities)
 			edge.SetBotAllowlist(newCfg.Bridge.BotAllowlist)
+			render.ConfigureDescriptions(newCfg.Render.Descriptions.TargetWords, newCfg.Render.Descriptions.HardTruncateWords)
 			slog.Info("config reloaded successfully")
 		case syscall.SIGINT, syscall.SIGTERM:
 			slog.Info("shutdown signal received", "signal", sig.String())

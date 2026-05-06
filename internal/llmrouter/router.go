@@ -235,8 +235,8 @@ func (r *Router) buildPrompt(event WebhookSummary, threads []ThreadContext) stri
 			limit = len(threads)
 		}
 		for i, t := range threads[:limit] {
-			sb.WriteString(fmt.Sprintf("%d. channel=%s thread=%s topic=%q workdir=%s last_active=%s\n",
-				i+1, t.ChannelName, t.ThreadTS, t.Topic, t.Workdir, t.LastActive))
+			sb.WriteString(fmt.Sprintf("%d. channel_id=%s channel=%s thread=%s topic=%q workdir=%s last_active=%s\n",
+				i+1, t.ChannelID, t.ChannelName, t.ThreadTS, t.Topic, t.Workdir, t.LastActive))
 		}
 		sb.WriteString("\n")
 	}
@@ -251,7 +251,18 @@ func (r *Router) buildPrompt(event WebhookSummary, threads []ThreadContext) stri
 	sb.WriteString("\n\nIf no thread is a good match:\n")
 	sb.WriteString(`{"thread_id": null, "confidence": 0, "reasoning": "brief explanation"}`)
 
-	return sb.String()
+	prompt := sb.String()
+
+	// Enforce max_input_tokens as a safety limit (rough estimate: 4 chars/token).
+	if r.cfg.MaxInputTokens > 0 {
+		maxChars := r.cfg.MaxInputTokens * 4
+		if len(prompt) > maxChars {
+			prompt = prompt[:maxChars]
+			slog.Warn("llmrouter: prompt truncated to max_input_tokens", "max_tokens", r.cfg.MaxInputTokens, "chars", maxChars)
+		}
+	}
+
+	return prompt
 }
 
 // ---------------------------------------------------------------------------
