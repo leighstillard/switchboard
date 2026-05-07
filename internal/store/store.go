@@ -404,6 +404,22 @@ func (s *Store) UpdateSessionActivity(channelID, threadTS string) error {
 	return expectOneRow(res, "session", channelID, threadTS)
 }
 
+// DeleteSession removes a session record so it can be recreated with a new jcode session.
+func (s *Store) DeleteSession(channelID, threadTS string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		DELETE FROM sessions
+		WHERE channel_id = ? AND thread_ts = ?`,
+		channelID, threadTS,
+	)
+	if err != nil {
+		return fmt.Errorf("store: delete session: %w", err)
+	}
+	return nil
+}
+
 // SetSessionFriendlyName sets or clears the friendly name.
 func (s *Store) SetSessionFriendlyName(channelID, threadTS, name string) error {
 	s.mu.Lock()

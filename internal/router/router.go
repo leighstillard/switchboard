@@ -403,7 +403,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	sessionID, events, err := r.jcode.Subscribe(ctx, workdir)
 	if err != nil {
 		slog.Error("router: failed to subscribe to jcode", "err", err, "workdir", workdir)
-		r.postError(msg.ChannelID, threadTS, "Failed to start agent session: "+err.Error())
+		r.postError(msg.ChannelID, threadTS, "Agent is temporarily unavailable. Try again in a moment.")
 		return
 	}
 
@@ -508,22 +508,27 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 			events, subErr := r.jcode.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
 			if subErr != nil {
-				slog.Error("router: re-subscribe failed, session is gone",
-					"session_id", session.JcodeSession, "err", subErr)
+				// Session is truly gone. Transparently create a new session
+				// in the same thread so the user doesn't notice the interruption.
+				slog.Info("router: session gone, transparently creating replacement",
+					"old_session_id", session.JcodeSession,
+					"channel", msg.ChannelID,
+					"thread_ts", threadTS)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.postError(msg.ChannelID, threadTS,
-					"Session expired. Please start a new conversation by mentioning me at the channel root.")
-				// Mark session as closed so future messages don't retry.
-				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "closed")
+				r.store.DeleteSession(msg.ChannelID, threadTS)
+				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
 
 			// Re-subscribe succeeded; start event consumer and retry send.
 			go r.consumeEvents(ctx, session.JcodeSession, events)
 			if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
-				slog.Error("router: send failed after re-subscribe", "err", err)
+				// Send still fails after re-subscribe. Create replacement session.
+				slog.Warn("router: send failed after re-subscribe, creating replacement",
+					"session_id", session.JcodeSession, "err", err)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
+				r.store.DeleteSession(msg.ChannelID, threadTS)
+				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
 		}
@@ -759,7 +764,12 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 
 	// Send combined message to jcode.
 	if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
-		slog.Error("router: failed to send queued messages", "err", err)
+		slog.Warn("router: failed to send queued messages, will retry on next user message",
+			"session_id", sessionID, "err", err)
+		// Re-enqueue the turns so they aren't lost.
+		for _, t := range turns {
+			r.store.EnqueueTurn(t)
+		}
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 		return
 	}
@@ -1263,6 +1273,12 @@ func (r *Router) postError(channelID, threadTS, msg string) {
 func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 	// TODO: read image from path, validate, upload via outbound queue.
 	slog.Info("router: image upload requested", "path", req.Path, "channel", req.ChannelID)
+}
+
+// resolveIdentity returns just the identity for a channel (used when workdir is already known).
+func (r *Router) resolveIdentity(channelID string) coalesce.Identity {
+	_, identity := r.resolveChannel(channelID)
+	return identity
 }
 
 func (r *Router) closeAllCoalescers() {
