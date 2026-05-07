@@ -25,8 +25,12 @@ import (
 const (
 	// flushInterval is the minimum time between lazy flushes.
 	flushInterval = 1 * time.Second
-	// maxSlackTextLen is Slack's per-message character limit.
-	maxSlackTextLen = 12000
+	// maxSlackTextLen is the threshold at which we split into a new message.
+	// Slack's chat.update limit is ~4000 chars for the text field, but the
+	// rendered message includes headers and tool descriptions on top of the
+	// raw text buffer. We use 3000 as a safe buffer-length threshold to
+	// account for the rendering overhead.
+	maxSlackTextLen = 3000
 	// toolSummaryPrefix for completed tools.
 	toolCheckmark = "✓"
 	// toolPendingPrefix for in-progress tools.
