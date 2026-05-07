@@ -444,6 +444,25 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Add 👀 reaction to acknowledge receipt.
 	r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
+	// If reusing an existing session that is currently processing another turn,
+	// queue the message rather than sending immediately. This prevents jcode
+	// from mixing the response into the wrong thread's coalescer.
+	if isReused && existingSession.Status == "processing" {
+		slog.Info("router: session busy, queueing message for new thread",
+			"session_id", sessionID,
+			"thread_ts", threadTS,
+			"existing_thread", existingSession.ThreadTS,
+		)
+		r.store.EnqueueTurn(&store.TurnQueueItem{
+			ChannelID:  msg.ChannelID,
+			ThreadTS:   threadTS,
+			EnqueuedAt: time.Now().Unix(),
+			UserID:     msg.UserID,
+			Text:       msg.Text,
+		})
+		return
+	}
+
 	// Send the user's message to jcode.
 	var images []jcodeproto.ImagePair
 	// TODO: handle file attachments -> images
@@ -751,6 +770,45 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 				Action:    outbound.ActionPostMessage,
 				Text:      notifyText,
 			})
+		}
+
+		// Check if the next entry in the coalescer queue has pending turns
+		// (e.g. a new thread was created while this session was busy).
+		r.mu.RLock()
+		nextQueue := r.coalescerQueue[sessionID]
+		var nextKey string
+		if len(nextQueue) > 0 {
+			nextKey = nextQueue[0]
+		}
+		r.mu.RUnlock()
+
+		if nextKey != "" {
+			nextCh, nextTS := parseCoalescerKey(nextKey)
+			if nextCh != "" {
+				nextTurns, _ := r.store.DrainTurns(nextCh, nextTS)
+				if len(nextTurns) > 0 {
+					var texts []string
+					for _, t := range nextTurns {
+						texts = append(texts, t.Text)
+					}
+					combined := strings.Join(texts, "\n\n---\n\n")
+
+					r.store.UpdateSessionStatus(nextCh, nextTS, "processing")
+					if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
+						slog.Warn("router: failed to send next-thread batch",
+							"session_id", sessionID, "err", err)
+						for _, t := range nextTurns {
+							r.store.EnqueueTurn(t)
+						}
+						r.store.UpdateSessionStatus(nextCh, nextTS, "idle")
+					} else {
+						slog.Info("router: sent next-thread batch",
+							"session_id", sessionID,
+							"thread_ts", nextTS,
+							"count", len(nextTurns))
+					}
+				}
+			}
 		}
 		return
 	}
