@@ -499,13 +499,33 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		// Add 👀 reaction.
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
-		// Send message to jcode.
+		// Send message to jcode. If the session is stale (e.g. jcode restarted),
+		// attempt to re-subscribe before giving up.
 		var images []jcodeproto.ImagePair
 		if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
-			slog.Error("router: failed to send continuation message", "err", err)
-			r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-			r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
-			return
+			slog.Warn("router: send failed, attempting re-subscribe",
+				"session_id", session.JcodeSession, "err", err)
+
+			events, subErr := r.jcode.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
+			if subErr != nil {
+				slog.Error("router: re-subscribe failed, session is gone",
+					"session_id", session.JcodeSession, "err", subErr)
+				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
+				r.postError(msg.ChannelID, threadTS,
+					"Session expired. Please start a new conversation by mentioning me at the channel root.")
+				// Mark session as closed so future messages don't retry.
+				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "closed")
+				return
+			}
+
+			// Re-subscribe succeeded; start event consumer and retry send.
+			go r.consumeEvents(ctx, session.JcodeSession, events)
+			if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+				slog.Error("router: send failed after re-subscribe", "err", err)
+				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
+				r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
+				return
+			}
 		}
 
 		// Ensure we have a coalescer and event consumer for this session.
