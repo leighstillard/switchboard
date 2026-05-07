@@ -774,6 +774,12 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 		return
 	}
 
+	// Push the coalescer key back onto the queue so the next "done" event
+	// (after processing this batch) routes to the correct coalescer.
+	r.mu.Lock()
+	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
+	r.mu.Unlock()
+
 	r.store.UpdateSessionActivity(channelID, threadTS)
 	slog.Info("router: sent queued batch", "session_id", sessionID, "count", len(turns))
 }
