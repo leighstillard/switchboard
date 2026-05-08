@@ -375,6 +375,112 @@ func TestDescribe_Corpus(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Issue 1: strings.Title deprecation — case-insensitive tool lookup must
+// work WITHOUT using the deprecated strings.Title function.
+// ---------------------------------------------------------------------------
+
+func TestDescribe_CaseInsensitiveLookup(t *testing.T) {
+	// Lowercase tool names should still match heuristics (e.g., "bash" -> "Bash").
+	got := Describe("bash", map[string]any{"command": "echo hello"})
+	want := "Printing output"
+	if got != want {
+		t.Errorf("Describe(bash lowercase) = %q, want %q", got, want)
+	}
+}
+
+func TestDescribe_CaseInsensitiveLookup_Read(t *testing.T) {
+	got := Describe("read", map[string]any{"file_path": "/tmp/foo.go"})
+	want := "Reading `foo.go`"
+	if got != want {
+		t.Errorf("Describe(read lowercase) = %q, want %q", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue 2: targetWords should be honored by Describe / DescribeWithDirective.
+// ---------------------------------------------------------------------------
+
+func TestDescribe_HonorsTargetWords(t *testing.T) {
+	// Save and restore defaults.
+	origTarget := targetWords
+	origHard := hardTruncateWords
+	defer func() {
+		targetWords = origTarget
+		hardTruncateWords = origHard
+	}()
+
+	ConfigureDescriptions(3, 14)
+
+	// A heuristic description like "Find `handleAuth` uses" is 3 words.
+	// With targetWords=3, a 4-word description should be truncated.
+	// Use a subagent prompt that produces 4+ words: "Subagent: one two..."
+	got := Describe("Agent", map[string]any{"prompt": "one two three four five"})
+	words := strings.Fields(got)
+	// Should be truncated to 3 words (targetWords) + ellipsis on last word.
+	if len(words) > 4 { // 3 words + the "..." appended might count as 3 or 4 depending on split
+		t.Errorf("with targetWords=3, Describe should truncate to <=3 words, got %d words: %q", len(words), got)
+	}
+	if len(words) > 3 {
+		t.Errorf("with targetWords=3, expected 3 words max, got %d: %q", len(words), got)
+	}
+}
+
+func TestDescribeWithDirective_HonorsHardTruncateForDirectives(t *testing.T) {
+	origTarget := targetWords
+	origHard := hardTruncateWords
+	defer func() {
+		targetWords = origTarget
+		hardTruncateWords = origHard
+	}()
+
+	ConfigureDescriptions(5, 8)
+
+	longDirective := "one two three four five six seven eight nine ten eleven twelve"
+	got := DescribeWithDirective("Read", map[string]any{}, longDirective)
+	words := strings.Fields(got)
+	// Directives use hardTruncateWords (8), not targetWords (5).
+	if len(words) > 8 {
+		t.Errorf("directive should truncate to hardTruncateWords(8), got %d words: %q", len(words), got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("truncated directive should end with ..., got %q", got)
+	}
+}
+
+func TestDescribe_TargetWordsUsedNotHardTruncate(t *testing.T) {
+	origTarget := targetWords
+	origHard := hardTruncateWords
+	defer func() {
+		targetWords = origTarget
+		hardTruncateWords = origHard
+	}()
+
+	// Set target to 5, hard to 14. Heuristic output with >5 words should be
+	// truncated at 5 (targetWords), NOT 14.
+	ConfigureDescriptions(5, 14)
+
+	// Subagent heuristic generates "Subagent: one two..." which is short.
+	// Let's use a bash command that generates a longer fallback.
+	// With a command that has no smart heuristic, we get "Running `<truncated cmd>`".
+	// Better: test TruncateWords directly with different limits.
+	// Actually let's verify through Describe that truncation uses targetWords.
+
+	// Agent with long prompt: "Subagent: word1 word2 word3 word4..." (always 4+ words from heuristic)
+	got := Describe("Agent", map[string]any{"prompt": "alpha beta gamma delta epsilon zeta eta"})
+	// heuristicSubagent produces "Subagent: alpha beta gamma..." (4 words - within target of 5, but let's not rely on that)
+	// Actually the subagent heuristic only uses first 4 words of prompt: "Subagent: alpha beta gamma..."
+	// That's already 4 words. Let's find a case that naturally produces >5 words.
+
+	// WebSearch with long query will produce "Search: <query>" - entire query
+	got = Describe("WebSearch", map[string]any{"query": "one two three four five six seven eight"})
+	words := strings.Fields(got)
+	// With targetWords=5, should truncate: "Search: one two three four..."
+	if len(words) > 5 {
+		t.Errorf("with targetWords=5, Describe should truncate to 5 words, got %d: %q", len(words), got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

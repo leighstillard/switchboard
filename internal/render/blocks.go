@@ -431,7 +431,7 @@ func RenderAlert(level AlertLevel, message string) []map[string]interface{} {
 			"type": "section",
 			"text": map[string]interface{}{
 				"type": "mrkdwn",
-				"text": fmt.Sprintf("%s *%s*\n%s", emoji, strings.Title(string(level)), message),
+				"text": fmt.Sprintf("%s *%s*\n%s", emoji, toTitleCase(string(level)), message),
 			},
 		},
 	}
