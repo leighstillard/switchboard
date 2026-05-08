@@ -11,7 +11,8 @@ set -uo pipefail
 CHANNEL="C0B17DDAQ67"   # #sw-test-noise
 INJECT_URL="http://127.0.0.1:8765/test/inject"
 HEALTH_URL="http://127.0.0.1:8765/health"
-DBQ="python3 /home/leigh/workspace/switchboard/test/scripts/dbq.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DBQ="python3 ${SCRIPT_DIR}/dbq.py"
 SLACK_TOKEN="${SWITCHBOARD_BOT_TOKEN:-}"
 
 PASS=0
@@ -121,10 +122,9 @@ import sys, json
 data = json.load(sys.stdin)
 msgs = data.get('messages', [])
 for m in msgs:
-    if m.get('bot_id') or m.get('ts') != '$MESSAGE_TS':
-        if m.get('ts') != '$MESSAGE_TS':
-            print('YES')
-            break
+    if m.get('ts') != '$MESSAGE_TS' and (m.get('bot_id') or m.get('subtype') == 'bot_message'):
+        print('YES')
+        break
 else:
     print('NO')
 " 2>/dev/null)
@@ -146,7 +146,7 @@ import sys, json
 data = json.load(sys.stdin)
 msgs = data.get('messages', [])
 for m in msgs:
-    if m.get('ts') != '$MESSAGE_TS' and (m.get('bot_id') or True):
+    if m.get('ts') != '$MESSAGE_TS' and (m.get('bot_id') or m.get('subtype') == 'bot_message'):
         print(m.get('text', '')[:200])
         break
 " 2>/dev/null)

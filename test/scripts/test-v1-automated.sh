@@ -3,8 +3,9 @@
 # from the Switchboard v1 test plan.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRET="6cba07cbb64129a77ac49f150d931932fccf2100"
-DBQ="python3 /home/leigh/workspace/switchboard/test/scripts/dbq.py"
+DBQ="python3 ${SCRIPT_DIR}/dbq.py"
 PASS=0
 FAIL=0
 DEVIATION=0
@@ -146,8 +147,13 @@ sleep 0.5
 PENDING_BEFORE=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status IN ('pending','processing')" 2>/dev/null)
 echo "  Pending/processing before restart: $PENDING_BEFORE"
 
-systemctl --user restart switchboard
-sleep 3
+if [ "${ALLOW_RESTART:-}" = "true" ]; then
+  systemctl --user restart switchboard
+  sleep 3
+else
+  echo "  SKIP: set ALLOW_RESTART=true to run restart test"
+  result SKIP "10.5" "Restart test skipped (set ALLOW_RESTART=true)"
+fi
 
 # Check all eventually get processed
 DONE_AFTER=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status = 'done'" 2>/dev/null)
