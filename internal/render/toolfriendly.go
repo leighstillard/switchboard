@@ -376,7 +376,7 @@ func describeBashCat(binary string, parts []string) string {
 	if file != "" {
 		return fmt.Sprintf("Reading %s", filepath.Base(file))
 	}
-	return fmt.Sprintf("Reading file")
+	return "Reading file"
 }
 
 func describeBashLs(binary string, parts []string) string {

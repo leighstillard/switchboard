@@ -315,9 +315,7 @@ func TestRoute_WithMockAPI(t *testing.T) {
 		MonthlyBudgetUSD:    5.0,
 	}
 	r := New(cfg)
-	// Override the HTTP client to point to our mock server.
-	r.httpClient = server.Client()
-	// We also need to override the URL - use a custom transport.
+	// Override the HTTP client with a transport that rewrites URLs to the mock server.
 	r.httpClient = &http.Client{
 		Transport: &rewriteTransport{base: http.DefaultTransport, target: server.URL},
 	}

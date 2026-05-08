@@ -466,13 +466,10 @@ func TestDescribe_TargetWordsUsedNotHardTruncate(t *testing.T) {
 	// Actually let's verify through Describe that truncation uses targetWords.
 
 	// Agent with long prompt: "Subagent: word1 word2 word3 word4..." (always 4+ words from heuristic)
-	got := Describe("Agent", map[string]any{"prompt": "alpha beta gamma delta epsilon zeta eta"})
-	// heuristicSubagent produces "Subagent: alpha beta gamma..." (4 words - within target of 5, but let's not rely on that)
-	// Actually the subagent heuristic only uses first 4 words of prompt: "Subagent: alpha beta gamma..."
-	// That's already 4 words. Let's find a case that naturally produces >5 words.
+	// (Skipped - would be dead assignment; instead test via WebSearch which naturally produces >5 words.)
 
 	// WebSearch with long query will produce "Search: <query>" - entire query
-	got = Describe("WebSearch", map[string]any{"query": "one two three four five six seven eight"})
+	got := Describe("WebSearch", map[string]any{"query": "one two three four five six seven eight"})
 	words := strings.Fields(got)
 	// With targetWords=5, should truncate: "Search: one two three four..."
 	if len(words) > 5 {
@@ -483,18 +480,6 @@ func TestDescribe_TargetWordsUsedNotHardTruncate(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func extractBacktickContent(s string) string {
-	start := strings.Index(s, "`")
-	if start == -1 {
-		return ""
-	}
-	end := strings.LastIndex(s, "`")
-	if end <= start {
-		return ""
-	}
-	return s[start+1 : end]
-}
 
 func TestDescribe_BashSmartHeuristics(t *testing.T) {
 	cases := []struct {

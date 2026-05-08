@@ -23,7 +23,8 @@ result() {
 
 gh_webhook() {
   local event="$1" body="$2" delivery="${3:-gh-$(date +%s%N)}"
-  local sig="sha256=$(echo -n "$body" | openssl dgst -sha256 -hmac "$SECRET" 2>/dev/null | awk '{print $NF}')"
+  local sig
+  sig="sha256=$(echo -n "$body" | openssl dgst -sha256 -hmac "$SECRET" 2>/dev/null | awk '{print $NF}')"
   curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8765/webhook/github \
     -H "Content-Type: application/json" \
     -H "X-Hub-Signature-256: $sig" \
