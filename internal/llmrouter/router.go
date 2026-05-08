@@ -209,6 +209,15 @@ func (r *Router) OverBudget() bool {
 	return r.costTracker.OverBudget()
 }
 
+// ResolvedModel returns the model that will actually be used for API calls,
+// applying the default fallback if the config field is empty.
+func (r *Router) ResolvedModel() string {
+	if r.cfg.Model != "" {
+		return r.cfg.Model
+	}
+	return "claude-haiku-4-5"
+}
+
 // ---------------------------------------------------------------------------
 // Prompt construction
 // ---------------------------------------------------------------------------

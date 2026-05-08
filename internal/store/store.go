@@ -306,7 +306,7 @@ func migrateV2(db *sql.DB) error {
 		// -- LLM routing decisions (v1.1 Feature 2)
 		`CREATE TABLE IF NOT EXISTS llm_routing_decisions (
 			id               INTEGER PRIMARY KEY AUTOINCREMENT,
-			webhook_inbox_id INTEGER,
+			webhook_inbox_id INTEGER REFERENCES webhook_inbox(id) ON DELETE SET NULL,
 			decided_at       INTEGER NOT NULL,
 			model            TEXT NOT NULL,
 			thread_id        TEXT,

@@ -228,6 +228,11 @@ func (r *Router) Reload(newCfg *config.Config) {
 		r.llmRouter = nil
 	}
 
+	// Propagate strict directive setting to all active coalescers.
+	for _, coal := range r.coalescers {
+		coal.SetStrictDirectives(newCfg.Render.StrictDirectiveValidation)
+	}
+
 	slog.Info("router: config reloaded",
 		"routes", len(newCfg.Routes),
 		"channels", len(newCfg.Channels),
@@ -455,13 +460,16 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 			"thread_ts", threadTS,
 			"existing_thread", existingSession.ThreadTS,
 		)
-		r.store.EnqueueTurn(&store.TurnQueueItem{
+		if err := r.store.EnqueueTurn(&store.TurnQueueItem{
 			ChannelID:  msg.ChannelID,
 			ThreadTS:   threadTS,
 			EnqueuedAt: time.Now().Unix(),
 			UserID:     msg.UserID,
 			Text:       msg.Text,
-		})
+		}); err != nil {
+			slog.Error("router: failed to enqueue deferred turn", "err", err)
+			r.postError(msg.ChannelID, threadTS, "Failed to queue message, please retry.")
+		}
 		return
 	}
 
@@ -841,7 +849,10 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 						slog.Warn("router: failed to send next-thread batch",
 							"session_id", sessionID, "err", err)
 						for _, t := range nextTurns {
-							r.store.EnqueueTurn(t)
+							if err := r.store.EnqueueTurn(t); err != nil {
+								slog.Error("router: failed to re-enqueue turn after send failure",
+									"err", err, "channel", nextCh, "thread_ts", nextTS)
+							}
 						}
 						r.store.UpdateSessionStatus(nextCh, nextTS, "idle")
 						// Remove the failed nextKey from the queue so it doesn't
@@ -868,23 +879,30 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 	}
 	combined := strings.Join(texts, "\n\n---\n\n")
 
+	// Push the coalescer key back onto the queue BEFORE sending so that
+	// jcode events arriving during the send can find the right coalescer.
+	r.mu.Lock()
+	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
+	r.mu.Unlock()
+
 	// Send combined message to jcode.
 	if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
+		// Remove the coalKey we just added since the send failed.
+		r.mu.Lock()
+		dropNextKeyFromQueue(r.coalescerQueue, sessionID, coalKey)
+		r.mu.Unlock()
 		// Re-enqueue the turns so they aren't lost.
 		for _, t := range turns {
-			r.store.EnqueueTurn(t)
+			if err := r.store.EnqueueTurn(t); err != nil {
+				slog.Error("router: failed to re-enqueue turn after batch send failure",
+					"err", err, "channel", channelID, "thread_ts", threadTS)
+			}
 		}
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 		return
 	}
-
-	// Push the coalescer key back onto the queue so the next "done" event
-	// (after processing this batch) routes to the correct coalescer.
-	r.mu.Lock()
-	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
-	r.mu.Unlock()
 
 	r.store.UpdateSessionActivity(channelID, threadTS)
 	slog.Info("router: sent queued batch", "session_id", sessionID, "count", len(turns))
@@ -1228,7 +1246,7 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 	decisionRecord := &store.LLMRoutingDecision{
 		WebhookInboxID: nil, // set when durable inbox is used
 		DecidedAt:      time.Now().Unix(),
-		Model:          r.cfg.Routing.LLM.Model,
+		Model:          llm.ResolvedModel(),
 		ThreadID:       decision.ThreadID,
 		Confidence:     decision.Confidence,
 		Reasoning:      &decision.Reasoning,
