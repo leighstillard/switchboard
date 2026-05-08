@@ -119,8 +119,8 @@ type SessionCoalescer struct {
 	// separate textBuffer + completedTools lists.
 	segments []segment
 
-	pendingTools []ToolProgress
-	toolInputBuf strings.Builder // accumulates tool_input deltas for current pending tool
+	pendingTools  []ToolProgress
+	toolInputBufs map[string]*strings.Builder // per-tool-ID input accumulator
 
 	// Block Kit blocks from render directives (accumulated during the turn).
 	directiveBlocks []map[string]interface{}
@@ -163,18 +163,19 @@ func NewSessionCoalescer(
 	onImage ImageHandler,
 ) *SessionCoalescer {
 	sc := &SessionCoalescer{
-		sessionID:    sessionID,
-		friendlyName: friendlyName,
-		channelID:    channelID,
-		threadTS:     threadTS,
-		workdir:      workdir,
-		identity:     identity,
-		outbound:     out,
-		onImage:      onImage,
-		firstTurn:    true,
-		lastFlush:    time.Now(),
-		driftMonitor: render.NewDriftMonitor(7), // default threshold
-		done:         make(chan struct{}),
+		sessionID:     sessionID,
+		friendlyName:  friendlyName,
+		channelID:     channelID,
+		threadTS:      threadTS,
+		workdir:       workdir,
+		identity:      identity,
+		outbound:      out,
+		onImage:       onImage,
+		firstTurn:     true,
+		lastFlush:     time.Now(),
+		toolInputBufs: make(map[string]*strings.Builder),
+		driftMonitor:  render.NewDriftMonitor(7), // default threshold
+		done:          make(chan struct{}),
 	}
 
 	// Start the periodic flush timer.
@@ -331,7 +332,24 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventToolInput:
 		var e jcodeproto.ToolInputEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.toolInputBuf.WriteString(e.Delta)
+			// Route input to the last pending tool that hasn't been exec'd yet.
+			// tool_input events don't carry a tool ID, so we assume input
+			// belongs to the most recently started non-exec tool.
+			var targetID string
+			for i := len(sc.pendingTools) - 1; i >= 0; i-- {
+				if !sc.pendingTools[i].Exec {
+					targetID = sc.pendingTools[i].ID
+					break
+				}
+			}
+			if targetID != "" {
+				buf, ok := sc.toolInputBufs[targetID]
+				if !ok {
+					buf = &strings.Builder{}
+					sc.toolInputBufs[targetID] = buf
+				}
+				buf.WriteString(e.Delta)
+			}
 		}
 
 	case jcodeproto.EventToolExec:
@@ -341,8 +359,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 				if sc.pendingTools[i].ID == e.ID {
 					sc.pendingTools[i].Exec = true
 					// Parse accumulated tool input and update description.
-					if sc.toolInputBuf.Len() > 0 {
-						rawInput := sc.toolInputBuf.String()
+					if buf, ok := sc.toolInputBufs[e.ID]; ok && buf.Len() > 0 {
+						rawInput := buf.String()
 						var input map[string]any
 						if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
 							desc := render.Describe(e.Name, input)
@@ -352,7 +370,7 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 							slog.Debug("coalescer: failed to parse tool input",
 								"tool", e.Name, "err", err, "raw_len", len(rawInput))
 						}
-						sc.toolInputBuf.Reset()
+						delete(sc.toolInputBufs, e.ID)
 					}
 					break
 				}
@@ -370,6 +388,7 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 				if sc.pendingTools[i].ID == e.ID {
 					desc = sc.pendingTools[i].Description
 					sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
+					delete(sc.toolInputBufs, e.ID) // clean up any remaining input buffer
 					break
 				}
 			}
@@ -495,7 +514,10 @@ func (sc *SessionCoalescer) SetStrictDirectives(strict bool) {
 func (sc *SessionCoalescer) resetForNextTurn() {
 	sc.segments = sc.segments[:0]
 	sc.pendingTools = nil
-	sc.toolInputBuf.Reset()
+	// Clear all per-tool input buffers.
+	for k := range sc.toolInputBufs {
+		delete(sc.toolInputBufs, k)
+	}
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
 	// Note: finalMessageText is NOT cleared here; it's read by the router
