@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -245,4 +246,41 @@ func TestDrainStats(t *testing.T) {
 	if stats["C_Y"] != 1 {
 		t.Errorf("C_Y depth = %d, want 1", stats["C_Y"])
 	}
+}
+
+func TestTruncateForSlack(t *testing.T) {
+	// Short text: no truncation.
+	short := "Hello world"
+	if got := truncateForSlack(short, 100); got != short {
+		t.Errorf("truncateForSlack(%q, 100) = %q, want unchanged", short, got)
+	}
+
+	// Long text: truncate at newline.
+	var lines string
+	for i := 0; i < 100; i++ {
+		lines += "This is line number something or other.\n"
+	}
+	got := truncateForSlack(lines, 200)
+	if len(got) > 300 { // 200 + truncation message
+		t.Errorf("truncated text too long: %d chars", len(got))
+	}
+	if !containsSubstring(got, "truncated") {
+		t.Error("truncated text should contain truncation notice")
+	}
+}
+
+func TestIsMsgTooLong(t *testing.T) {
+	if isMsgTooLong(nil) {
+		t.Error("nil error should not be msg_too_long")
+	}
+	if !isMsgTooLong(fmt.Errorf("slack: update message: msg_too_long")) {
+		t.Error("msg_too_long error should match")
+	}
+	if isMsgTooLong(fmt.Errorf("slack: rate limited")) {
+		t.Error("rate limited error should not match msg_too_long")
+	}
+}
+
+func containsSubstring(s, sub string) bool {
+	return len(s) >= len(sub) && indexOf(s, sub) >= 0
 }

@@ -493,6 +493,26 @@ func (q *Queue) execute(ctx context.Context, item *OutboundItem) {
 			q.Enqueue(item)
 			return
 		}
+		// Handle msg_too_long: truncate and retry once for UpdateMessage.
+		if item.Action == ActionUpdateMessage && isMsgTooLong(err) {
+			truncated := truncateForSlack(item.Text, 3800)
+			if truncated != item.Text {
+				slog.Warn("outbound: msg_too_long, retrying with truncated text",
+					"channel", item.ChannelID,
+					"original_len", len(item.Text),
+					"truncated_len", len(truncated),
+				)
+				opts := buildPostOpts(item)
+				retryErr := q.slack.UpdateMessage(item.ChannelID, item.MessageTS, truncated, opts...)
+				if retryErr != nil {
+					slog.Error("outbound: truncated retry also failed",
+						"channel", item.ChannelID,
+						"error", retryErr,
+					)
+				}
+				return
+			}
+		}
 		slog.Error("outbound: send failed",
 			"channel", item.ChannelID,
 			"action", item.Action,
@@ -576,4 +596,36 @@ func (q *Queue) applyRetryAfter(action OutboundAction, d time.Duration) {
 	case ActionUploadFile:
 		q.uploadBucket.retryAfter(d)
 	}
+}
+
+// isMsgTooLong checks if the error is Slack's msg_too_long rejection.
+func isMsgTooLong(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return indexOf(s, "msg_too_long") >= 0
+}
+
+// truncateForSlack truncates text to fit within Slack's chat.update limit.
+// It tries to break at the last newline before maxLen to avoid mid-line cuts.
+func truncateForSlack(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+	// Find last newline before the limit.
+	cutoff := text[:maxLen]
+	if idx := lastIndexByte(cutoff, '\n'); idx > maxLen/2 {
+		return text[:idx] + "\n\n_...message truncated (exceeded Slack limit)_"
+	}
+	return text[:maxLen] + "\n\n_...message truncated (exceeded Slack limit)_"
+}
+
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
