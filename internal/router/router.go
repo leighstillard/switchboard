@@ -534,7 +534,10 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 					"channel", msg.ChannelID,
 					"thread_ts", threadTS)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.store.DeleteSession(msg.ChannelID, threadTS)
+				if err := r.store.DeleteSession(msg.ChannelID, threadTS); err != nil {
+					slog.Warn("router: failed to delete stale session before replacement",
+						"channel", msg.ChannelID, "thread_ts", threadTS, "err", err)
+				}
 				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
@@ -546,7 +549,10 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.store.DeleteSession(msg.ChannelID, threadTS)
+				if err := r.store.DeleteSession(msg.ChannelID, threadTS); err != nil {
+					slog.Warn("router: failed to delete session before replacement",
+						"channel", msg.ChannelID, "thread_ts", threadTS, "err", err)
+				}
 				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
@@ -717,14 +723,46 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				}
 				r.mu.Unlock()
 
-				r.handleTurnEnd(ctx, sessionID, key)
+				r.handleTurnEnd(ctx, sessionID, key, ev.Type)
 			}
 		}
 	}
 }
 
+// shouldNotifySuccess returns true if the event type warrants a ✅ success
+// notification. Error and interrupted events are handled by the coalescer
+// with their own messaging, so sending ✅ would be misleading.
+func shouldNotifySuccess(eventType string) bool {
+	return eventType == jcodeproto.EventDone
+}
+
+// dropNextKeyFromQueue removes the front entry from the coalescerQueue for the
+// given sessionID, but only if it matches expectedKey. This is used to clean up
+// after a failed SendMessage for a next-thread batch.
+func dropNextKeyFromQueue(queue map[string][]string, sessionID, expectedKey string) {
+	if q := queue[sessionID]; len(q) > 0 && q[0] == expectedKey {
+		queue[sessionID] = q[1:]
+	}
+}
+
+// isValidLLMThreadID checks that a thread_id string (format "channelID:threadTS")
+// matches one of the ThreadContext entries that were provided to the LLM.
+func isValidLLMThreadID(threadID string, threads []llmrouter.ThreadContext) bool {
+	parts := strings.SplitN(threadID, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	channelID, threadTS := parts[0], parts[1]
+	for _, tc := range threads {
+		if tc.ChannelID == channelID && tc.ThreadTS == threadTS {
+			return true
+		}
+	}
+	return false
+}
+
 // handleTurnEnd drains the turn queue and either sends the next batch or marks idle.
-func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
+func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventType string) {
 	// Parse channelID and threadTS from the coalescer key.
 	channelID, threadTS := parseCoalescerKey(coalKey)
 	if channelID == "" {
@@ -745,13 +783,15 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 
 		// Notify the requesting user that the turn is complete,
 		// including the agent's final message text if available.
+		// Only send success notification for EventDone; errors and
+		// interruptions are already displayed by the coalescer.
 		r.mu.Lock()
 		requester := r.turnRequester[coalKey]
 		delete(r.turnRequester, coalKey)
 		coal := r.coalescers[coalKey]
 		r.mu.Unlock()
 
-		if requester != "" {
+		if requester != "" && shouldNotifySuccess(eventType) {
 			notifyText := fmt.Sprintf("<@%s> ✅", requester)
 			if coal != nil {
 				if finalMsg := coal.FinalMessageText(); finalMsg != "" {
@@ -801,6 +841,11 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 							r.store.EnqueueTurn(t)
 						}
 						r.store.UpdateSessionStatus(nextCh, nextTS, "idle")
+						// Remove the failed nextKey from the queue so it doesn't
+						// block future event routing.
+						r.mu.Lock()
+						dropNextKeyFromQueue(r.coalescerQueue, sessionID, nextKey)
+						r.mu.Unlock()
 					} else {
 						slog.Info("router: sent next-thread batch",
 							"session_id", sessionID,
@@ -1190,6 +1235,18 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 		parts := strings.SplitN(*decision.ThreadID, ":", 2)
 		if len(parts) == 2 {
 			channelID, threadTS := parts[0], parts[1]
+
+			// Validate that the thread_id matches one of the threads we
+			// actually provided to the LLM. This prevents hallucinated
+			// thread IDs from being blindly accepted.
+			if !isValidLLMThreadID(*decision.ThreadID, threads) {
+				slog.Warn("router: LLM suggested thread_id not in provided list, falling back",
+					"thread_id", *decision.ThreadID)
+				decisionRecord.PostedTo = "fallback"
+				r.postToFallback(evt, fallbackID, decision)
+				r.store.InsertLLMDecision(decisionRecord)
+				return
+			}
 
 			// Validate that the channel is one we actually manage.
 			if workdir, _ := r.resolveChannel(channelID); workdir == "" {
