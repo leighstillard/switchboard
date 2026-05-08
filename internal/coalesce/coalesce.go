@@ -281,6 +281,7 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 			sc.completedTools = append(sc.completedTools, tp)
 			sc.textOffsetAfterLastTool = sc.textBuffer.Len()
 			sc.dirty = true
+			sc.checkOverflow()
 		}
 
 	case jcodeproto.EventUpstreamProvider:
@@ -520,8 +521,12 @@ func (sc *SessionCoalescer) SetProgressMessageTS(ts string) {
 }
 
 // checkOverflow splits into a new message if we're approaching Slack's limit.
+// It checks the estimated rendered length (text + tool summaries + overhead)
+// rather than just the raw text buffer, since tool summaries can grow large
+// on turns with many tool calls.
 func (sc *SessionCoalescer) checkOverflow() {
-	if sc.textBuffer.Len() > maxSlackTextLen {
+	estimated := sc.estimateRenderedLen()
+	if estimated > maxSlackTextLen {
 		// Flush current content as a finalized message, then reset.
 		sc.flushLocked(false)
 		// Start new progress message.
@@ -529,6 +534,37 @@ func (sc *SessionCoalescer) checkOverflow() {
 		sc.textBuffer.Reset()
 		sc.completedTools = nil
 	}
+}
+
+// estimateRenderedLen returns an approximate character count for the rendered
+// message, accounting for text buffer, tool summaries, header, and footer.
+func (sc *SessionCoalescer) estimateRenderedLen() int {
+	n := sc.textBuffer.Len()
+	// Header (first turn only).
+	if sc.firstTurn {
+		n += 40
+	}
+	// Completed tool summaries.
+	for _, t := range sc.completedTools {
+		desc := t.Description
+		if desc == "" {
+			desc = t.Name
+		}
+		n += len(desc) + 6 // emoji + space + newline
+	}
+	// Pending tool summaries.
+	for _, t := range sc.pendingTools {
+		desc := t.Description
+		if desc == "" {
+			desc = t.Name
+		}
+		n += len(desc) + 20 // emoji + status + newline
+	}
+	// Provider footer.
+	if sc.upstreamProvider != nil {
+		n += len(*sc.upstreamProvider) + 6
+	}
+	return n
 }
 
 // renderMessage constructs the Slack message text from current state.

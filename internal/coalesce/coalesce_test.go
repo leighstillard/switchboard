@@ -595,3 +595,74 @@ func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
 		t.Errorf("directive blocks duplicated: found %d header blocks, want 1", headerCount)
 	}
 }
+
+// TestCoalescer_OverflowFromManyTools verifies that many completed tools
+// trigger an overflow split even when the text buffer itself is short.
+// This was the root cause of truncation: tool summaries grew the rendered
+// message beyond Slack's chat.update limit without triggering checkOverflow.
+func TestCoalescer_OverflowFromManyTools(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-overflow", "ant", "C999", "ts99", "/workspace/big",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Add a small text buffer.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "Starting work...\n",
+	}))
+
+	// Simulate 150 tool calls with moderately long descriptions.
+	// Each tool description is ~25 chars; 150 * (25+6) = 4650, which exceeds 3000.
+	for i := 0; i < 150; i++ {
+		toolID := fmt.Sprintf("tool-%d", i)
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+			"type":  "tool_start",
+			"id":    toolID,
+			"name":  "Read",
+			"input": map[string]interface{}{"file_path": fmt.Sprintf("/workspace/src/module%d/handler.go", i)},
+		}))
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+			"type":   "tool_done",
+			"id":     toolID,
+			"name":   "Read",
+			"output": "file contents",
+		}))
+	}
+
+	// Final text + done.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "All done reviewing files.",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	// Wait for async callbacks.
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) < 2 {
+		t.Fatalf("expected at least 2 outbound items (overflow split), got %d", len(items))
+	}
+
+	// Verify that no single item's text exceeds a reasonable limit.
+	for i, item := range items {
+		if len(item.Text) > 4500 {
+			t.Errorf("item %d text too long (%d chars), should have been split", i, len(item.Text))
+		}
+	}
+
+	// Verify the final text appears in the last item.
+	lastItem := items[len(items)-1]
+	if !contains(lastItem.Text, "All done reviewing files") {
+		t.Error("expected final text in last outbound item")
+		t.Logf("last item text: %s", lastItem.Text[:min(200, len(lastItem.Text))])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
