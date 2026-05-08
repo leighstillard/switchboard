@@ -135,8 +135,12 @@ func (e *Edge) ReloadConfig(channels []config.ChannelConfig, identities map[stri
 	e.channels = channels
 	e.identities = identities
 	e.channelSet = make(map[string]bool, len(channels))
+	e.channelName = make(map[string]string, len(channels))
 	for _, ch := range channels {
 		e.channelSet[ch.ID] = true
+		if ch.Name != "" {
+			e.channelName[ch.ID] = ch.Name
+		}
 	}
 	slog.Info("slack edge: config reloaded", "channels", len(channels), "identities", len(identities))
 }
@@ -536,8 +540,9 @@ func (e *Edge) stripBotMention(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// userMentionRe matches Slack user mentions like <@U12345ABC>.
-var userMentionRe = regexp.MustCompile(`<@(U[A-Z0-9]+)>`)
+// userMentionRe matches Slack user mentions like <@U12345ABC> or <@W12345ABC>
+// (Enterprise Grid users have W-prefixed IDs).
+var userMentionRe = regexp.MustCompile(`<@([UW][A-Z0-9]+)>`)
 
 // hasMentionOtherThan returns true if the text contains an @mention of any
 // user other than the specified one (typically the bot's own user ID).
