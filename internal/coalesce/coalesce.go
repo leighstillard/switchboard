@@ -31,9 +31,9 @@ const (
 	// raw text buffer. We use 3000 as a safe buffer-length threshold to
 	// account for the rendering overhead.
 	maxSlackTextLen = 3000
-	// toolSummaryPrefix for completed tools.
+	// toolCheckmark for completed tools.
 	toolCheckmark = "✓"
-	// toolPendingPrefix for in-progress tools.
+	// toolSpinner for in-progress tools.
 	toolSpinner = "⏳"
 )
 
@@ -41,7 +41,29 @@ const (
 // Types
 // ---------------------------------------------------------------------------
 
-// ToolProgress tracks a single tool invocation.
+// segmentKind discriminates between text and tool entries in the output stream.
+type segmentKind int
+
+const (
+	segText segmentKind = iota
+	segTool
+)
+
+// segment is a single unit in the interleaved output stream: either a chunk
+// of text or a completed tool entry.
+type segment struct {
+	kind segmentKind
+
+	// Text segment fields.
+	text strings.Builder
+
+	// Tool segment fields.
+	description string // human-friendly label
+	isError     bool
+	count       int // >=1; incremented for sequential dedup
+}
+
+// ToolProgress tracks a single in-flight tool invocation.
 type ToolProgress struct {
 	ID          string
 	Name        string
@@ -92,10 +114,13 @@ type SessionCoalescer struct {
 	// The Slack message being updated (nil = first flush creates it).
 	progressMessageTS *string
 
-	textBuffer     strings.Builder
-	pendingTools   []ToolProgress
-	completedTools []ToolProgress
-	toolInputBuf   strings.Builder // accumulates tool_input deltas for current pending tool
+	// segments is an ordered stream of text chunks and completed tool entries,
+	// interleaved in the order they were produced. This replaces the old
+	// separate textBuffer + completedTools lists.
+	segments []segment
+
+	pendingTools []ToolProgress
+	toolInputBuf strings.Builder // accumulates tool_input deltas for current pending tool
 
 	// Block Kit blocks from render directives (accumulated during the turn).
 	directiveBlocks []map[string]interface{}
@@ -106,10 +131,6 @@ type SessionCoalescer struct {
 	// the last tool call) captured at turn end for inclusion in the done
 	// notification. Reset on each new turn.
 	finalMessageText string
-
-	// textOffsetAfterLastTool tracks the textBuffer length after the most
-	// recent tool_done event, so we can extract post-tool text at turn end.
-	textOffsetAfterLastTool int
 
 	upstreamProvider *string // captured for footer on final flush
 
@@ -173,6 +194,89 @@ func (sc *SessionCoalescer) Close() {
 	close(sc.done)
 }
 
+// ---------------------------------------------------------------------------
+// Segment helpers (must be called with mu held)
+// ---------------------------------------------------------------------------
+
+// currentTextSegment returns the trailing text segment, creating one if the
+// last segment is not a text segment.
+func (sc *SessionCoalescer) currentTextSegment() *segment {
+	if len(sc.segments) > 0 {
+		last := &sc.segments[len(sc.segments)-1]
+		if last.kind == segText {
+			return last
+		}
+	}
+	sc.segments = append(sc.segments, segment{kind: segText})
+	return &sc.segments[len(sc.segments)-1]
+}
+
+// appendToolSegment adds a completed tool entry. If the previous segment is
+// a tool with the same description (and no error), increment its count
+// instead of creating a new entry (sequential dedup).
+func (sc *SessionCoalescer) appendToolSegment(description string, isError bool) {
+	if !isError && len(sc.segments) > 0 {
+		last := &sc.segments[len(sc.segments)-1]
+		if last.kind == segTool && !last.isError && last.description == description {
+			last.count++
+			return
+		}
+	}
+	sc.segments = append(sc.segments, segment{
+		kind:        segTool,
+		description: description,
+		isError:     isError,
+		count:       1,
+	})
+}
+
+// totalTextLen returns the sum of all text segment lengths.
+func (sc *SessionCoalescer) totalTextLen() int {
+	n := 0
+	for i := range sc.segments {
+		if sc.segments[i].kind == segText {
+			n += sc.segments[i].text.Len()
+		}
+	}
+	return n
+}
+
+// lastTextContent returns the text content from the last text segment, or "".
+func (sc *SessionCoalescer) lastTextContent() string {
+	for i := len(sc.segments) - 1; i >= 0; i-- {
+		if sc.segments[i].kind == segText {
+			return sc.segments[i].text.String()
+		}
+	}
+	return ""
+}
+
+// allText concatenates all text segments (used for directive extraction).
+func (sc *SessionCoalescer) allText() string {
+	var sb strings.Builder
+	for i := range sc.segments {
+		if sc.segments[i].kind == segText {
+			sb.WriteString(sc.segments[i].text.String())
+		}
+	}
+	return sb.String()
+}
+
+// hasContent returns true if there's any meaningful content to render.
+func (sc *SessionCoalescer) hasContent() bool {
+	for i := range sc.segments {
+		switch sc.segments[i].kind {
+		case segText:
+			if sc.segments[i].text.Len() > 0 {
+				return true
+			}
+		case segTool:
+			return true
+		}
+	}
+	return len(sc.pendingTools) > 0
+}
+
 // HandleEvent processes a single jcode server event.
 func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	sc.mu.Lock()
@@ -186,7 +290,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventTextDelta:
 		var e jcodeproto.TextDeltaEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.textBuffer.WriteString(e.Text)
+			seg := sc.currentTextSegment()
+			seg.text.WriteString(e.Text)
 			sc.dirty = true
 			sc.checkOverflow()
 		}
@@ -194,8 +299,10 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventTextReplace:
 		var e jcodeproto.TextReplaceEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.textBuffer.Reset()
-			sc.textBuffer.WriteString(e.Text)
+			// Replace clears ALL text segments and replaces with a single one.
+			sc.segments = sc.segments[:0]
+			seg := sc.currentTextSegment()
+			seg.text.WriteString(e.Text)
 			sc.dirty = true
 		}
 
@@ -253,33 +360,22 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventToolDone:
 		var e jcodeproto.ToolDoneEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Move from pending to completed.
-			tp := ToolProgress{
-				ID:   e.ID,
-				Name: e.Name,
-				Done: true,
-			}
-			if e.Error != nil {
-				tp.Error = *e.Error
-			}
-			// Truncate output for display.
-			if len(e.Output) > 200 {
-				tp.Output = e.Output[:200] + "..."
-			} else {
-				tp.Output = e.Output
-			}
-
-			// Carry description from the pending tool entry.
+			// Resolve description from the pending tool entry.
+			desc := e.Name
+			isError := e.Error != nil
 			for i := range sc.pendingTools {
 				if sc.pendingTools[i].ID == e.ID {
-					tp.Description = sc.pendingTools[i].Description
+					desc = sc.pendingTools[i].Description
 					sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
 					break
 				}
 			}
+			if desc == "" {
+				desc = e.Name
+			}
 
-			sc.completedTools = append(sc.completedTools, tp)
-			sc.textOffsetAfterLastTool = sc.textBuffer.Len()
+			// Add to the interleaved stream (with sequential dedup).
+			sc.appendToolSegment(desc, isError)
 			sc.dirty = true
 			sc.checkOverflow()
 		}
@@ -312,13 +408,33 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 
 	case jcodeproto.EventDone:
 		// Capture post-tool text as the final message for the done notification.
-		fullText := sc.textBuffer.String()
-		if sc.textOffsetAfterLastTool > 0 && sc.textOffsetAfterLastTool < len(fullText) {
-			sc.finalMessageText = strings.TrimSpace(fullText[sc.textOffsetAfterLastTool:])
-		} else if len(sc.completedTools) == 0 {
-			// No tools were used; the entire text is the final message.
-			sc.finalMessageText = strings.TrimSpace(fullText)
+		// Walk segments backwards to find the last text after the last tool.
+		sc.finalMessageText = ""
+		hasTools := false
+		for i := range sc.segments {
+			if sc.segments[i].kind == segTool {
+				hasTools = true
+			}
 		}
+		if hasTools {
+			// Find text after the last tool segment.
+			for i := len(sc.segments) - 1; i >= 0; i-- {
+				if sc.segments[i].kind == segText {
+					txt := strings.TrimSpace(sc.segments[i].text.String())
+					if txt != "" {
+						sc.finalMessageText = txt
+					}
+					break
+				}
+				if sc.segments[i].kind == segTool {
+					break
+				}
+			}
+		} else {
+			// No tools: the entire text is the final message.
+			sc.finalMessageText = strings.TrimSpace(sc.allText())
+		}
+
 		sc.finalized = true
 		sc.flushLocked(true)
 		// Reset state for the next turn (same session, new response).
@@ -327,7 +443,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventError:
 		var e jcodeproto.ErrorEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.textBuffer.WriteString(fmt.Sprintf("\n\n❌ *Error:* %s", e.Message))
+			seg := sc.currentTextSegment()
+			seg.text.WriteString(fmt.Sprintf("\n\n❌ *Error:* %s", e.Message))
 			sc.dirty = true
 		}
 		sc.finalized = true
@@ -335,7 +452,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 		sc.resetForNextTurn()
 
 	case jcodeproto.EventInterrupted:
-		sc.textBuffer.WriteString("\n\n⚠️ _Agent interrupted_")
+		seg := sc.currentTextSegment()
+		seg.text.WriteString("\n\n⚠️ _Agent interrupted_")
 		sc.dirty = true
 		sc.finalized = true
 		sc.flushLocked(true)
@@ -348,7 +466,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 			if e.FromName != nil {
 				fromName = *e.FromName
 			}
-			sc.textBuffer.WriteString(fmt.Sprintf("\n\n📢 _%s: %s_", fromName, e.Message))
+			seg := sc.currentTextSegment()
+			seg.text.WriteString(fmt.Sprintf("\n\n📢 _%s: %s_", fromName, e.Message))
 			sc.dirty = true
 		}
 	}
@@ -364,13 +483,11 @@ func (sc *SessionCoalescer) SetFriendlyName(name string) {
 // resetForNextTurn clears per-turn state so the coalescer is ready for
 // subsequent messages on the same session. Must be called with mu held.
 func (sc *SessionCoalescer) resetForNextTurn() {
-	sc.textBuffer.Reset()
+	sc.segments = sc.segments[:0]
 	sc.pendingTools = nil
-	sc.completedTools = nil
 	sc.toolInputBuf.Reset()
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
-	sc.textOffsetAfterLastTool = 0
 	// Note: finalMessageText is NOT cleared here; it's read by the router
 	// after the turn ends. It will be overwritten on the next turn's done event.
 	sc.progressMessageTS = nil // next turn gets a new Slack message
@@ -440,7 +557,7 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 	// Don't create a new Slack message if there's no meaningful content.
 	// This avoids posting header-only messages during recovery when a
 	// stale "done" event arrives for a turn that already completed.
-	if sc.progressMessageTS == nil && sc.textBuffer.Len() == 0 && len(sc.pendingTools) == 0 && len(sc.completedTools) == 0 {
+	if sc.progressMessageTS == nil && !sc.hasContent() {
 		sc.dirty = false
 		return
 	}
@@ -521,9 +638,8 @@ func (sc *SessionCoalescer) SetProgressMessageTS(ts string) {
 }
 
 // checkOverflow splits into a new message if we're approaching Slack's limit.
-// It checks the estimated rendered length (text + tool summaries + overhead)
-// rather than just the raw text buffer, since tool summaries can grow large
-// on turns with many tool calls.
+// It checks the estimated rendered length (text + inline tool summaries + overhead)
+// rather than just the raw text, since tool summaries can accumulate.
 func (sc *SessionCoalescer) checkOverflow() {
 	estimated := sc.estimateRenderedLen()
 	if estimated > maxSlackTextLen {
@@ -531,26 +647,26 @@ func (sc *SessionCoalescer) checkOverflow() {
 		sc.flushLocked(false)
 		// Start new progress message.
 		sc.progressMessageTS = nil
-		sc.textBuffer.Reset()
-		sc.completedTools = nil
+		sc.segments = sc.segments[:0]
 	}
 }
 
 // estimateRenderedLen returns an approximate character count for the rendered
-// message, accounting for text buffer, tool summaries, header, and footer.
+// message, accounting for all segments, header, pending tools, and footer.
 func (sc *SessionCoalescer) estimateRenderedLen() int {
-	n := sc.textBuffer.Len()
+	n := 0
 	// Header (first turn only).
 	if sc.firstTurn {
 		n += 40
 	}
-	// Completed tool summaries.
-	for _, t := range sc.completedTools {
-		desc := t.Description
-		if desc == "" {
-			desc = t.Name
+	// Segments (text + inline tool summaries).
+	for i := range sc.segments {
+		switch sc.segments[i].kind {
+		case segText:
+			n += sc.segments[i].text.Len()
+		case segTool:
+			n += len(sc.segments[i].description) + 10 // emoji + count + newline
 		}
-		n += len(desc) + 6 // emoji + space + newline
 	}
 	// Pending tool summaries.
 	for _, t := range sc.pendingTools {
@@ -568,6 +684,7 @@ func (sc *SessionCoalescer) estimateRenderedLen() int {
 }
 
 // renderMessage constructs the Slack message text from current state.
+// Text and tool summaries are interleaved in the order they were produced.
 // Uses Slack mrkdwn format (not standard Markdown).
 // Also processes any render directives in the text buffer, accumulating blocks.
 func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
@@ -591,50 +708,56 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 		sb.WriteString(fmt.Sprintf("*%s %s @ %s*\n\n", emoji, name, workdirBase))
 	}
 
-	// Text content: extract directives, then convert remaining Markdown → mrkdwn.
-	text := sc.textBuffer.String()
-	if text != "" {
-		// Process render directives if any are present.
-		if render.HasDirectives(text) {
-			// TODO: pass config's StrictDirectiveValidation setting through
-			// to the coalescer. For now, non-strict mode is safer as it
-			// preserves unknown directives in the text rather than silently
-			// dropping them.
-			result := render.ExtractDirectives(text, false)
-			text = result.CleanText
-			if len(result.Blocks) > 0 {
-				sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)
-			}
-			if result.FallbackText != "" {
-				sc.directiveFallback = result.FallbackText
-			}
+	// Check for directives across all text content.
+	fullText := sc.allText()
+	var directiveResult *render.DirectiveResult
+	if fullText != "" && render.HasDirectives(fullText) {
+		result := render.ExtractDirectives(fullText, false)
+		directiveResult = &result
+		if len(result.Blocks) > 0 {
+			sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)
 		}
-
-		if text != "" {
-			sb.WriteString(MarkdownToMrkdwn(text))
-			sb.WriteString("\n")
+		if result.FallbackText != "" {
+			sc.directiveFallback = result.FallbackText
 		}
 	}
 
-	// Tool summary (completed).
-	if len(sc.completedTools) > 0 {
+	// Render segments in order.
+	// If we have directives, we need to apply the clean text transformation.
+	// For simplicity, when directives are present we extract clean text once
+	// and render it followed by tools (since directive extraction operates on
+	// the concatenated text). When no directives, render segment by segment.
+	if directiveResult != nil && directiveResult.CleanText != "" {
+		sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
 		sb.WriteString("\n")
-		for _, t := range sc.completedTools {
-			label := t.Description
-			if label == "" {
-				label = t.Name
+		// Render tool segments that follow (directives mess with text positions,
+		// so we just append all tool entries after the clean text).
+		for i := range sc.segments {
+			if sc.segments[i].kind == segTool {
+				sc.renderToolSegment(&sb, &sc.segments[i])
 			}
-			if t.Error != "" {
-				sb.WriteString(fmt.Sprintf("❌ %s\n", label))
-			} else {
-				sb.WriteString(fmt.Sprintf("%s %s\n", toolCheckmark, label))
+		}
+	} else {
+		for i := range sc.segments {
+			seg := &sc.segments[i]
+			switch seg.kind {
+			case segText:
+				text := seg.text.String()
+				if text != "" {
+					sb.WriteString(MarkdownToMrkdwn(text))
+					// Only add trailing newline if the text doesn't already end with one.
+					if !strings.HasSuffix(text, "\n") {
+						sb.WriteString("\n")
+					}
+				}
+			case segTool:
+				sc.renderToolSegment(&sb, seg)
 			}
 		}
 	}
 
-	// Pending tools.
+	// Pending tools (always at the end, since they're in-progress).
 	if len(sc.pendingTools) > 0 {
-		sb.WriteString("\n")
 		for _, t := range sc.pendingTools {
 			label := t.Description
 			if label == "" {
@@ -654,4 +777,23 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	}
 
 	return sb.String()
+}
+
+// renderToolSegment writes a single tool entry to the builder, including
+// sequential dedup count if > 1.
+func (sc *SessionCoalescer) renderToolSegment(sb *strings.Builder, seg *segment) {
+	label := seg.description
+	if seg.isError {
+		if seg.count > 1 {
+			sb.WriteString(fmt.Sprintf("❌ %s ×%d\n", label, seg.count))
+		} else {
+			sb.WriteString(fmt.Sprintf("❌ %s\n", label))
+		}
+	} else {
+		if seg.count > 1 {
+			sb.WriteString(fmt.Sprintf("%s %s ×%d\n", toolCheckmark, label, seg.count))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s %s\n", toolCheckmark, label))
+		}
+	}
 }

@@ -3,6 +3,7 @@ package coalesce
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -598,8 +599,7 @@ func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
 
 // TestCoalescer_OverflowFromManyTools verifies that many completed tools
 // trigger an overflow split even when the text buffer itself is short.
-// This was the root cause of truncation: tool summaries grew the rendered
-// message beyond Slack's chat.update limit without triggering checkOverflow.
+// Uses unique file paths so sequential dedup doesn't collapse them.
 func TestCoalescer_OverflowFromManyTools(t *testing.T) {
 	out := &mockOutbound{}
 	coal := NewSessionCoalescer("sess-overflow", "ant", "C999", "ts99", "/workspace/big",
@@ -611,15 +611,16 @@ func TestCoalescer_OverflowFromManyTools(t *testing.T) {
 		"type": "text_delta", "text": "Starting work...\n",
 	}))
 
-	// Simulate 150 tool calls with moderately long descriptions.
-	// Each tool description is ~25 chars; 150 * (25+6) = 4650, which exceeds 3000.
+	// Simulate 150 tool calls with UNIQUE file names (render.Describe uses
+	// basename, so each file must have a distinct name to avoid dedup).
+	// Each description is ~25 chars; 150 * (25+10) = 5250, which exceeds 3000.
 	for i := 0; i < 150; i++ {
 		toolID := fmt.Sprintf("tool-%d", i)
 		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
 			"type":  "tool_start",
 			"id":    toolID,
 			"name":  "Read",
-			"input": map[string]interface{}{"file_path": fmt.Sprintf("/workspace/src/module%d/handler.go", i)},
+			"input": map[string]interface{}{"file_path": fmt.Sprintf("/workspace/handler_%d.go", i)},
 		}))
 		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
 			"type":   "tool_done",
@@ -657,6 +658,156 @@ func TestCoalescer_OverflowFromManyTools(t *testing.T) {
 	if !contains(lastItem.Text, "All done reviewing files") {
 		t.Error("expected final text in last outbound item")
 		t.Logf("last item text: %s", lastItem.Text[:min(200, len(lastItem.Text))])
+	}
+}
+
+// TestCoalescer_SequentialToolDedup verifies that sequential identical tool
+// descriptions are collapsed into a single entry with a count (×N).
+func TestCoalescer_SequentialToolDedup(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-dedup", "fox", "C300", "ts300", "/workspace/dedup",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "Querying databases...\n",
+	}))
+
+	// Three sequential identical tool calls.
+	for i := 0; i < 3; i++ {
+		toolID := fmt.Sprintf("pg-%d", i)
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+			"type":  "tool_start",
+			"id":    toolID,
+			"name":  "postgres",
+			"input": map[string]interface{}{"query": "SELECT * FROM users"},
+		}))
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+			"type":   "tool_done",
+			"id":     toolID,
+			"name":   "postgres",
+			"output": "3 rows",
+		}))
+	}
+
+	// Then a different tool.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type": "tool_start", "id": "read-1", "name": "Read",
+		"input": map[string]interface{}{"file_path": "/workspace/config.go"},
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+		"type": "tool_done", "id": "read-1", "name": "Read", "output": "contents",
+	}))
+
+	// Then two more identical tool calls.
+	for i := 0; i < 2; i++ {
+		toolID := fmt.Sprintf("pg-extra-%d", i)
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+			"type":  "tool_start",
+			"id":    toolID,
+			"name":  "postgres",
+			"input": map[string]interface{}{"query": "SELECT * FROM users"},
+		}))
+		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+			"type":   "tool_done",
+			"id":     toolID,
+			"name":   "postgres",
+			"output": "3 rows",
+		}))
+	}
+
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected outbound items")
+	}
+
+	// Find the last item (final flush).
+	lastItem := items[len(items)-1]
+
+	// Should contain "×3" for the first batch.
+	if !contains(lastItem.Text, "×3") {
+		t.Error("expected ×3 dedup count for first batch of postgres calls")
+		t.Logf("text: %s", lastItem.Text)
+	}
+
+	// Should contain "×2" for the second batch.
+	if !contains(lastItem.Text, "×2") {
+		t.Error("expected ×2 dedup count for second batch of postgres calls")
+		t.Logf("text: %s", lastItem.Text)
+	}
+
+	// Should contain Reading `config.go` (the non-deduped tool).
+	if !contains(lastItem.Text, "config.go") {
+		t.Error("expected Reading config.go in output")
+		t.Logf("text: %s", lastItem.Text)
+	}
+
+	// The ×3 and Reading should appear in order (not all tools at the end).
+	idx3 := strings.Index(lastItem.Text, "×3")
+	idxRead := strings.Index(lastItem.Text, "config.go")
+	idx2 := strings.Index(lastItem.Text, "×2")
+	if idx3 >= idxRead || idxRead >= idx2 {
+		t.Errorf("tool entries should be interleaved in order: ×3 (at %d) < config.go (at %d) < ×2 (at %d)",
+			idx3, idxRead, idx2)
+		t.Logf("text: %s", lastItem.Text)
+	}
+}
+
+// TestCoalescer_InlineToolOrdering verifies that tool summaries appear inline
+// between text segments rather than all collected at the end.
+func TestCoalescer_InlineToolOrdering(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-inline", "cat", "C400", "ts400", "/workspace/inline",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Text, then tool, then more text.
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "Let me check the file.\n",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
+		"type": "tool_start", "id": "t1", "name": "Read",
+		"input": map[string]interface{}{"file_path": "/workspace/main.go"},
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
+		"type": "tool_done", "id": "t1", "name": "Read", "output": "package main",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "The file looks good.\n",
+	}))
+	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
+		"type": "done", "id": float64(1),
+	}))
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected outbound items")
+	}
+
+	lastItem := items[len(items)-1]
+
+	// The tool should appear BETWEEN the two text segments.
+	idxCheck := strings.Index(lastItem.Text, "check the file")
+	idxTool := strings.Index(lastItem.Text, "main.go")
+	idxGood := strings.Index(lastItem.Text, "looks good")
+
+	if idxCheck < 0 || idxTool < 0 || idxGood < 0 {
+		t.Fatalf("missing expected content in output: check=%d tool=%d good=%d\ntext: %s",
+			idxCheck, idxTool, idxGood, lastItem.Text)
+	}
+
+	if !(idxCheck < idxTool && idxTool < idxGood) {
+		t.Errorf("tool should be inline between text segments: check(%d) < tool(%d) < good(%d)",
+			idxCheck, idxTool, idxGood)
+		t.Logf("text: %s", lastItem.Text)
 	}
 }
 
