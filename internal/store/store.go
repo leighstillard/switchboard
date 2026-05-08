@@ -316,7 +316,7 @@ func migrateV2(db *sql.DB) error {
 			user_feedback    TEXT,
 			feedback_at      INTEGER
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_llm_routing_inbox ON llm_routing_decisions(webhook_inbox_id) WHERE webhook_inbox_id IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_routing_inbox ON llm_routing_decisions(webhook_inbox_id) WHERE webhook_inbox_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_routing_feedback ON llm_routing_decisions(user_feedback, decided_at)`,
 
 		// -- set version
@@ -1017,12 +1017,17 @@ func (s *Store) InsertLLMDecision(d *LLMRoutingDecision) error {
 }
 
 // UpdateLLMFeedback records user feedback on an LLM routing decision.
+// feedback must be "confirmed" or "rejected".
 func (s *Store) UpdateLLMFeedback(id int64, feedback string) error {
+	if feedback != "confirmed" && feedback != "rejected" {
+		return fmt.Errorf("store: invalid feedback value %q: must be \"confirmed\" or \"rejected\"", feedback)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
+	res, err := s.db.Exec(`
 		UPDATE llm_routing_decisions
 		SET user_feedback = ?, feedback_at = ?
 		WHERE id = ?`,
@@ -1030,6 +1035,13 @@ func (s *Store) UpdateLLMFeedback(id int64, feedback string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("store: update llm feedback: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: update llm feedback rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: llm routing decision not found (id %d)", id)
 	}
 	return nil
 }
@@ -1040,7 +1052,9 @@ func (s *Store) GetLLMDecisionByWebhookID(webhookInboxID int64) (*LLMRoutingDeci
 		SELECT id, webhook_inbox_id, decided_at, model, thread_id,
 		       confidence, reasoning, posted_to, user_feedback, feedback_at
 		FROM llm_routing_decisions
-		WHERE webhook_inbox_id = ?`, webhookInboxID)
+		WHERE webhook_inbox_id = ?
+		ORDER BY decided_at DESC
+		LIMIT 1`, webhookInboxID)
 
 	d := &LLMRoutingDecision{}
 	err := row.Scan(&d.ID, &d.WebhookInboxID, &d.DecidedAt, &d.Model,
