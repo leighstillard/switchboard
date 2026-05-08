@@ -268,6 +268,10 @@ func (sc *SessionCoalescer) allText() string {
 
 // hasContent returns true if there's any meaningful content to render.
 func (sc *SessionCoalescer) hasContent() bool {
+	// Directive blocks count as content (set by renderMessage).
+	if len(sc.directiveBlocks) > 0 {
+		return true
+	}
 	for i := range sc.segments {
 		switch sc.segments[i].kind {
 		case segText:
@@ -761,19 +765,35 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	}
 
 	// Render segments in order.
-	// If we have directives, we need to apply the clean text transformation.
-	// For simplicity, when directives are present we extract clean text once
-	// and render it followed by tools (since directive extraction operates on
-	// the concatenated text). When no directives, render segment by segment.
-	if directiveResult != nil && directiveResult.CleanText != "" {
-		sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
-		sb.WriteString("\n")
-		// Render tool segments that follow (directives mess with text positions,
-		// so we just append all tool entries after the clean text).
+	// When directives are present, we replace all text segments with the
+	// cleaned text (directives stripped) while keeping tool segments in their
+	// original interleaved positions. The first text segment gets the clean
+	// text; subsequent text segments are skipped (their content is already
+	// included in the concatenated clean text).
+	if directiveResult != nil {
+		cleanTextWritten := false
 		for i := range sc.segments {
-			if sc.segments[i].kind == segTool {
-				sc.renderToolSegment(&sb, &sc.segments[i])
+			seg := &sc.segments[i]
+			switch seg.kind {
+			case segText:
+				if !cleanTextWritten {
+					cleanTextWritten = true
+					if directiveResult.CleanText != "" {
+						sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
+						if !strings.HasSuffix(directiveResult.CleanText, "\n") {
+							sb.WriteString("\n")
+						}
+					}
+				}
+				// Skip subsequent text segments (already merged into CleanText).
+			case segTool:
+				sc.renderToolSegment(&sb, seg)
 			}
+		}
+		// If there were no text segments at all (unlikely), still write clean text.
+		if !cleanTextWritten && directiveResult.CleanText != "" {
+			sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
+			sb.WriteString("\n")
 		}
 	} else {
 		for i := range sc.segments {
