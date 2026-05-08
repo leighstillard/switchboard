@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -434,6 +435,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		sessionID, friendlyName, msg.ChannelID, threadTS, workdir,
 		identity, r.outbound, r.handleImage,
 	)
+	coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 	key := coalescerKey(msg.ChannelID, threadTS)
 	r.mu.Lock()
 	r.coalescers[key] = coal
@@ -570,6 +572,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				msg.ChannelID, threadTS, session.Workdir,
 				identity, r.outbound, r.handleImage,
 			)
+			coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 			r.coalescers[key] = coal
 		}
 		// Ensure event consumer routes to this coalescer for the next turn.
@@ -1148,6 +1151,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 			sess.ChannelID, sess.ThreadTS, sess.Workdir,
 			identity, r.outbound, r.handleImage,
 		)
+		coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
@@ -1320,6 +1324,8 @@ func (r *Router) postToFallback(evt *WebhookEvent, fallbackID string, decision *
 }
 
 // buildThreadContext gathers recent active threads for the LLM prompt.
+// It filters out DM sessions, sorts by last activity (most recent first),
+// and limits to include_thread_count (default 30).
 func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 	sessions, err := r.store.ListActiveSessions()
 	if err != nil {
@@ -1327,8 +1333,18 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 		return nil
 	}
 
+	// Sort by LastActivity descending (most recent first).
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].LastActivity > sessions[j].LastActivity
+	})
+
 	var threads []llmrouter.ThreadContext
 	for _, sess := range sessions {
+		// Filter out DM sessions (channel ID starts with "D").
+		if strings.HasPrefix(sess.ChannelID, "D") {
+			continue
+		}
+
 		channelName := r.edge.ChannelName(sess.ChannelID)
 		if channelName == "" {
 			channelName = sess.ChannelID
@@ -1344,6 +1360,15 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 			Workdir:     sess.Workdir,
 			LastActive:  lastActive,
 		})
+	}
+
+	// Cap to include_thread_count (default 30).
+	limit := r.cfg.Routing.LLM.IncludeThreadCount
+	if limit == 0 {
+		limit = 30
+	}
+	if limit < len(threads) {
+		threads = threads[:limit]
 	}
 
 	return threads

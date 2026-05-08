@@ -214,18 +214,21 @@ func (r *Router) OverBudget() bool {
 // ---------------------------------------------------------------------------
 
 func (r *Router) buildPrompt(event WebhookSummary, threads []ThreadContext) string {
-	var sb strings.Builder
+	// Build prompt in 3 parts: prefix (event details), middle (thread list),
+	// suffix (instructions). If truncation is needed, only the middle section
+	// is trimmed so that the JSON response format instructions are preserved.
+	var prefix, middle, suffix strings.Builder
 
-	sb.WriteString("You are a notification router. Given an incoming webhook event and a list of active Slack threads, determine which thread (if any) this event is most likely associated with.\n\n")
+	prefix.WriteString("You are a notification router. Given an incoming webhook event and a list of active Slack threads, determine which thread (if any) this event is most likely associated with.\n\n")
 
-	sb.WriteString("## Incoming Event\n")
-	sb.WriteString(fmt.Sprintf("Source: %s\n", event.Source))
-	sb.WriteString(fmt.Sprintf("Type: %s\n", event.EventType))
-	sb.WriteString(fmt.Sprintf("Summary: %s\n\n", event.Summary))
+	prefix.WriteString("## Incoming Event\n")
+	prefix.WriteString(fmt.Sprintf("Source: %s\n", event.Source))
+	prefix.WriteString(fmt.Sprintf("Type: %s\n", event.EventType))
+	prefix.WriteString(fmt.Sprintf("Summary: %s\n\n", event.Summary))
 
-	sb.WriteString("## Active Threads (last 24 hours)\n")
+	middle.WriteString("## Active Threads (last 24 hours)\n")
 	if len(threads) == 0 {
-		sb.WriteString("(no active threads)\n\n")
+		middle.WriteString("(no active threads)\n\n")
 	} else {
 		limit := r.cfg.IncludeThreadCount
 		if limit == 0 {
@@ -235,34 +238,45 @@ func (r *Router) buildPrompt(event WebhookSummary, threads []ThreadContext) stri
 			limit = len(threads)
 		}
 		for i, t := range threads[:limit] {
-			sb.WriteString(fmt.Sprintf("%d. channel_id=%s channel=%s thread=%s topic=%q workdir=%s last_active=%s\n",
+			middle.WriteString(fmt.Sprintf("%d. channel_id=%s channel=%s thread=%s topic=%q workdir=%s last_active=%s\n",
 				i+1, t.ChannelID, t.ChannelName, t.ThreadTS, t.Topic, t.Workdir, t.LastActive))
 		}
-		sb.WriteString("\n")
+		middle.WriteString("\n")
 	}
 
-	sb.WriteString("## Instructions\n")
-	sb.WriteString("Which thread is this event most likely associated with? Consider:\n")
-	sb.WriteString("- Does the event source/type match the workdir or topic of any thread?\n")
-	sb.WriteString("- Is there a repo name, project name, or keyword match?\n")
-	sb.WriteString("- If no thread is a good match, say so.\n\n")
-	sb.WriteString("Respond as JSON only, no other text:\n")
-	sb.WriteString(`{"thread_id": "channel_id:thread_ts", "confidence": 0-100, "reasoning": "brief explanation"}`)
-	sb.WriteString("\n\nIf no thread is a good match:\n")
-	sb.WriteString(`{"thread_id": null, "confidence": 0, "reasoning": "brief explanation"}`)
+	suffix.WriteString("## Instructions\n")
+	suffix.WriteString("Which thread is this event most likely associated with? Consider:\n")
+	suffix.WriteString("- Does the event source/type match the workdir or topic of any thread?\n")
+	suffix.WriteString("- Is there a repo name, project name, or keyword match?\n")
+	suffix.WriteString("- If no thread is a good match, say so.\n\n")
+	suffix.WriteString("Respond as JSON only, no other text:\n")
+	suffix.WriteString(`{"thread_id": "channel_id:thread_ts", "confidence": 0-100, "reasoning": "brief explanation"}`)
+	suffix.WriteString("\n\nIf no thread is a good match:\n")
+	suffix.WriteString(`{"thread_id": null, "confidence": 0, "reasoning": "brief explanation"}`)
 
-	prompt := sb.String()
+	prefixStr := prefix.String()
+	middleStr := middle.String()
+	suffixStr := suffix.String()
 
 	// Enforce max_input_tokens as a safety limit (rough estimate: 4 chars/token).
+	// Only truncate the middle (thread list) section to preserve instructions.
 	if r.cfg.MaxInputTokens > 0 {
 		maxChars := r.cfg.MaxInputTokens * 4
-		if len(prompt) > maxChars {
-			prompt = prompt[:maxChars]
-			slog.Warn("llmrouter: prompt truncated to max_input_tokens", "max_tokens", r.cfg.MaxInputTokens, "chars", maxChars)
+		totalLen := len(prefixStr) + len(middleStr) + len(suffixStr)
+		if totalLen > maxChars {
+			allowedMiddle := maxChars - len(prefixStr) - len(suffixStr)
+			if allowedMiddle < 0 {
+				allowedMiddle = 0
+			}
+			if allowedMiddle < len(middleStr) {
+				middleStr = middleStr[:allowedMiddle]
+				slog.Warn("llmrouter: thread context truncated to fit max_input_tokens",
+					"max_tokens", r.cfg.MaxInputTokens, "chars", maxChars)
+			}
 		}
 	}
 
-	return prompt
+	return prefixStr + middleStr + suffixStr
 }
 
 // ---------------------------------------------------------------------------

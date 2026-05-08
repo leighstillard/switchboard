@@ -146,6 +146,9 @@ type SessionCoalescer struct {
 	// Drift monitor for tool description word count (Feature 1c).
 	driftMonitor *render.DriftMonitor
 
+	// strictDirectives controls whether render directive validation is strict.
+	strictDirectives bool
+
 	// Flush timer
 	timer  *time.Timer
 	done   chan struct{}
@@ -480,6 +483,13 @@ func (sc *SessionCoalescer) SetFriendlyName(name string) {
 	sc.friendlyName = name
 }
 
+// SetStrictDirectives enables or disables strict render directive validation.
+func (sc *SessionCoalescer) SetStrictDirectives(strict bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.strictDirectives = strict
+}
+
 // resetForNextTurn clears per-turn state so the coalescer is ready for
 // subsequent messages on the same session. Must be called with mu held.
 func (sc *SessionCoalescer) resetForNextTurn() {
@@ -712,7 +722,7 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	fullText := sc.allText()
 	var directiveResult *render.DirectiveResult
 	if fullText != "" && render.HasDirectives(fullText) {
-		result := render.ExtractDirectives(fullText, false)
+		result := render.ExtractDirectives(fullText, sc.strictDirectives)
 		directiveResult = &result
 		if len(result.Blocks) > 0 {
 			sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)

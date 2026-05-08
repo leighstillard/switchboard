@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -184,6 +185,82 @@ bot_token = ""
 	_, err := Load(cfgPath)
 	if err == nil {
 		t.Fatal("expected validation error")
+	}
+}
+
+func TestInsertChannel_RespectsProvidedValues(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	base := `[bridge]
+name = "test"
+
+[ingest]
+listen_addr = "127.0.0.1:9999"
+`
+	if err := os.WriteFile(cfgPath, []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert with explicit workdir and icon_url.
+	ch := ChannelConfig{
+		ID:       "C999TEST",
+		Name:     "my-project",
+		Workdir:  "~/custom/path",
+		Identity: "Worker",
+		IconURL:  "https://example.com/icon.png",
+	}
+	if err := InsertChannel(cfgPath, ch); err != nil {
+		t.Fatalf("InsertChannel failed: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, `workdir = "~/custom/path"`) {
+		t.Errorf("expected provided workdir, got:\n%s", content)
+	}
+	if !strings.Contains(content, `icon_url = "https://example.com/icon.png"`) {
+		t.Errorf("expected provided icon_url, got:\n%s", content)
+	}
+}
+
+func TestInsertChannel_FallbackWorkdir(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	base := `[bridge]
+name = "test"
+`
+	if err := os.WriteFile(cfgPath, []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert with empty workdir and icon_url -- should fall back.
+	ch := ChannelConfig{
+		ID:       "C888TEST",
+		Name:     "fallback-proj",
+		Identity: "Bot",
+	}
+	if err := InsertChannel(cfgPath, ch); err != nil {
+		t.Fatalf("InsertChannel failed: %v", err)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, `workdir = "~/workspace/fallback-proj"`) {
+		t.Errorf("expected fallback workdir, got:\n%s", content)
+	}
+	// icon_url should be empty string (quoted)
+	if !strings.Contains(content, `icon_url = ""`) {
+		t.Errorf("expected empty icon_url, got:\n%s", content)
 	}
 }
 
