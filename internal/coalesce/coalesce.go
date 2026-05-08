@@ -303,8 +303,14 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventTextReplace:
 		var e jcodeproto.TextReplaceEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Replace clears ALL text segments and replaces with a single one.
-			sc.segments = sc.segments[:0]
+			// Replace only text segments; preserve tool segments.
+			kept := sc.segments[:0]
+			for i := range sc.segments {
+				if sc.segments[i].kind == segTool {
+					kept = append(kept, sc.segments[i])
+				}
+			}
+			sc.segments = kept
 			seg := sc.currentTextSegment()
 			seg.text.WriteString(e.Text)
 			sc.dirty = true
