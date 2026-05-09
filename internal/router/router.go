@@ -1447,9 +1447,10 @@ func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchRe
 		IsAppMention: true,
 	}
 
-	// Run handleInbound synchronously. It will create the session,
-	// coalescer, and start streaming events to Slack.
-	r.handleInbound(ctx, msg)
+	// Run handleInbound with a background context so the session outlives
+	// the HTTP request. The request ctx is only used for the dispatch call
+	// itself, not for the long-running event consumer.
+	r.handleInbound(context.Background(), msg)
 
 	// Look up the session that was just created.
 	session, _ := r.store.GetSession(req.ChannelID, threadTS)
