@@ -122,6 +122,19 @@ func main() {
 		})
 	}
 
+	// Wire dispatch endpoint -> router.
+	ing.SetDispatchHandler(func(ctx context.Context, channelID, prompt, userID string) (string, string, error) {
+		result, err := rt.Dispatch(ctx, router.DispatchRequest{
+			ChannelID: channelID,
+			Prompt:    prompt,
+			UserID:    userID,
+		})
+		if err != nil {
+			return "", "", err
+		}
+		return result.ThreadTS, result.SessionID, nil
+	})
+
 	// Start all components.
 	go edge.Run(ctx)
 	go out.Run(ctx)

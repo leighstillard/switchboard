@@ -43,6 +43,10 @@ type Server struct {
 	// Slack message through the router. Only enabled in debug mode.
 	testInjectHandler func(channelID, threadTS, userID, text string) string
 
+	// Dispatch handler: when set, POST /dispatch creates a jcode session
+	// and streams the response to Slack.
+	dispatchHandler func(ctx context.Context, channelID, prompt, userID string) (threadTS, sessionID string, err error)
+
 	// Per-source rate limiters.
 	mu       sync.Mutex
 	limiters map[string]*rateLimiter
@@ -62,6 +66,7 @@ func NewServer(cfg config.IngestConfig, st *store.Store) *Server {
 	mux.HandleFunc("/webhook/cron", s.handleWebhook("cron"))
 	mux.HandleFunc("/webhook/generic", s.handleWebhookGeneric)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/dispatch", s.handleDispatch)
 	mux.HandleFunc("/test/inject", s.handleTestInject)
 
 	s.srv = &http.Server{
@@ -83,6 +88,11 @@ func (s *Server) SetHandler(h WebhookHandler) {
 // This should only be called in debug mode.
 func (s *Server) SetTestInjectHandler(h func(channelID, threadTS, userID, text string) string) {
 	s.testInjectHandler = h
+}
+
+// SetDispatchHandler registers a callback for the dispatch endpoint.
+func (s *Server) SetDispatchHandler(h func(ctx context.Context, channelID, prompt, userID string) (string, string, error)) {
+	s.dispatchHandler = h
 }
 
 // Run starts the HTTP server and webhook worker. Blocks until ctx is cancelled.
@@ -231,6 +241,50 @@ func (s *Server) handleWebhookGeneric(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleDispatch starts a jcode session and streams the response to Slack.
+// POST /dispatch with JSON body: {"channel_id", "prompt", "user_id"?}
+func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
+	if s.dispatchHandler == nil {
+		http.Error(w, "dispatch not configured", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ChannelID string `json:"channel_id"`
+		Prompt    string `json:"prompt"`
+		UserID    string `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ChannelID == "" || req.Prompt == "" {
+		http.Error(w, "channel_id and prompt are required", http.StatusBadRequest)
+		return
+	}
+
+	slog.Info("ingest: dispatch request", "channel", req.ChannelID, "prompt_len", len(req.Prompt))
+
+	threadTS, sessionID, err := s.dispatchHandler(r.Context(), req.ChannelID, req.Prompt, req.UserID)
+	if err != nil {
+		slog.Error("ingest: dispatch failed", "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":     "dispatched",
+		"thread_ts":  threadTS,
+		"session_id": sessionID,
+	})
 }
 
 // handleTestInject accepts simulated Slack messages for e2e testing.

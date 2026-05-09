@@ -1381,6 +1381,90 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatch API
+// ---------------------------------------------------------------------------
+
+// DispatchRequest describes a programmatic dispatch to a channel.
+type DispatchRequest struct {
+	ChannelID string // target Slack channel
+	Prompt    string // message text to send to the agent
+	UserID    string // user to @mention on completion (optional)
+}
+
+// DispatchResult contains the outcome of a Dispatch call.
+type DispatchResult struct {
+	ThreadTS  string // the Slack thread that was created
+	SessionID string // the jcode session that is processing the request
+}
+
+// Dispatch programmatically starts a jcode turn in a channel. It posts the
+// prompt as a top-level Slack message (creating a thread), then routes the
+// prompt to jcode exactly like a human-initiated message. The agent response
+// streams into the newly created thread via the normal coalescer path.
+func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchResult, error) {
+	if req.ChannelID == "" || req.Prompt == "" {
+		return nil, fmt.Errorf("dispatch: channel_id and prompt are required")
+	}
+
+	// Resolve channel configuration.
+	workdir, _ := r.resolveChannel(req.ChannelID)
+	if workdir == "" {
+		return nil, fmt.Errorf("dispatch: channel %s is not configured", req.ChannelID)
+	}
+
+	// Post the prompt as a top-level message to create a thread.
+	identity := r.resolveIdentity(req.ChannelID)
+	var postOpts []outbound.PostOption
+	if identity.DisplayName != "" || identity.IconURL != "" {
+		postOpts = append(postOpts, outbound.PostOption{
+			Username: identity.DisplayName,
+			IconURL:  identity.IconURL,
+		})
+	}
+
+	threadTS, err := r.edge.PostMessage(req.ChannelID, fmt.Sprintf("📋 *Dispatch:*\n%s", req.Prompt), postOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: post thread: %w", err)
+	}
+
+	slog.Info("dispatch: created thread",
+		"channel", req.ChannelID,
+		"thread_ts", threadTS,
+		"prompt_len", len(req.Prompt),
+	)
+
+	// Synthesize an InboundMessage and route through handleInbound.
+	userID := req.UserID
+	if userID == "" {
+		userID = "dispatch"
+	}
+	msg := &slack.InboundMessage{
+		ChannelID:    req.ChannelID,
+		UserID:       userID,
+		Text:         req.Prompt,
+		MessageTS:    threadTS,
+		IsTopLevel:   true,
+		IsAppMention: true,
+	}
+
+	// Run handleInbound synchronously. It will create the session,
+	// coalescer, and start streaming events to Slack.
+	r.handleInbound(ctx, msg)
+
+	// Look up the session that was just created.
+	session, _ := r.store.GetSession(req.ChannelID, threadTS)
+	sessionID := ""
+	if session != nil {
+		sessionID = session.JcodeSession
+	}
+
+	return &DispatchResult{
+		ThreadTS:  threadTS,
+		SessionID: sessionID,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
