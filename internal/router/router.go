@@ -58,6 +58,14 @@ type Router struct {
 	// subsequent turns route to the next waiting coalescer (thread).
 	coalescerQueue map[string][]string // jcodeSessionID -> []coalescerKey
 
+	// threadLock enforces that only one thread at a time receives events from
+	// a jcode session. When a thread starts a turn, it acquires the lock.
+	// consumeEvents routes events exclusively to the locked thread. On turn
+	// completion the lock is released and the next queued thread (if any)
+	// is promoted. This prevents events from leaking to the wrong Slack
+	// thread when multiple threads share a jcode session.
+	threadLock map[string]string // jcodeSessionID -> coalescerKey (active lock holder)
+
 	// turnRequester tracks which user triggered the current active turn,
 	// keyed by coalescerKey. Used to @mention them when the turn completes.
 	turnRequester map[string]string // coalescerKey -> userID
@@ -88,6 +96,7 @@ func New(
 		routes:             cfg.Routes,
 		coalescers:         make(map[string]*coalesce.SessionCoalescer),
 		coalescerQueue:     make(map[string][]string),
+		threadLock:         make(map[string]string),
 		turnRequester:      make(map[string]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
@@ -445,6 +454,10 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	r.mu.Lock()
 	r.coalescers[key] = coal
 	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], key)
+	// Acquire thread lock if no other thread holds it.
+	if _, locked := r.threadLock[sessionID]; !locked {
+		r.threadLock[sessionID] = key
+	}
 	r.turnRequester[key] = msg.UserID
 	r.mu.Unlock()
 
@@ -563,6 +576,10 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		}
 		// Ensure event consumer routes to this coalescer for the next turn.
 		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		// Acquire thread lock if no other thread holds it.
+		if _, locked := r.threadLock[session.JcodeSession]; !locked {
+			r.threadLock[session.JcodeSession] = key
+		}
 		r.turnRequester[key] = msg.UserID
 		r.mu.Unlock()
 	} else if session.Status == "processing" {
@@ -662,20 +679,16 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				return
 			}
 
-			// Look up the active coalescer for this jcode session (front of queue).
+			// Route events exclusively to the thread that holds the lock.
 			r.mu.RLock()
-			queue := r.coalescerQueue[sessionID]
-			var key string
-			if len(queue) > 0 {
-				key = queue[0]
-			}
+			key := r.threadLock[sessionID]
 			coal := r.coalescers[key]
 			r.mu.RUnlock()
 
-			slog.Debug("router: consumeEvents got event", "session_id", sessionID, "type", ev.Type, "key", key, "has_coal", coal != nil)
+			slog.Debug("router: consumeEvents got event", "session_id", sessionID, "type", ev.Type, "locked_key", key, "has_coal", coal != nil)
 
 			if coal == nil {
-				slog.Debug("router: no coalescer for event", "session_id", sessionID, "type", ev.Type)
+				slog.Debug("router: no locked coalescer for event", "session_id", sessionID, "type", ev.Type)
 				continue
 			}
 
@@ -704,11 +717,18 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 
 			// Handle turn completion.
 			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
-				// Pop the front of the coalescer queue so subsequent events
-				// route to the next waiting thread.
 				r.mu.Lock()
+				// Release the lock.
+				delete(r.threadLock, sessionID)
+				// Pop the front of the coalescer queue.
 				if q := r.coalescerQueue[sessionID]; len(q) > 0 {
 					r.coalescerQueue[sessionID] = q[1:]
+				}
+				// Promote the next queued thread to lock holder.
+				if q := r.coalescerQueue[sessionID]; len(q) > 0 {
+					r.threadLock[sessionID] = q[0]
+					slog.Info("router: promoted next thread to lock",
+						"session_id", sessionID, "key", q[0])
 				}
 				r.mu.Unlock()
 
@@ -802,6 +822,10 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 	// jcode events arriving during the send can find the right coalescer.
 	r.mu.Lock()
 	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
+	// Acquire thread lock if no other thread holds it.
+	if _, locked := r.threadLock[sessionID]; !locked {
+		r.threadLock[sessionID] = coalKey
+	}
 	r.mu.Unlock()
 
 	// Send combined message to jcode.
@@ -811,6 +835,10 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 		// Remove the coalKey we just added since the send failed.
 		r.mu.Lock()
 		dropNextKeyFromQueue(r.coalescerQueue, sessionID, coalKey)
+		// Release lock if we held it.
+		if r.threadLock[sessionID] == coalKey {
+			delete(r.threadLock, sessionID)
+		}
 		r.mu.Unlock()
 		// Re-enqueue the turns so they aren't lost.
 		for _, t := range turns {
@@ -1097,6 +1125,10 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		// Idle sessions will be added when a new message arrives.
 		if sess.Status == "processing" {
 			r.coalescerQueue[sess.JcodeSession] = append(r.coalescerQueue[sess.JcodeSession], key)
+			// Acquire thread lock if no other thread holds it.
+			if _, locked := r.threadLock[sess.JcodeSession]; !locked {
+				r.threadLock[sess.JcodeSession] = key
+			}
 		}
 		r.mu.Unlock()
 
