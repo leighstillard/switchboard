@@ -792,28 +792,16 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 	if len(turns) == 0 {
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 
-		// Notify the requesting user that the turn is complete,
-		// including the agent's final message text if available.
+		// Notify the requesting user that the turn is complete.
 		// Only send success notification for EventDone; errors and
 		// interruptions are already displayed by the coalescer.
 		r.mu.Lock()
 		requester := r.turnRequester[coalKey]
 		delete(r.turnRequester, coalKey)
-		coal := r.coalescers[coalKey]
 		r.mu.Unlock()
 
 		if requester != "" && shouldNotifySuccess(eventType) {
 			notifyText := fmt.Sprintf("<@%s> ✅", requester)
-			if coal != nil {
-				if finalMsg := coal.FinalMessageText(); finalMsg != "" {
-					// Convert markdown to Slack mrkdwn and truncate.
-					finalMsg = coalesce.MarkdownToMrkdwn(finalMsg)
-					if len(finalMsg) > 300 {
-						finalMsg = finalMsg[:300] + "..."
-					}
-					notifyText = fmt.Sprintf("<@%s> ✅\n\n%s", requester, finalMsg)
-				}
-			}
 			r.outbound.Enqueue(&outbound.OutboundItem{
 				Priority:  2,
 				ChannelID: channelID,

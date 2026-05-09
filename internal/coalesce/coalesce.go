@@ -127,11 +127,6 @@ type SessionCoalescer struct {
 	// Fallback text from directives (for clients that can't render blocks).
 	directiveFallback string
 
-	// finalMessageText holds the last assistant message segment (text after
-	// the last tool call) captured at turn end for inclusion in the done
-	// notification. Reset on each new turn.
-	finalMessageText string
-
 	upstreamProvider *string // captured for footer on final flush
 
 	firstTurn bool // true until the first turn completes (show header)
@@ -439,34 +434,6 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 		sc.flushLocked(false)
 
 	case jcodeproto.EventDone:
-		// Capture post-tool text as the final message for the done notification.
-		// Walk segments backwards to find the last text after the last tool.
-		sc.finalMessageText = ""
-		hasTools := false
-		for i := range sc.segments {
-			if sc.segments[i].kind == segTool {
-				hasTools = true
-			}
-		}
-		if hasTools {
-			// Find text after the last tool segment.
-			for i := len(sc.segments) - 1; i >= 0; i-- {
-				if sc.segments[i].kind == segText {
-					txt := strings.TrimSpace(sc.segments[i].text.String())
-					if txt != "" {
-						sc.finalMessageText = txt
-					}
-					break
-				}
-				if sc.segments[i].kind == segTool {
-					break
-				}
-			}
-		} else {
-			// No tools: the entire text is the final message.
-			sc.finalMessageText = strings.TrimSpace(sc.allText())
-		}
-
 		sc.finalized = true
 		sc.flushLocked(true)
 		// Reset state for the next turn (same session, new response).
@@ -530,8 +497,6 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	}
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
-	// Note: finalMessageText is NOT cleared here; it's read by the router
-	// after the turn ends. It will be overwritten on the next turn's done event.
 	sc.progressMessageTS = nil // next turn gets a new Slack message
 	sc.firstTurn = false       // header only on the first turn
 	sc.finalized = false
@@ -543,15 +508,6 @@ func (sc *SessionCoalescer) ProgressMessageTS() *string {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return sc.progressMessageTS
-}
-
-// FinalMessageText returns the agent's concluding text (after the last tool
-// call) from the most recently completed turn. This is intended for inclusion
-// in the "done" notification so users see the conclusion without scrolling.
-func (sc *SessionCoalescer) FinalMessageText() string {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return sc.finalMessageText
 }
 
 // ---------------------------------------------------------------------------
