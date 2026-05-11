@@ -667,6 +667,14 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		slashCmd := text[1:] // strip "!" so "!/<cmd>" becomes "/<cmd>"
 		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
+
+		// Push coalescer key so events (including done) route correctly
+		// and the coalescer resets at end of turn.
+		key := coalescerKey(msg.ChannelID, threadTS)
+		r.mu.Lock()
+		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		r.mu.Unlock()
+
 		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
 			slog.Error("router: slash passthrough send failed", "err", err)
 			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
