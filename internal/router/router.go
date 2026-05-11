@@ -623,22 +623,6 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		threadTS = msg.MessageTS
 	}
 
-	// Slash command passthrough: "//<cmd>" -> sends "/<cmd>" to jcode.
-	if strings.HasPrefix(text, "//") {
-		session, err := r.store.GetSession(msg.ChannelID, threadTS)
-		if err != nil || session == nil {
-			return false
-		}
-		slashCmd := text[1:] // strip leading "/" so "//<cmd>" becomes "/<cmd>"
-		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
-		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
-		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
-			slog.Error("router: slash passthrough send failed", "err", err)
-			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
-		}
-		return true
-	}
-
 	switch {
 	case text == "!stop" || text == "!cancel":
 		session, err := r.store.GetSession(msg.ChannelID, threadTS)
@@ -669,6 +653,23 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 				Action:    outbound.ActionPostMessage,
 				Text:      fmt.Sprintf("Purged %d queued message(s).", len(turns)),
 			})
+		}
+		return true
+	}
+
+	// Slash command passthrough: "!/<cmd>" sends "/<cmd>" to jcode.
+	// Must come after specific !commands above.
+	if strings.HasPrefix(text, "!/") {
+		session, err := r.store.GetSession(msg.ChannelID, threadTS)
+		if err != nil || session == nil {
+			return false
+		}
+		slashCmd := text[1:] // strip "!" so "!/<cmd>" becomes "/<cmd>"
+		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
+		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
+			slog.Error("router: slash passthrough send failed", "err", err)
+			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
 		}
 		return true
 	}
