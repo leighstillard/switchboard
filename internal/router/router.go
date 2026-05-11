@@ -614,13 +614,29 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 	}
 }
 
-// handleCommand checks for !stop, !cancel, !purge commands.
+// handleCommand checks for !stop, !cancel, !purge, and // passthrough commands.
 func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) bool {
 	text := strings.TrimSpace(msg.Text)
 
 	threadTS := msg.ThreadTS
 	if msg.IsTopLevel {
 		threadTS = msg.MessageTS
+	}
+
+	// Slash command passthrough: "//<cmd>" -> sends "/<cmd>" to jcode.
+	if strings.HasPrefix(text, "//") {
+		session, err := r.store.GetSession(msg.ChannelID, threadTS)
+		if err != nil || session == nil {
+			return false
+		}
+		slashCmd := text[1:] // strip leading "/" so "//<cmd>" becomes "/<cmd>"
+		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
+		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
+			slog.Error("router: slash passthrough send failed", "err", err)
+			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
+		}
+		return true
 	}
 
 	switch {
