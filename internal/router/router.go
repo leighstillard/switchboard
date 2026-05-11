@@ -668,11 +668,14 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
 
-		// Push coalescer key so events (including done) route correctly
-		// and the coalescer resets at end of turn.
+		// Push coalescer key and acquire thread lock so events
+		// (including done) route correctly and the coalescer resets.
 		key := coalescerKey(msg.ChannelID, threadTS)
 		r.mu.Lock()
 		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		if _, locked := r.threadLock[session.JcodeSession]; !locked {
+			r.threadLock[session.JcodeSession] = key
+		}
 		r.mu.Unlock()
 
 		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
