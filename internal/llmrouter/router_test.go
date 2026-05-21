@@ -235,6 +235,45 @@ func TestBuildPrompt_ThreadLimitRespected(t *testing.T) {
 	}
 }
 
+func TestBuildPrompt_TruncationPreservesInstructions(t *testing.T) {
+	// Use a very small max_input_tokens to force truncation.
+	r := New(Config{
+		MaxInputTokens:     100, // 400 chars max - will require truncation
+		IncludeThreadCount: 50,
+	})
+
+	// Generate many threads to create a large middle section.
+	threads := make([]ThreadContext, 20)
+	for i := range threads {
+		threads[i] = ThreadContext{
+			ChannelID:   "C123",
+			ChannelName: "#dev",
+			ThreadTS:    "ts",
+			Topic:       "Long topic description for thread padding",
+			Workdir:     "/home/user/workspace/project",
+			LastActive:  "5m ago",
+		}
+	}
+
+	event := WebhookSummary{Source: "github", EventType: "push", Summary: "Push to main"}
+	prompt := r.buildPrompt(event, threads)
+
+	// The JSON response format instructions must be preserved even after truncation.
+	if !contains(prompt, "Respond as JSON only") {
+		t.Error("truncation removed JSON response instructions")
+	}
+	if !contains(prompt, `"thread_id"`) {
+		t.Error("truncation removed JSON format example")
+	}
+	if !contains(prompt, "## Instructions") {
+		t.Error("truncation removed Instructions header")
+	}
+	// Event details should also be preserved.
+	if !contains(prompt, "github") {
+		t.Error("truncation removed event source")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration test with mock Anthropic API
 // ---------------------------------------------------------------------------
@@ -276,9 +315,7 @@ func TestRoute_WithMockAPI(t *testing.T) {
 		MonthlyBudgetUSD:    5.0,
 	}
 	r := New(cfg)
-	// Override the HTTP client to point to our mock server.
-	r.httpClient = server.Client()
-	// We also need to override the URL - use a custom transport.
+	// Override the HTTP client with a transport that rewrites URLs to the mock server.
 	r.httpClient = &http.Client{
 		Transport: &rewriteTransport{base: http.DefaultTransport, target: server.URL},
 	}

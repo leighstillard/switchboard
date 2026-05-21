@@ -505,6 +505,19 @@ func (q *Queue) execute(ctx context.Context, item *OutboundItem) {
 				opts := buildPostOpts(item)
 				retryErr := q.slack.UpdateMessage(item.ChannelID, item.MessageTS, truncated, opts...)
 				if retryErr != nil {
+					// If the truncated retry also hit a transient 429,
+					// re-enqueue with the truncated text so it isn't lost.
+					if retryAfter := parseRetryAfter(retryErr); retryAfter > 0 {
+						slog.Warn("outbound: truncated retry rate-limited, re-queuing",
+							"channel", item.ChannelID,
+							"retry_after", retryAfter,
+						)
+						q.applyRetryAfter(item.Action, retryAfter)
+						retryItem := *item
+						retryItem.Text = truncated
+						q.Enqueue(&retryItem)
+						return
+					}
 					slog.Error("outbound: truncated retry also failed",
 						"channel", item.ChannelID,
 						"error", retryErr,

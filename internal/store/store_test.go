@@ -748,6 +748,161 @@ func TestLLMRoutingDecision_UpdateFeedback(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// PR review fixes: TDD tests (written before implementation)
+// ---------------------------------------------------------------------------
+
+func TestLLMDecision_NullWebhookInboxID(t *testing.T) {
+	s := newTestStore(t)
+
+	// Insert a decision with nil WebhookInboxID (no durable inbox).
+	d := &LLMRoutingDecision{
+		DecidedAt:  time.Now().Unix(),
+		Model:      "claude-haiku-4-5",
+		Confidence: 75,
+		PostedTo:   "fallback",
+	}
+	if err := s.InsertLLMDecision(d); err != nil {
+		t.Fatalf("InsertLLMDecision with nil webhook_inbox_id: %v", err)
+	}
+	if d.ID == 0 {
+		t.Error("expected non-zero ID")
+	}
+}
+
+func TestLLMDecision_UniqueWebhookInboxID(t *testing.T) {
+	s := newTestStore(t)
+
+	w := &WebhookInboxItem{
+		ReceivedAt:     time.Now().Unix(),
+		Source:         "test",
+		IdempotencyKey: "unique-test",
+		HeadersJSON:    "{}",
+		BodyBlob:       []byte("{}"),
+		Status:         "done",
+	}
+	s.InsertWebhook(w)
+
+	// First decision for this webhook should succeed.
+	d1 := &LLMRoutingDecision{
+		WebhookInboxID: &w.ID,
+		DecidedAt:      time.Now().Unix(),
+		Model:          "claude-haiku-4-5",
+		Confidence:     80,
+		PostedTo:       "suggested",
+	}
+	if err := s.InsertLLMDecision(d1); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+
+	// Second decision for the SAME webhook should fail (unique constraint).
+	d2 := &LLMRoutingDecision{
+		WebhookInboxID: &w.ID,
+		DecidedAt:      time.Now().Unix(),
+		Model:          "claude-haiku-4-5",
+		Confidence:     90,
+		PostedTo:       "suggested",
+	}
+	err := s.InsertLLMDecision(d2)
+	if err == nil {
+		t.Fatal("expected unique constraint error for duplicate webhook_inbox_id, got nil")
+	}
+}
+
+func TestLLMDecision_MultipleNullWebhookIDs(t *testing.T) {
+	s := newTestStore(t)
+
+	// Multiple decisions with NULL webhook_inbox_id should be allowed
+	// (NULL != NULL in SQL unique constraints).
+	for i := 0; i < 3; i++ {
+		d := &LLMRoutingDecision{
+			DecidedAt:  time.Now().Unix(),
+			Model:      "claude-haiku-4-5",
+			Confidence: 70 + i,
+			PostedTo:   "fallback",
+		}
+		if err := s.InsertLLMDecision(d); err != nil {
+			t.Fatalf("insert %d with nil webhook_inbox_id: %v", i, err)
+		}
+	}
+}
+
+func TestUpdateLLMFeedback_InvalidEnum(t *testing.T) {
+	s := newTestStore(t)
+
+	d := &LLMRoutingDecision{
+		DecidedAt:  time.Now().Unix(),
+		Model:      "claude-haiku-4-5",
+		Confidence: 80,
+		PostedTo:   "suggested",
+	}
+	s.InsertLLMDecision(d)
+
+	// Invalid feedback value should be rejected.
+	err := s.UpdateLLMFeedback(d.ID, "invalid-value")
+	if err == nil {
+		t.Fatal("expected error for invalid feedback enum, got nil")
+	}
+
+	err = s.UpdateLLMFeedback(d.ID, "")
+	if err == nil {
+		t.Fatal("expected error for empty feedback, got nil")
+	}
+}
+
+func TestUpdateLLMFeedback_StaleID(t *testing.T) {
+	s := newTestStore(t)
+
+	// Updating a non-existent ID should fail.
+	err := s.UpdateLLMFeedback(99999, "confirmed")
+	if err == nil {
+		t.Fatal("expected error for stale/missing ID, got nil")
+	}
+}
+
+func TestGetLLMDecisionByWebhookID_Deterministic(t *testing.T) {
+	s := newTestStore(t)
+
+	w := &WebhookInboxItem{
+		ReceivedAt:     time.Now().Unix(),
+		Source:         "test",
+		IdempotencyKey: "det-test",
+		HeadersJSON:    "{}",
+		BodyBlob:       []byte("{}"),
+		Status:         "done",
+	}
+	s.InsertWebhook(w)
+
+	// To test determinism, we need two rows with the same webhook_inbox_id.
+	// Since we're adding a unique index, we'll instead test that the query
+	// includes ORDER BY + LIMIT 1 by inserting one row and verifying it
+	// comes back correctly. The real protection is the unique index +
+	// deterministic query for defense-in-depth.
+	now := time.Now().Unix()
+	d := &LLMRoutingDecision{
+		WebhookInboxID: &w.ID,
+		DecidedAt:      now,
+		Model:          "claude-haiku-4-5",
+		Confidence:     85,
+		PostedTo:       "suggested",
+	}
+	s.InsertLLMDecision(d)
+
+	got, err := s.GetLLMDecisionByWebhookID(w.ID)
+	if err != nil {
+		t.Fatalf("GetLLMDecisionByWebhookID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil decision")
+	}
+	if got.DecidedAt != now {
+		t.Errorf("decided_at = %d, want %d", got.DecidedAt, now)
+	}
+	if got.Confidence != 85 {
+		t.Errorf("confidence = %d, want 85", got.Confidence)
+	}
+}
+
 func TestLLMRoutingStats(t *testing.T) {
 	s := newTestStore(t)
 

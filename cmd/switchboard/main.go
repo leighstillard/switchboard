@@ -122,6 +122,19 @@ func main() {
 		})
 	}
 
+	// Wire dispatch endpoint -> router.
+	ing.SetDispatchHandler(func(ctx context.Context, channelID, prompt, userID string) (string, string, error) {
+		result, err := rt.Dispatch(ctx, router.DispatchRequest{
+			ChannelID: channelID,
+			Prompt:    prompt,
+			UserID:    userID,
+		})
+		if err != nil {
+			return "", "", err
+		}
+		return result.ThreadTS, result.SessionID, nil
+	})
+
 	// Start all components.
 	go edge.Run(ctx)
 	go out.Run(ctx)
@@ -146,6 +159,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
+	forceShutdown := false
 	for {
 		sig := <-sigCh
 		switch sig {
@@ -162,6 +176,27 @@ func main() {
 			render.ConfigureDescriptions(newCfg.Render.Descriptions.TargetWords, newCfg.Render.Descriptions.HardTruncateWords)
 			slog.Info("config reloaded successfully")
 		case syscall.SIGINT, syscall.SIGTERM:
+			// Check for active processing sessions before shutting down.
+			if !forceShutdown {
+				sessions, _ := st.ListActiveSessions()
+				var processing []string
+				for _, s := range sessions {
+					if s.Status == "processing" {
+						processing = append(processing, fmt.Sprintf("  %s (thread %s)", s.FriendlyName, s.ThreadTS))
+					}
+				}
+				if len(processing) > 0 {
+					slog.Warn("shutdown blocked: agents are still processing",
+						"count", len(processing),
+					)
+					for _, p := range processing {
+						slog.Warn("  active session", "session", p)
+					}
+					slog.Warn("send signal again to force shutdown")
+					forceShutdown = true
+					continue
+				}
+			}
 			slog.Info("shutdown signal received", "signal", sig.String())
 			rt.NotifyShutdown()
 			cancel()

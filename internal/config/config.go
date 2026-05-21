@@ -273,9 +273,13 @@ func InsertChannel(configPath string, ch ChannelConfig) error {
 		return fmt.Errorf("config: read for insert: %w", err)
 	}
 
-	// Use ~/workspace/<name> format in the file (not expanded path)
-	entry := fmt.Sprintf("\n[[channels]]\nid = %q\nname = %q\nworkdir = \"~/workspace/%s\"\nidentity = %q\nicon_url = \"\"\n",
-		ch.ID, ch.Name, ch.Name, ch.Identity)
+	// Use provided workdir, falling back to ~/workspace/<name> if empty.
+	workdir := ch.Workdir
+	if workdir == "" {
+		workdir = fmt.Sprintf("~/workspace/%s", ch.Name)
+	}
+	entry := fmt.Sprintf("\n[[channels]]\nid = %q\nname = %q\nworkdir = %q\nidentity = %q\nicon_url = %q\n",
+		ch.ID, ch.Name, workdir, ch.Identity, ch.IconURL)
 
 	content := string(data)
 

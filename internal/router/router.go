@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,14 @@ type Router struct {
 	// subsequent turns route to the next waiting coalescer (thread).
 	coalescerQueue map[string][]string // jcodeSessionID -> []coalescerKey
 
+	// threadLock enforces that only one thread at a time receives events from
+	// a jcode session. When a thread starts a turn, it acquires the lock.
+	// consumeEvents routes events exclusively to the locked thread. On turn
+	// completion the lock is released and the next queued thread (if any)
+	// is promoted. This prevents events from leaking to the wrong Slack
+	// thread when multiple threads share a jcode session.
+	threadLock map[string]string // jcodeSessionID -> coalescerKey (active lock holder)
+
 	// turnRequester tracks which user triggered the current active turn,
 	// keyed by coalescerKey. Used to @mention them when the turn completes.
 	turnRequester map[string]string // coalescerKey -> userID
@@ -87,6 +96,7 @@ func New(
 		routes:             cfg.Routes,
 		coalescers:         make(map[string]*coalesce.SessionCoalescer),
 		coalescerQueue:     make(map[string][]string),
+		threadLock:         make(map[string]string),
 		turnRequester:      make(map[string]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
@@ -225,6 +235,11 @@ func (r *Router) Reload(newCfg *config.Config) {
 		slog.Info("router: LLM router (re)enabled on reload", "model", llmCfg.Model)
 	} else {
 		r.llmRouter = nil
+	}
+
+	// Propagate strict directive setting to all active coalescers.
+	for _, coal := range r.coalescers {
+		coal.SetStrictDirectives(newCfg.Render.StrictDirectiveValidation)
 	}
 
 	slog.Info("router: config reloaded",
@@ -434,34 +449,20 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		sessionID, friendlyName, msg.ChannelID, threadTS, workdir,
 		identity, r.outbound, r.handleImage,
 	)
+	coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 	key := coalescerKey(msg.ChannelID, threadTS)
 	r.mu.Lock()
 	r.coalescers[key] = coal
 	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], key)
+	// Acquire thread lock if no other thread holds it.
+	if _, locked := r.threadLock[sessionID]; !locked {
+		r.threadLock[sessionID] = key
+	}
 	r.turnRequester[key] = msg.UserID
 	r.mu.Unlock()
 
 	// Add 👀 reaction to acknowledge receipt.
 	r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
-
-	// If reusing an existing session that is currently processing another turn,
-	// queue the message rather than sending immediately. This prevents jcode
-	// from mixing the response into the wrong thread's coalescer.
-	if isReused && existingSession.Status == "processing" {
-		slog.Info("router: session busy, queueing message for new thread",
-			"session_id", sessionID,
-			"thread_ts", threadTS,
-			"existing_thread", existingSession.ThreadTS,
-		)
-		r.store.EnqueueTurn(&store.TurnQueueItem{
-			ChannelID:  msg.ChannelID,
-			ThreadTS:   threadTS,
-			EnqueuedAt: time.Now().Unix(),
-			UserID:     msg.UserID,
-			Text:       msg.Text,
-		})
-		return
-	}
 
 	// Send the user's message to jcode.
 	var images []jcodeproto.ImagePair
@@ -534,7 +535,10 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 					"channel", msg.ChannelID,
 					"thread_ts", threadTS)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.store.DeleteSession(msg.ChannelID, threadTS)
+				if err := r.store.DeleteSession(msg.ChannelID, threadTS); err != nil {
+					slog.Warn("router: failed to delete stale session before replacement",
+						"channel", msg.ChannelID, "thread_ts", threadTS, "err", err)
+				}
 				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
@@ -546,7 +550,10 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
 				r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
-				r.store.DeleteSession(msg.ChannelID, threadTS)
+				if err := r.store.DeleteSession(msg.ChannelID, threadTS); err != nil {
+					slog.Warn("router: failed to delete session before replacement",
+						"channel", msg.ChannelID, "thread_ts", threadTS, "err", err)
+				}
 				r.handleNewSession(ctx, msg, session.Workdir, r.resolveIdentity(msg.ChannelID), threadTS)
 				return
 			}
@@ -564,10 +571,15 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				msg.ChannelID, threadTS, session.Workdir,
 				identity, r.outbound, r.handleImage,
 			)
+			coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 			r.coalescers[key] = coal
 		}
 		// Ensure event consumer routes to this coalescer for the next turn.
 		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		// Acquire thread lock if no other thread holds it.
+		if _, locked := r.threadLock[session.JcodeSession]; !locked {
+			r.threadLock[session.JcodeSession] = key
+		}
 		r.turnRequester[key] = msg.UserID
 		r.mu.Unlock()
 	} else if session.Status == "processing" {
@@ -602,7 +614,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 	}
 }
 
-// handleCommand checks for !stop, !cancel, !purge commands.
+// handleCommand checks for !stop, !cancel, !purge, and // passthrough commands.
 func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) bool {
 	text := strings.TrimSpace(msg.Text)
 
@@ -645,6 +657,34 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		return true
 	}
 
+	// Slash command passthrough: "!/<cmd>" sends "/<cmd>" to jcode.
+	// Must come after specific !commands above.
+	if strings.HasPrefix(text, "!/") {
+		session, err := r.store.GetSession(msg.ChannelID, threadTS)
+		if err != nil || session == nil {
+			return false
+		}
+		slashCmd := text[1:] // strip "!" so "!/<cmd>" becomes "/<cmd>"
+		slog.Info("router: slash passthrough", "channel", msg.ChannelID, "thread_ts", threadTS, "cmd", slashCmd)
+		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "arrow_right")
+
+		// Push coalescer key and acquire thread lock so events
+		// (including done) route correctly and the coalescer resets.
+		key := coalescerKey(msg.ChannelID, threadTS)
+		r.mu.Lock()
+		r.coalescerQueue[session.JcodeSession] = append(r.coalescerQueue[session.JcodeSession], key)
+		if _, locked := r.threadLock[session.JcodeSession]; !locked {
+			r.threadLock[session.JcodeSession] = key
+		}
+		r.mu.Unlock()
+
+		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
+			slog.Error("router: slash passthrough send failed", "err", err)
+			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
+		}
+		return true
+	}
+
 	return false
 }
 
@@ -667,20 +707,16 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				return
 			}
 
-			// Look up the active coalescer for this jcode session (front of queue).
+			// Route events exclusively to the thread that holds the lock.
 			r.mu.RLock()
-			queue := r.coalescerQueue[sessionID]
-			var key string
-			if len(queue) > 0 {
-				key = queue[0]
-			}
+			key := r.threadLock[sessionID]
 			coal := r.coalescers[key]
 			r.mu.RUnlock()
 
-			slog.Debug("router: consumeEvents got event", "session_id", sessionID, "type", ev.Type, "key", key, "has_coal", coal != nil)
+			slog.Debug("router: consumeEvents got event", "session_id", sessionID, "type", ev.Type, "locked_key", key, "has_coal", coal != nil)
 
 			if coal == nil {
-				slog.Debug("router: no coalescer for event", "session_id", sessionID, "type", ev.Type)
+				slog.Debug("router: no locked coalescer for event", "session_id", sessionID, "type", ev.Type)
 				continue
 			}
 
@@ -709,22 +745,61 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 
 			// Handle turn completion.
 			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
-				// Pop the front of the coalescer queue so subsequent events
-				// route to the next waiting thread.
 				r.mu.Lock()
+				// Release the lock.
+				delete(r.threadLock, sessionID)
+				// Pop the front of the coalescer queue.
 				if q := r.coalescerQueue[sessionID]; len(q) > 0 {
 					r.coalescerQueue[sessionID] = q[1:]
 				}
+				// Promote the next queued thread to lock holder.
+				if q := r.coalescerQueue[sessionID]; len(q) > 0 {
+					r.threadLock[sessionID] = q[0]
+					slog.Info("router: promoted next thread to lock",
+						"session_id", sessionID, "key", q[0])
+				}
 				r.mu.Unlock()
 
-				r.handleTurnEnd(ctx, sessionID, key)
+				r.handleTurnEnd(ctx, sessionID, key, ev.Type)
 			}
 		}
 	}
 }
 
+// shouldNotifySuccess returns true if the event type warrants a ✅ success
+// notification. Error and interrupted events are handled by the coalescer
+// with their own messaging, so sending ✅ would be misleading.
+func shouldNotifySuccess(eventType string) bool {
+	return eventType == jcodeproto.EventDone
+}
+
+// dropNextKeyFromQueue removes the front entry from the coalescerQueue for the
+// given sessionID, but only if it matches expectedKey. This is used to clean up
+// after a failed SendMessage for a next-thread batch.
+func dropNextKeyFromQueue(queue map[string][]string, sessionID, expectedKey string) {
+	if q := queue[sessionID]; len(q) > 0 && q[0] == expectedKey {
+		queue[sessionID] = q[1:]
+	}
+}
+
+// isValidLLMThreadID checks that a thread_id string (format "channelID:threadTS")
+// matches one of the ThreadContext entries that were provided to the LLM.
+func isValidLLMThreadID(threadID string, threads []llmrouter.ThreadContext) bool {
+	parts := strings.SplitN(threadID, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	channelID, threadTS := parts[0], parts[1]
+	for _, tc := range threads {
+		if tc.ChannelID == channelID && tc.ThreadTS == threadTS {
+			return true
+		}
+	}
+	return false
+}
+
 // handleTurnEnd drains the turn queue and either sends the next batch or marks idle.
-func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
+func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventType string) {
 	// Parse channelID and threadTS from the coalescer key.
 	channelID, threadTS := parseCoalescerKey(coalKey)
 	if channelID == "" {
@@ -743,26 +818,16 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 	if len(turns) == 0 {
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 
-		// Notify the requesting user that the turn is complete,
-		// including the agent's final message text if available.
+		// Notify the requesting user that the turn is complete.
+		// Only send success notification for EventDone; errors and
+		// interruptions are already displayed by the coalescer.
 		r.mu.Lock()
 		requester := r.turnRequester[coalKey]
 		delete(r.turnRequester, coalKey)
-		coal := r.coalescers[coalKey]
 		r.mu.Unlock()
 
-		if requester != "" {
+		if requester != "" && shouldNotifySuccess(eventType) {
 			notifyText := fmt.Sprintf("<@%s> ✅", requester)
-			if coal != nil {
-				if finalMsg := coal.FinalMessageText(); finalMsg != "" {
-					// Convert markdown to Slack mrkdwn and truncate.
-					finalMsg = coalesce.MarkdownToMrkdwn(finalMsg)
-					if len(finalMsg) > 300 {
-						finalMsg = finalMsg[:300] + "..."
-					}
-					notifyText = fmt.Sprintf("<@%s> ✅\n\n%s", requester, finalMsg)
-				}
-			}
 			r.outbound.Enqueue(&outbound.OutboundItem{
 				Priority:  2,
 				ChannelID: channelID,
@@ -770,45 +835,6 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 				Action:    outbound.ActionPostMessage,
 				Text:      notifyText,
 			})
-		}
-
-		// Check if the next entry in the coalescer queue has pending turns
-		// (e.g. a new thread was created while this session was busy).
-		r.mu.RLock()
-		nextQueue := r.coalescerQueue[sessionID]
-		var nextKey string
-		if len(nextQueue) > 0 {
-			nextKey = nextQueue[0]
-		}
-		r.mu.RUnlock()
-
-		if nextKey != "" {
-			nextCh, nextTS := parseCoalescerKey(nextKey)
-			if nextCh != "" {
-				nextTurns, _ := r.store.DrainTurns(nextCh, nextTS)
-				if len(nextTurns) > 0 {
-					var texts []string
-					for _, t := range nextTurns {
-						texts = append(texts, t.Text)
-					}
-					combined := strings.Join(texts, "\n\n---\n\n")
-
-					r.store.UpdateSessionStatus(nextCh, nextTS, "processing")
-					if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
-						slog.Warn("router: failed to send next-thread batch",
-							"session_id", sessionID, "err", err)
-						for _, t := range nextTurns {
-							r.store.EnqueueTurn(t)
-						}
-						r.store.UpdateSessionStatus(nextCh, nextTS, "idle")
-					} else {
-						slog.Info("router: sent next-thread batch",
-							"session_id", sessionID,
-							"thread_ts", nextTS,
-							"count", len(nextTurns))
-					}
-				}
-			}
 		}
 		return
 	}
@@ -820,23 +846,38 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string) {
 	}
 	combined := strings.Join(texts, "\n\n---\n\n")
 
+	// Push the coalescer key back onto the queue BEFORE sending so that
+	// jcode events arriving during the send can find the right coalescer.
+	r.mu.Lock()
+	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
+	// Acquire thread lock if no other thread holds it.
+	if _, locked := r.threadLock[sessionID]; !locked {
+		r.threadLock[sessionID] = coalKey
+	}
+	r.mu.Unlock()
+
 	// Send combined message to jcode.
 	if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
+		// Remove the coalKey we just added since the send failed.
+		r.mu.Lock()
+		dropNextKeyFromQueue(r.coalescerQueue, sessionID, coalKey)
+		// Release lock if we held it.
+		if r.threadLock[sessionID] == coalKey {
+			delete(r.threadLock, sessionID)
+		}
+		r.mu.Unlock()
 		// Re-enqueue the turns so they aren't lost.
 		for _, t := range turns {
-			r.store.EnqueueTurn(t)
+			if err := r.store.EnqueueTurn(t); err != nil {
+				slog.Error("router: failed to re-enqueue turn after batch send failure",
+					"err", err, "channel", channelID, "thread_ts", threadTS)
+			}
 		}
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 		return
 	}
-
-	// Push the coalescer key back onto the queue so the next "done" event
-	// (after processing this batch) routes to the correct coalescer.
-	r.mu.Lock()
-	r.coalescerQueue[sessionID] = append(r.coalescerQueue[sessionID], coalKey)
-	r.mu.Unlock()
 
 	r.store.UpdateSessionActivity(channelID, threadTS)
 	slog.Info("router: sent queued batch", "session_id", sessionID, "count", len(turns))
@@ -1103,6 +1144,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 			sess.ChannelID, sess.ThreadTS, sess.Workdir,
 			identity, r.outbound, r.handleImage,
 		)
+		coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
 
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
@@ -1111,6 +1153,10 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		// Idle sessions will be added when a new message arrives.
 		if sess.Status == "processing" {
 			r.coalescerQueue[sess.JcodeSession] = append(r.coalescerQueue[sess.JcodeSession], key)
+			// Acquire thread lock if no other thread holds it.
+			if _, locked := r.threadLock[sess.JcodeSession]; !locked {
+				r.threadLock[sess.JcodeSession] = key
+			}
 		}
 		r.mu.Unlock()
 
@@ -1179,7 +1225,7 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 	decisionRecord := &store.LLMRoutingDecision{
 		WebhookInboxID: nil, // set when durable inbox is used
 		DecidedAt:      time.Now().Unix(),
-		Model:          r.cfg.Routing.LLM.Model,
+		Model:          llm.ResolvedModel(),
 		ThreadID:       decision.ThreadID,
 		Confidence:     decision.Confidence,
 		Reasoning:      &decision.Reasoning,
@@ -1190,6 +1236,18 @@ func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent)
 		parts := strings.SplitN(*decision.ThreadID, ":", 2)
 		if len(parts) == 2 {
 			channelID, threadTS := parts[0], parts[1]
+
+			// Validate that the thread_id matches one of the threads we
+			// actually provided to the LLM. This prevents hallucinated
+			// thread IDs from being blindly accepted.
+			if !isValidLLMThreadID(*decision.ThreadID, threads) {
+				slog.Warn("router: LLM suggested thread_id not in provided list, falling back",
+					"thread_id", *decision.ThreadID)
+				decisionRecord.PostedTo = "fallback"
+				r.postToFallback(evt, fallbackID, decision)
+				r.store.InsertLLMDecision(decisionRecord)
+				return
+			}
 
 			// Validate that the channel is one we actually manage.
 			if workdir, _ := r.resolveChannel(channelID); workdir == "" {
@@ -1263,6 +1321,8 @@ func (r *Router) postToFallback(evt *WebhookEvent, fallbackID string, decision *
 }
 
 // buildThreadContext gathers recent active threads for the LLM prompt.
+// It filters out DM sessions, sorts by last activity (most recent first),
+// and limits to include_thread_count (default 30).
 func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 	sessions, err := r.store.ListActiveSessions()
 	if err != nil {
@@ -1270,8 +1330,18 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 		return nil
 	}
 
+	// Sort by LastActivity descending (most recent first).
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].LastActivity > sessions[j].LastActivity
+	})
+
 	var threads []llmrouter.ThreadContext
 	for _, sess := range sessions {
+		// Filter out DM sessions (channel ID starts with "D").
+		if strings.HasPrefix(sess.ChannelID, "D") {
+			continue
+		}
+
 		channelName := r.edge.ChannelName(sess.ChannelID)
 		if channelName == "" {
 			channelName = sess.ChannelID
@@ -1289,7 +1359,101 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 		})
 	}
 
+	// Cap to include_thread_count (default 30).
+	limit := r.cfg.Routing.LLM.IncludeThreadCount
+	if limit == 0 {
+		limit = 30
+	}
+	if limit < len(threads) {
+		threads = threads[:limit]
+	}
+
 	return threads
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch API
+// ---------------------------------------------------------------------------
+
+// DispatchRequest describes a programmatic dispatch to a channel.
+type DispatchRequest struct {
+	ChannelID string // target Slack channel
+	Prompt    string // message text to send to the agent
+	UserID    string // user to @mention on completion (optional)
+}
+
+// DispatchResult contains the outcome of a Dispatch call.
+type DispatchResult struct {
+	ThreadTS  string // the Slack thread that was created
+	SessionID string // the jcode session that is processing the request
+}
+
+// Dispatch programmatically starts a jcode turn in a channel. It posts the
+// prompt as a top-level Slack message (creating a thread), then routes the
+// prompt to jcode exactly like a human-initiated message. The agent response
+// streams into the newly created thread via the normal coalescer path.
+func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchResult, error) {
+	if req.ChannelID == "" || req.Prompt == "" {
+		return nil, fmt.Errorf("dispatch: channel_id and prompt are required")
+	}
+
+	// Resolve channel configuration.
+	workdir, _ := r.resolveChannel(req.ChannelID)
+	if workdir == "" {
+		return nil, fmt.Errorf("dispatch: channel %s is not configured", req.ChannelID)
+	}
+
+	// Post the prompt as a top-level message to create a thread.
+	identity := r.resolveIdentity(req.ChannelID)
+	var postOpts []outbound.PostOption
+	if identity.DisplayName != "" || identity.IconURL != "" {
+		postOpts = append(postOpts, outbound.PostOption{
+			Username: identity.DisplayName,
+			IconURL:  identity.IconURL,
+		})
+	}
+
+	threadTS, err := r.edge.PostMessage(req.ChannelID, fmt.Sprintf("📋 *Dispatch:*\n%s", req.Prompt), postOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: post thread: %w", err)
+	}
+
+	slog.Info("dispatch: created thread",
+		"channel", req.ChannelID,
+		"thread_ts", threadTS,
+		"prompt_len", len(req.Prompt),
+	)
+
+	// Synthesize an InboundMessage and route through handleInbound.
+	userID := req.UserID
+	if userID == "" {
+		userID = "dispatch"
+	}
+	msg := &slack.InboundMessage{
+		ChannelID:    req.ChannelID,
+		UserID:       userID,
+		Text:         req.Prompt,
+		MessageTS:    threadTS,
+		IsTopLevel:   true,
+		IsAppMention: true,
+	}
+
+	// Run handleInbound with a background context so the session outlives
+	// the HTTP request. The request ctx is only used for the dispatch call
+	// itself, not for the long-running event consumer.
+	r.handleInbound(context.Background(), msg)
+
+	// Look up the session that was just created.
+	session, _ := r.store.GetSession(req.ChannelID, threadTS)
+	sessionID := ""
+	if session != nil {
+		sessionID = session.JcodeSession
+	}
+
+	return &DispatchResult{
+		ThreadTS:  threadTS,
+		SessionID: sessionID,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

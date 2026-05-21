@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // ---------------------------------------------------------------------------
@@ -26,18 +29,19 @@ func Describe(tool string, input map[string]any) string {
 	}
 
 	// Try exact match first, then case-insensitive title case.
+	// Use targetWords as the soft truncation limit for heuristic descriptions.
 	if fn, ok := heuristics[tool]; ok {
 		if desc := fn(input); desc != "" {
-			return TruncateWords(desc, hardTruncateWords)
+			return TruncateWords(desc, targetWords)
 		}
 	}
 
 	// Try title-cased version (jcode sends "bash", heuristics use "Bash").
-	titleTool := strings.Title(strings.ToLower(tool))
+	titleTool := toTitleCase(strings.ToLower(tool))
 	if titleTool != tool {
 		if fn, ok := heuristics[titleTool]; ok {
 			if desc := fn(input); desc != "" {
-				return TruncateWords(desc, hardTruncateWords)
+				return TruncateWords(desc, targetWords)
 			}
 		}
 	}
@@ -86,6 +90,12 @@ func ConfigureDescriptions(target, hardTruncate int) {
 	if hardTruncate > 0 {
 		hardTruncateWords = hardTruncate
 	}
+}
+
+// toTitleCase converts a string to title case using the x/text cases package.
+// Replaces the deprecated strings.Title.
+func toTitleCase(s string) string {
+	return cases.Title(language.English, cases.NoLower).String(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +376,7 @@ func describeBashCat(binary string, parts []string) string {
 	if file != "" {
 		return fmt.Sprintf("Reading %s", filepath.Base(file))
 	}
-	return fmt.Sprintf("Reading file")
+	return "Reading file"
 }
 
 func describeBashLs(binary string, parts []string) string {

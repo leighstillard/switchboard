@@ -119,8 +119,8 @@ type SessionCoalescer struct {
 	// separate textBuffer + completedTools lists.
 	segments []segment
 
-	pendingTools []ToolProgress
-	toolInputBuf strings.Builder // accumulates tool_input deltas for current pending tool
+	pendingTools  []ToolProgress
+	toolInputBufs map[string]*strings.Builder // per-tool-ID input accumulator
 
 	// Block Kit blocks from render directives (accumulated during the turn).
 	directiveBlocks []map[string]interface{}
@@ -146,6 +146,9 @@ type SessionCoalescer struct {
 	// Drift monitor for tool description word count (Feature 1c).
 	driftMonitor *render.DriftMonitor
 
+	// strictDirectives controls whether render directive validation is strict.
+	strictDirectives bool
+
 	// Flush timer
 	timer  *time.Timer
 	done   chan struct{}
@@ -160,18 +163,19 @@ func NewSessionCoalescer(
 	onImage ImageHandler,
 ) *SessionCoalescer {
 	sc := &SessionCoalescer{
-		sessionID:    sessionID,
-		friendlyName: friendlyName,
-		channelID:    channelID,
-		threadTS:     threadTS,
-		workdir:      workdir,
-		identity:     identity,
-		outbound:     out,
-		onImage:      onImage,
-		firstTurn:    true,
-		lastFlush:    time.Now(),
-		driftMonitor: render.NewDriftMonitor(7), // default threshold
-		done:         make(chan struct{}),
+		sessionID:     sessionID,
+		friendlyName:  friendlyName,
+		channelID:     channelID,
+		threadTS:      threadTS,
+		workdir:       workdir,
+		identity:      identity,
+		outbound:      out,
+		onImage:       onImage,
+		firstTurn:     true,
+		lastFlush:     time.Now(),
+		toolInputBufs: make(map[string]*strings.Builder),
+		driftMonitor:  render.NewDriftMonitor(7), // default threshold
+		done:          make(chan struct{}),
 	}
 
 	// Start the periodic flush timer.
@@ -264,6 +268,10 @@ func (sc *SessionCoalescer) allText() string {
 
 // hasContent returns true if there's any meaningful content to render.
 func (sc *SessionCoalescer) hasContent() bool {
+	// Directive blocks count as content (set by renderMessage).
+	if len(sc.directiveBlocks) > 0 {
+		return true
+	}
 	for i := range sc.segments {
 		switch sc.segments[i].kind {
 		case segText:
@@ -299,8 +307,14 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventTextReplace:
 		var e jcodeproto.TextReplaceEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Replace clears ALL text segments and replaces with a single one.
-			sc.segments = sc.segments[:0]
+			// Replace only text segments; preserve tool segments.
+			kept := sc.segments[:0]
+			for i := range sc.segments {
+				if sc.segments[i].kind == segTool {
+					kept = append(kept, sc.segments[i])
+				}
+			}
+			sc.segments = kept
 			seg := sc.currentTextSegment()
 			seg.text.WriteString(e.Text)
 			sc.dirty = true
@@ -328,7 +342,24 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	case jcodeproto.EventToolInput:
 		var e jcodeproto.ToolInputEvent
 		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.toolInputBuf.WriteString(e.Delta)
+			// Route input to the last pending tool that hasn't been exec'd yet.
+			// tool_input events don't carry a tool ID, so we assume input
+			// belongs to the most recently started non-exec tool.
+			var targetID string
+			for i := len(sc.pendingTools) - 1; i >= 0; i-- {
+				if !sc.pendingTools[i].Exec {
+					targetID = sc.pendingTools[i].ID
+					break
+				}
+			}
+			if targetID != "" {
+				buf, ok := sc.toolInputBufs[targetID]
+				if !ok {
+					buf = &strings.Builder{}
+					sc.toolInputBufs[targetID] = buf
+				}
+				buf.WriteString(e.Delta)
+			}
 		}
 
 	case jcodeproto.EventToolExec:
@@ -338,8 +369,8 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 				if sc.pendingTools[i].ID == e.ID {
 					sc.pendingTools[i].Exec = true
 					// Parse accumulated tool input and update description.
-					if sc.toolInputBuf.Len() > 0 {
-						rawInput := sc.toolInputBuf.String()
+					if buf, ok := sc.toolInputBufs[e.ID]; ok && buf.Len() > 0 {
+						rawInput := buf.String()
 						var input map[string]any
 						if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
 							desc := render.Describe(e.Name, input)
@@ -349,7 +380,7 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 							slog.Debug("coalescer: failed to parse tool input",
 								"tool", e.Name, "err", err, "raw_len", len(rawInput))
 						}
-						sc.toolInputBuf.Reset()
+						delete(sc.toolInputBufs, e.ID)
 					}
 					break
 				}
@@ -367,6 +398,7 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 				if sc.pendingTools[i].ID == e.ID {
 					desc = sc.pendingTools[i].Description
 					sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
+					delete(sc.toolInputBufs, e.ID) // clean up any remaining input buffer
 					break
 				}
 			}
@@ -480,12 +512,22 @@ func (sc *SessionCoalescer) SetFriendlyName(name string) {
 	sc.friendlyName = name
 }
 
+// SetStrictDirectives enables or disables strict render directive validation.
+func (sc *SessionCoalescer) SetStrictDirectives(strict bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.strictDirectives = strict
+}
+
 // resetForNextTurn clears per-turn state so the coalescer is ready for
 // subsequent messages on the same session. Must be called with mu held.
 func (sc *SessionCoalescer) resetForNextTurn() {
 	sc.segments = sc.segments[:0]
 	sc.pendingTools = nil
-	sc.toolInputBuf.Reset()
+	// Clear all per-tool input buffers.
+	for k := range sc.toolInputBufs {
+		delete(sc.toolInputBufs, k)
+	}
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
 	// Note: finalMessageText is NOT cleared here; it's read by the router
@@ -501,15 +543,6 @@ func (sc *SessionCoalescer) ProgressMessageTS() *string {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return sc.progressMessageTS
-}
-
-// FinalMessageText returns the agent's concluding text (after the last tool
-// call) from the most recently completed turn. This is intended for inclusion
-// in the "done" notification so users see the conclusion without scrolling.
-func (sc *SessionCoalescer) FinalMessageText() string {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return sc.finalMessageText
 }
 
 // ---------------------------------------------------------------------------
@@ -712,7 +745,7 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	fullText := sc.allText()
 	var directiveResult *render.DirectiveResult
 	if fullText != "" && render.HasDirectives(fullText) {
-		result := render.ExtractDirectives(fullText, false)
+		result := render.ExtractDirectives(fullText, sc.strictDirectives)
 		directiveResult = &result
 		if len(result.Blocks) > 0 {
 			sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)
@@ -723,19 +756,35 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	}
 
 	// Render segments in order.
-	// If we have directives, we need to apply the clean text transformation.
-	// For simplicity, when directives are present we extract clean text once
-	// and render it followed by tools (since directive extraction operates on
-	// the concatenated text). When no directives, render segment by segment.
-	if directiveResult != nil && directiveResult.CleanText != "" {
-		sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
-		sb.WriteString("\n")
-		// Render tool segments that follow (directives mess with text positions,
-		// so we just append all tool entries after the clean text).
+	// When directives are present, we replace all text segments with the
+	// cleaned text (directives stripped) while keeping tool segments in their
+	// original interleaved positions. The first text segment gets the clean
+	// text; subsequent text segments are skipped (their content is already
+	// included in the concatenated clean text).
+	if directiveResult != nil {
+		cleanTextWritten := false
 		for i := range sc.segments {
-			if sc.segments[i].kind == segTool {
-				sc.renderToolSegment(&sb, &sc.segments[i])
+			seg := &sc.segments[i]
+			switch seg.kind {
+			case segText:
+				if !cleanTextWritten {
+					cleanTextWritten = true
+					if directiveResult.CleanText != "" {
+						sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
+						if !strings.HasSuffix(directiveResult.CleanText, "\n") {
+							sb.WriteString("\n")
+						}
+					}
+				}
+				// Skip subsequent text segments (already merged into CleanText).
+			case segTool:
+				sc.renderToolSegment(&sb, seg)
 			}
+		}
+		// If there were no text segments at all (unlikely), still write clean text.
+		if !cleanTextWritten && directiveResult.CleanText != "" {
+			sb.WriteString(MarkdownToMrkdwn(directiveResult.CleanText))
+			sb.WriteString("\n")
 		}
 	} else {
 		for i := range sc.segments {
