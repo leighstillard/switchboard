@@ -28,7 +28,18 @@ type Config struct {
 	Routing    RoutingConfig2              `toml:"routing"`
 	Channels   []ChannelConfig             `toml:"channels"`
 	Routes     []RouteConfig               `toml:"routes"`
+	Crons      []CronConfig                `toml:"cron"`
 	Identities map[string]IdentityConfig   `toml:"identities"`
+}
+
+// CronConfig defines a scheduled cron job that dispatches a prompt.
+type CronConfig struct {
+	ID        string `toml:"id"`
+	Schedule  string `toml:"schedule"`
+	ChannelID string `toml:"channel_id"`
+	Prompt    string `toml:"prompt"`
+	UserID    string `toml:"user_id"`
+	Enabled   bool   `toml:"enabled"`
 }
 
 // GitHubConfig holds GitHub-specific routing configuration.
@@ -247,6 +258,35 @@ func (c *Config) validate() error {
 					"channel_id", destID,
 				)
 			}
+		}
+	}
+
+	// Validate cron jobs.
+	cronIDs := make(map[string]bool)
+	for i, cj := range c.Crons {
+		if cj.ID == "" {
+			return fmt.Errorf("config: cron[%d] has empty id", i)
+		}
+		if cronIDs[cj.ID] {
+			return fmt.Errorf("config: duplicate cron id %q", cj.ID)
+		}
+		cronIDs[cj.ID] = true
+
+		fields := strings.Fields(cj.Schedule)
+		if len(fields) != 5 {
+			return fmt.Errorf("config: cron %q has invalid schedule %q (expected 5 fields)", cj.ID, cj.Schedule)
+		}
+		if cj.ChannelID == "" {
+			return fmt.Errorf("config: cron %q has empty channel_id", cj.ID)
+		}
+		if cj.Prompt == "" {
+			return fmt.Errorf("config: cron %q has empty prompt", cj.ID)
+		}
+		if _, known := seen[cj.ChannelID]; !known {
+			slog.Warn("config: cron job references unknown channel",
+				"cron_id", cj.ID,
+				"channel_id", cj.ChannelID,
+			)
 		}
 	}
 

@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/format5/switchboard/internal/config"
+	"github.com/format5/switchboard/internal/cron"
 	"github.com/format5/switchboard/internal/ingest"
 	"github.com/format5/switchboard/internal/jcode"
 	"github.com/format5/switchboard/internal/outbound"
@@ -109,6 +110,14 @@ func main() {
 	// 6. Router (wires everything together)
 	rt := router.New(cfg, st, jc, edge, out, *configPath)
 
+	// 7. Cron scheduler
+	cronJobs := cronJobsFromConfig(cfg.Crons)
+	cronSched, err := cron.New(cronJobs, &cronDispatchAdapter{rt: rt}, st)
+	if err != nil {
+		slog.Error("failed to initialize cron scheduler", "error", err)
+		os.Exit(1)
+	}
+
 	// Wire ingest -> router.
 	ing.SetHandler(func(item *store.WebhookInboxItem) {
 		// Parse the webhook body and dispatch to router.
@@ -148,6 +157,7 @@ func main() {
 			slog.Error("router error", "error", err)
 		}
 	}()
+	go cronSched.Run(ctx)
 
 	slog.Info("switchboard started",
 		"listen_addr", cfg.Ingest.ListenAddr,
@@ -174,6 +184,9 @@ func main() {
 			edge.ReloadConfig(newCfg.Channels, newCfg.Identities)
 			edge.SetBotAllowlist(newCfg.Bridge.BotAllowlist)
 			render.ConfigureDescriptions(newCfg.Render.Descriptions.TargetWords, newCfg.Render.Descriptions.HardTruncateWords)
+			if err := cronSched.Reload(cronJobsFromConfig(newCfg.Crons)); err != nil {
+				slog.Error("cron reload failed", "error", err)
+			}
 			slog.Info("config reloaded successfully")
 		case syscall.SIGINT, syscall.SIGTERM:
 			// Check for active processing sessions before shutting down.
@@ -272,4 +285,44 @@ func webhookFromInbox(item *store.WebhookInboxItem) *router.WebhookEvent {
 	}
 
 	return evt
+}
+
+// ---------------------------------------------------------------------------
+// Cron adapter
+// ---------------------------------------------------------------------------
+
+// cronDispatchAdapter adapts router.Router to the cron.Dispatcher interface.
+type cronDispatchAdapter struct {
+	rt *router.Router
+}
+
+func (a *cronDispatchAdapter) Dispatch(ctx context.Context, req cron.DispatchRequest) (*cron.DispatchResult, error) {
+	result, err := a.rt.Dispatch(ctx, router.DispatchRequest{
+		ChannelID: req.ChannelID,
+		Prompt:    req.Prompt,
+		UserID:    req.UserID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &cron.DispatchResult{
+		ThreadTS:  result.ThreadTS,
+		SessionID: result.SessionID,
+	}, nil
+}
+
+// cronJobsFromConfig converts config cron entries to cron.Job values.
+func cronJobsFromConfig(crons []config.CronConfig) []cron.Job {
+	jobs := make([]cron.Job, len(crons))
+	for i, c := range crons {
+		jobs[i] = cron.Job{
+			ID:        c.ID,
+			Schedule:  c.Schedule,
+			ChannelID: c.ChannelID,
+			Prompt:    c.Prompt,
+			UserID:    c.UserID,
+			Enabled:   c.Enabled,
+		}
+	}
+	return jobs
 }

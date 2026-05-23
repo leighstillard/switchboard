@@ -76,6 +76,18 @@ signature_header = "X-Switchboard-Signature"
 secret = "${CRON_WEBHOOK_SECRET}"
 signature_header = "X-Switchboard-Signature"
 
+# Cron jobs: scheduled prompt dispatches.
+# Each job fires on schedule, posts the prompt to the target channel,
+# and streams the agent response into a new Slack thread.
+
+# [[cron]]
+# id = "daily-drift-audit"
+# schedule = "0 21 * * *"              # standard 5-field cron (minute hour dom month dow)
+# channel_id = "C0123ABCDEF"
+# prompt = "Run the nightly audit..."
+# user_id = "U0123USER"                # optional: @mention on completion
+# enabled = true
+
 # Routing rules (v1: deterministic matching only)
 # Destination uses channel_id, not name.
 
