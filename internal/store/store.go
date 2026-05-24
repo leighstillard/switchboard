@@ -91,6 +91,18 @@ type MaintenanceConfig struct {
 	MaxCorrelationRows         int
 }
 
+// CronJob represents a runtime-managed cron job stored in SQLite.
+type CronJob struct {
+	ID        string
+	Schedule  string
+	ChannelID string
+	Prompt    string
+	UserID    string
+	Enabled   bool
+	CreatedAt int64
+	UpdatedAt int64
+}
+
 // LLMRoutingDecision records an LLM routing decision for audit.
 type LLMRoutingDecision struct {
 	ID             int64
@@ -193,6 +205,11 @@ func migrate(db *sql.DB) error {
 	if version < 2 {
 		if err := migrateV2(db); err != nil {
 			return fmt.Errorf("v2: %w", err)
+		}
+	}
+	if version < 3 {
+		if err := migrateV3(db); err != nil {
+			return fmt.Errorf("v3: %w", err)
 		}
 	}
 
@@ -330,6 +347,148 @@ func migrateV2(db *sql.DB) error {
 	}
 
 	return tx.Commit()
+}
+
+func migrateV3(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		// -- Runtime cron jobs (managed via CLI)
+		`CREATE TABLE IF NOT EXISTS cron_jobs (
+			id          TEXT PRIMARY KEY,
+			schedule    TEXT NOT NULL,
+			channel_id  TEXT NOT NULL,
+			prompt      TEXT NOT NULL,
+			user_id     TEXT NOT NULL DEFAULT '',
+			enabled     INTEGER NOT NULL DEFAULT 1,
+			created_at  INTEGER NOT NULL,
+			updated_at  INTEGER NOT NULL
+		)`,
+
+		// -- set version
+		`PRAGMA user_version = 3`,
+	}
+
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("exec %q: %w", stmt[:min(len(stmt), 60)], err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ---------------------------------------------------------------------------
+// Cron Jobs
+// ---------------------------------------------------------------------------
+
+// InsertCronJob inserts a new runtime cron job. Fails if the ID already exists.
+func (s *Store) InsertCronJob(job *CronJob) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO cron_jobs (id, schedule, channel_id, prompt, user_id, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Schedule, job.ChannelID, job.Prompt, job.UserID,
+		boolToInt(job.Enabled), job.CreatedAt, job.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("store: insert cron job: %w", err)
+	}
+	return nil
+}
+
+// GetCronJob retrieves a cron job by ID. Returns nil, nil if not found.
+func (s *Store) GetCronJob(id string) (*CronJob, error) {
+	row := s.db.QueryRow(`
+		SELECT id, schedule, channel_id, prompt, user_id, enabled, created_at, updated_at
+		FROM cron_jobs WHERE id = ?`, id)
+
+	job := &CronJob{}
+	var enabled int
+	err := row.Scan(&job.ID, &job.Schedule, &job.ChannelID, &job.Prompt,
+		&job.UserID, &enabled, &job.CreatedAt, &job.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get cron job: %w", err)
+	}
+	job.Enabled = enabled != 0
+	return job, nil
+}
+
+// ListCronJobs returns all runtime cron jobs ordered by ID.
+func (s *Store) ListCronJobs() ([]*CronJob, error) {
+	rows, err := s.db.Query(`
+		SELECT id, schedule, channel_id, prompt, user_id, enabled, created_at, updated_at
+		FROM cron_jobs ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list cron jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*CronJob
+	for rows.Next() {
+		job := &CronJob{}
+		var enabled int
+		if err := rows.Scan(&job.ID, &job.Schedule, &job.ChannelID, &job.Prompt,
+			&job.UserID, &enabled, &job.CreatedAt, &job.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan cron job: %w", err)
+		}
+		job.Enabled = enabled != 0
+		out = append(out, job)
+	}
+	return out, rows.Err()
+}
+
+// DeleteCronJob removes a cron job by ID. Returns an error if not found.
+func (s *Store) DeleteCronJob(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`DELETE FROM cron_jobs WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete cron job: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("store: cron job %q not found", id)
+	}
+	return nil
+}
+
+// UpdateCronJobEnabled sets the enabled flag for a cron job.
+func (s *Store) UpdateCronJobEnabled(id string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`
+		UPDATE cron_jobs SET enabled = ?, updated_at = ?
+		WHERE id = ?`,
+		boolToInt(enabled), time.Now().Unix(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update cron job enabled: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("store: cron job %q not found", id)
+	}
+	return nil
+}
+
+// boolToInt converts a bool to 0/1 for SQLite storage.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------

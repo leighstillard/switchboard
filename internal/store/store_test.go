@@ -37,8 +37,8 @@ func TestNew_WALAndIntegrity(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 }
 
@@ -951,5 +951,114 @@ func TestLLMRoutingStats(t *testing.T) {
 	}
 	if stats.Pending != 1 {
 		t.Errorf("pending = %d, want 1", stats.Pending)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cron Jobs
+// ---------------------------------------------------------------------------
+
+func TestCronJob_CRUD(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Unix()
+
+	// Insert a job.
+	job := &CronJob{
+		ID:        "daily-audit",
+		Schedule:  "0 21 * * *",
+		ChannelID: "C0AL12WCNBG",
+		Prompt:    "Run the audit",
+		UserID:    "U0AL7H3HQ56",
+		Enabled:   true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.InsertCronJob(job); err != nil {
+		t.Fatalf("InsertCronJob: %v", err)
+	}
+
+	// Get it back.
+	got, err := s.GetCronJob("daily-audit")
+	if err != nil {
+		t.Fatalf("GetCronJob: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetCronJob returned nil")
+	}
+	if got.Schedule != "0 21 * * *" {
+		t.Errorf("schedule = %q, want %q", got.Schedule, "0 21 * * *")
+	}
+	if !got.Enabled {
+		t.Error("expected enabled = true")
+	}
+
+	// List.
+	jobs, err := s.ListCronJobs()
+	if err != nil {
+		t.Fatalf("ListCronJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("len(jobs) = %d, want 1", len(jobs))
+	}
+
+	// Disable.
+	if err := s.UpdateCronJobEnabled("daily-audit", false); err != nil {
+		t.Fatalf("UpdateCronJobEnabled: %v", err)
+	}
+	got, _ = s.GetCronJob("daily-audit")
+	if got.Enabled {
+		t.Error("expected enabled = false after disable")
+	}
+
+	// Enable.
+	if err := s.UpdateCronJobEnabled("daily-audit", true); err != nil {
+		t.Fatalf("UpdateCronJobEnabled: %v", err)
+	}
+	got, _ = s.GetCronJob("daily-audit")
+	if !got.Enabled {
+		t.Error("expected enabled = true after enable")
+	}
+
+	// Delete.
+	if err := s.DeleteCronJob("daily-audit"); err != nil {
+		t.Fatalf("DeleteCronJob: %v", err)
+	}
+	got, err = s.GetCronJob("daily-audit")
+	if err != nil {
+		t.Fatalf("GetCronJob after delete: %v", err)
+	}
+	if got != nil {
+		t.Error("expected nil after delete")
+	}
+
+	// Delete non-existent.
+	if err := s.DeleteCronJob("nonexistent"); err == nil {
+		t.Error("expected error deleting non-existent job")
+	}
+
+	// Update non-existent.
+	if err := s.UpdateCronJobEnabled("nonexistent", true); err == nil {
+		t.Error("expected error updating non-existent job")
+	}
+}
+
+func TestCronJob_DuplicateID(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Unix()
+
+	job := &CronJob{
+		ID:        "dup-test",
+		Schedule:  "* * * * *",
+		ChannelID: "C0AL12WCNBG",
+		Prompt:    "test",
+		Enabled:   true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.InsertCronJob(job); err != nil {
+		t.Fatalf("first InsertCronJob: %v", err)
+	}
+	if err := s.InsertCronJob(job); err == nil {
+		t.Error("expected error on duplicate insert")
 	}
 }
