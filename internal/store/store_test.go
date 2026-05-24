@@ -1062,3 +1062,70 @@ func TestCronJob_DuplicateID(t *testing.T) {
 		t.Error("expected error on duplicate insert")
 	}
 }
+
+func TestCronJob_ConcurrentDaemonAndCLI(t *testing.T) {
+	// Simulate the daemon holding a store.New connection while
+	// CLI opens a store.NewCLI connection to the same DB.
+	dir := t.TempDir()
+
+	// "Daemon" connection.
+	daemon, err := New(dir)
+	if err != nil {
+		t.Fatalf("New (daemon): %v", err)
+	}
+	defer daemon.Close()
+
+	// Insert a session so the daemon has touched the DB.
+	daemon.CreateSession(&Session{
+		ChannelID:    "C0AL12WCNBG",
+		ThreadTS:     "1234567890.000001",
+		JcodeSession: "test-session",
+		Workdir:      "/tmp",
+		CreatedAt:    time.Now().Unix(),
+		LastActivity: time.Now().Unix(),
+		Status:       "idle",
+	})
+
+	// "CLI" connection -- this is what was hanging before the fix.
+	cli, err := NewCLI(dir)
+	if err != nil {
+		t.Fatalf("NewCLI (cli): %v", err)
+	}
+	defer cli.Close()
+
+	// CLI should be able to insert and read cron jobs while daemon is open.
+	now := time.Now().Unix()
+	job := &CronJob{
+		ID:        "concurrent-test",
+		Schedule:  "0 9 * * *",
+		ChannelID: "C0AL12WCNBG",
+		Prompt:    "concurrent test prompt",
+		Enabled:   true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := cli.InsertCronJob(job); err != nil {
+		t.Fatalf("CLI InsertCronJob: %v", err)
+	}
+
+	// Read from CLI.
+	jobs, err := cli.ListCronJobs()
+	if err != nil {
+		t.Fatalf("CLI ListCronJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("CLI ListCronJobs: got %d, want 1", len(jobs))
+	}
+
+	// Daemon should also see the CLI-inserted job.
+	daemonJobs, err := daemon.ListCronJobs()
+	if err != nil {
+		t.Fatalf("daemon ListCronJobs: %v", err)
+	}
+	if len(daemonJobs) != 1 {
+		t.Fatalf("daemon ListCronJobs: got %d, want 1", len(daemonJobs))
+	}
+	if daemonJobs[0].ID != "concurrent-test" {
+		t.Errorf("daemon sees wrong job ID: %q", daemonJobs[0].ID)
+	}
+}

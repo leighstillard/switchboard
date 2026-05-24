@@ -131,6 +131,17 @@ type Store struct {
 // New creates or opens the SQLite database in dataDir/switchboard.db.
 // It enables WAL mode, runs an integrity check, and applies migrations.
 func New(dataDir string) (*Store, error) {
+	return open(dataDir, false)
+}
+
+// NewCLI opens the database for short-lived CLI use. It skips the integrity
+// check and uses a single connection with a longer busy timeout so it can
+// coexist with a running daemon that holds its own connections.
+func NewCLI(dataDir string) (*Store, error) {
+	return open(dataDir, true)
+}
+
+func open(dataDir string, cli bool) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("store: mkdir %s: %w", dataDir, err)
 	}
@@ -141,15 +152,26 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
 
-	// Connection pool settings for SQLite: one writer, multiple readers via WAL.
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(2)
+	if cli {
+		// Single connection, long busy wait to coexist with daemon.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	} else {
+		// Connection pool settings for SQLite: one writer, multiple readers via WAL.
+		db.SetMaxOpenConns(4)
+		db.SetMaxIdleConns(2)
+	}
 	db.SetConnMaxLifetime(0) // never expire
 
 	// Enable WAL mode and set busy timeout.
+	// CLI uses a longer timeout (30s) since the daemon may hold brief write locks.
+	busyTimeout := 5000
+	if cli {
+		busyTimeout = 30000
+	}
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
+		fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeout),
 		"PRAGMA foreign_keys=ON",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
@@ -158,15 +180,17 @@ func New(dataDir string) (*Store, error) {
 		}
 	}
 
-	// Integrity check -- refuse to start on corruption.
-	var result string
-	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: integrity_check query failed: %w", err)
-	}
-	if result != "ok" {
-		db.Close()
-		return nil, fmt.Errorf("store: database integrity check failed: %s", result)
+	if !cli {
+		// Integrity check -- refuse to start on corruption.
+		var result string
+		if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: integrity_check query failed: %w", err)
+		}
+		if result != "ok" {
+			db.Close()
+			return nil, fmt.Errorf("store: database integrity check failed: %s", result)
+		}
 	}
 
 	if err := migrate(db); err != nil {

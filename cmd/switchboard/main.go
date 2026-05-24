@@ -532,7 +532,7 @@ func cronList(args []string) int {
 		return 1
 	}
 
-	st, err := store.New(cfg.Bridge.DataDir)
+	st, err := store.NewCLI(cfg.Bridge.DataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -682,13 +682,14 @@ func cronSetEnabled(args []string, enabled bool) int {
 	return 0
 }
 
-// openStoreFromConfig loads config to find DataDir, then opens the store.
+// openStoreFromConfig loads config to find DataDir, then opens the store
+// in CLI mode (single connection, long busy timeout, no integrity check).
 func openStoreFromConfig(configPath string) (*store.Store, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
-	st, err := store.New(cfg.Bridge.DataDir)
+	st, err := store.NewCLI(cfg.Bridge.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
