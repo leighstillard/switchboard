@@ -380,30 +380,32 @@ func migrateV3(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	stmts := []string{
-		// -- Runtime cron jobs (managed via CLI)
-		`CREATE TABLE IF NOT EXISTS cron_jobs (
-			id          TEXT PRIMARY KEY,
-			schedule    TEXT NOT NULL,
-			channel_id  TEXT NOT NULL,
-			prompt      TEXT NOT NULL,
-			user_id     TEXT NOT NULL DEFAULT '',
-			enabled     INTEGER NOT NULL DEFAULT 1,
-			created_at  INTEGER NOT NULL,
-			updated_at  INTEGER NOT NULL
-		)`,
-
-		// -- set version
-		`PRAGMA user_version = 3`,
+	// Create table first, then bump version.
+	// NOTE: PRAGMA user_version is non-transactional in SQLite, so we
+	// create the table unconditionally with IF NOT EXISTS to be idempotent
+	// in case a prior run set the version but the table creation was lost.
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS cron_jobs (
+		id          TEXT PRIMARY KEY,
+		schedule    TEXT NOT NULL,
+		channel_id  TEXT NOT NULL,
+		prompt      TEXT NOT NULL,
+		user_id     TEXT NOT NULL DEFAULT '',
+		enabled     INTEGER NOT NULL DEFAULT 1,
+		created_at  INTEGER NOT NULL,
+		updated_at  INTEGER NOT NULL
+	)`)
+	if err != nil {
+		return fmt.Errorf("exec create cron_jobs: %w", err)
 	}
 
-	for _, stmt := range stmts {
-		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("exec %q: %w", stmt[:min(len(stmt), 60)], err)
-		}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 
-	return tx.Commit()
+	// Set version outside the transaction since PRAGMA user_version is
+	// non-transactional anyway.
+	_, err = db.Exec("PRAGMA user_version = 3")
+	return err
 }
 
 // ---------------------------------------------------------------------------
