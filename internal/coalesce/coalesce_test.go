@@ -817,3 +817,54 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func TestFormatCountdown(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{9*time.Minute + 30*time.Second, "9m 30s"},
+		{1*time.Minute + 5*time.Second, "1m 5s"},
+		{45 * time.Second, "45s"},
+		{10 * time.Second, "10s"},
+		{0, "0s"},
+		{1*time.Hour + 5*time.Minute, "1h 5m"},
+		{2 * time.Hour, "2h 0m"},
+	}
+	for _, tt := range tests {
+		got := formatCountdown(tt.d)
+		if got != tt.want {
+			t.Errorf("formatCountdown(%v) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+func TestStartCountdownSetsTarget(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-cd", "timer", "C999", "ts9", "/workspace/countdown",
+		Identity{DisplayName: "Test"}, out, nil)
+	defer coal.Close()
+
+	input := map[string]any{
+		"delaySeconds": float64(120),
+		"reason":       "waiting for build",
+	}
+
+	coal.mu.Lock()
+	coal.startCountdown(input)
+	coal.mu.Unlock()
+
+	coal.mu.Lock()
+	defer coal.mu.Unlock()
+
+	if coal.countdownTarget == nil {
+		t.Fatal("expected countdownTarget to be set")
+	}
+	remaining := time.Until(*coal.countdownTarget)
+	if remaining < 115*time.Second || remaining > 125*time.Second {
+		t.Errorf("expected ~120s remaining, got %v", remaining)
+	}
+	if coal.countdownElapsed {
+		t.Error("expected countdownElapsed to be false")
+	}
+}

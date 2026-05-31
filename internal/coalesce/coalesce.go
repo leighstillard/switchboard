@@ -150,6 +150,14 @@ type SessionCoalescer struct {
 	// strictDirectives controls whether render directive validation is strict.
 	strictDirectives bool
 
+	// Countdown timer for ScheduleWakeup display.
+	countdownTarget    *time.Time   // when the timer expires
+	countdownLabel     string       // reason/prompt from the schedule
+	countdownTicker    *time.Ticker // background tick for updates
+	countdownStopCh    chan struct{}
+	countdownElapsed   bool   // true once the timer has hit zero
+	countdownMessageTS string // Slack TS of the message to update for countdown
+
 	// Flush timer
 	timer  *time.Timer
 	done   chan struct{}
@@ -194,6 +202,7 @@ func (sc *SessionCoalescer) Close() {
 	}
 	sc.closed = true
 	sc.timer.Stop()
+	sc.stopCountdownLocked()
 	sc.mu.Unlock()
 
 	close(sc.done)
@@ -377,6 +386,11 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 							desc := render.Describe(e.Name, input)
 							sc.driftMonitor.Record(desc)
 							sc.pendingTools[i].Description = desc
+
+							// Detect ScheduleWakeup and start countdown timer.
+							if e.Name == "ScheduleWakeup" {
+								sc.startCountdown(input)
+							}
 						} else {
 							slog.Debug("coalescer: failed to parse tool input",
 								"tool", e.Name, "err", err, "raw_len", len(rawInput))
@@ -670,6 +684,10 @@ func (sc *SessionCoalescer) SetProgressMessageTS(ts string) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.progressMessageTS = &ts
+	// Track for countdown updates after the turn ends.
+	if sc.countdownTarget != nil {
+		sc.countdownMessageTS = ts
+	}
 	slog.Debug("coalescer: progress message TS set", "session_id", sc.sessionID, "ts", ts)
 }
 
@@ -686,6 +704,9 @@ func (sc *SessionCoalescer) setProgressMessageTSGuarded(ts string, expectedTurnI
 		return
 	}
 	sc.progressMessageTS = &ts
+	if sc.countdownTarget != nil {
+		sc.countdownMessageTS = ts
+	}
 	slog.Debug("coalescer: progress message TS set", "session_id", sc.sessionID, "ts", ts)
 }
 
@@ -839,6 +860,16 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 		}
 	}
 
+	// Countdown timer display (ScheduleWakeup).
+	if sc.countdownTarget != nil {
+		remaining := time.Until(*sc.countdownTarget)
+		if remaining <= 0 || sc.countdownElapsed {
+			sb.WriteString("\n⏱ *Timer elapsed — command running*\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("\n⏱ *Timer: %s remaining*\n", formatCountdown(remaining)))
+		}
+	}
+
 	// Provider footer (final flush only, if non-default).
 	if isFinal && sc.upstreamProvider != nil {
 		sb.WriteString(fmt.Sprintf("\n_%s_\n", *sc.upstreamProvider))
@@ -864,4 +895,139 @@ func (sc *SessionCoalescer) renderToolSegment(sb *strings.Builder, seg *segment)
 			sb.WriteString(fmt.Sprintf("%s %s\n", toolCheckmark, label))
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Countdown timer (ScheduleWakeup display)
+// ---------------------------------------------------------------------------
+
+// startCountdown begins a visible countdown timer from a ScheduleWakeup tool input.
+// Must be called with mu held.
+func (sc *SessionCoalescer) startCountdown(input map[string]any) {
+	// Stop any existing countdown.
+	sc.stopCountdownLocked()
+
+	// Extract delaySeconds from the tool input.
+	var delaySec float64
+	switch v := input["delaySeconds"].(type) {
+	case float64:
+		delaySec = v
+	case int:
+		delaySec = float64(v)
+	default:
+		slog.Debug("coalescer: ScheduleWakeup missing delaySeconds", "input", input)
+		return
+	}
+	if delaySec <= 0 {
+		return
+	}
+
+	reason, _ := input["reason"].(string)
+	target := time.Now().Add(time.Duration(delaySec) * time.Second)
+
+	sc.countdownTarget = &target
+	sc.countdownLabel = reason
+	sc.countdownElapsed = false
+	sc.dirty = true
+
+	slog.Info("coalescer: countdown started",
+		"session_id", sc.sessionID,
+		"delay_seconds", delaySec,
+		"reason", reason,
+	)
+
+	// Start background ticker for updates.
+	sc.countdownStopCh = make(chan struct{})
+	stopCh := sc.countdownStopCh
+	go sc.countdownLoop(target, stopCh)
+}
+
+// countdownLoop runs in the background and triggers flushes to update the
+// countdown display. It ticks every 30s, switching to 10s when < 30s remain.
+func (sc *SessionCoalescer) countdownLoop(target time.Time, stopCh chan struct{}) {
+	for {
+		remaining := time.Until(target)
+
+		// Determine next tick interval.
+		var interval time.Duration
+		if remaining <= 0 {
+			// Timer expired.
+			sc.mu.Lock()
+			sc.countdownElapsed = true
+			sc.dirty = true
+			sc.flushLocked(false)
+			sc.mu.Unlock()
+
+			// Clear countdown after one final "elapsed" display.
+			// The next regular flush will include it, then it can be cleaned up
+			// when the next turn starts.
+			return
+		} else if remaining <= 30*time.Second {
+			interval = 10 * time.Second
+		} else {
+			interval = 30 * time.Second
+		}
+
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(interval):
+		}
+
+		// Force a flush to update the countdown display.
+		sc.mu.Lock()
+		if sc.closed {
+			sc.mu.Unlock()
+			return
+		}
+		// Only flush if we have a progressMessageTS (message exists to update).
+		if sc.progressMessageTS != nil && *sc.progressMessageTS != "" {
+			sc.dirty = true
+			sc.flushLocked(false)
+		} else if sc.countdownMessageTS != "" {
+			// Turn has ended but countdown is still active: update the saved message.
+			text := sc.renderMessage(false)
+			item := &outbound.OutboundItem{
+				Priority:  2,
+				ChannelID: sc.channelID,
+				Action:    outbound.ActionUpdateMessage,
+				Text:      text,
+				MessageTS: sc.countdownMessageTS,
+			}
+			sc.outbound.Enqueue(item)
+		}
+		sc.mu.Unlock()
+	}
+}
+
+// stopCountdownLocked stops the countdown timer. Must be called with mu held.
+func (sc *SessionCoalescer) stopCountdownLocked() {
+	if sc.countdownStopCh != nil {
+		close(sc.countdownStopCh)
+		sc.countdownStopCh = nil
+	}
+	if sc.countdownTicker != nil {
+		sc.countdownTicker.Stop()
+		sc.countdownTicker = nil
+	}
+}
+
+// formatCountdown formats a duration into a human-readable countdown string.
+func formatCountdown(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
