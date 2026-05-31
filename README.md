@@ -78,6 +78,32 @@ go build -race ./cmd/switchboard
 SWITCHBOARD_LOG_LEVEL=debug ./switchboard --config config.toml
 ```
 
+## ScheduleWakeup Countdown Timer
+
+When an agent calls `ScheduleWakeup` (jcode's `schedule` tool), switchboard displays a live countdown timer in the Slack message:
+
+```
+⏱ Timer: 4m 30s remaining
+```
+
+The countdown updates every 30 seconds (every 10 seconds when under 30 seconds remain). On expiry it shows:
+
+```
+⏱ Timer elapsed — command running
+```
+
+The timer is extracted from the `ScheduleWakeup` tool call's `delaySeconds` parameter. It persists across message updates within the same thread but is **in-memory only** -- timers do not survive switchboard restarts.
+
+### jcode ScheduleWakeup parameter mapping
+
+The Anthropic SDK defines `ScheduleWakeup` with fields `delaySeconds`, `prompt`, and `reason`. jcode's internal `schedule` tool uses different field names (`task`, `wake_in_minutes`, `background_context`). jcode maps the tool name automatically but requires serde aliases to map the parameters. If you see `missing field 'task'` errors from `ScheduleWakeup`, ensure your jcode build includes the alias fix (`fix/schedule-anthropic-sdk-params` branch or later).
+
+| Anthropic SDK field | jcode `schedule` field | Notes |
+|---|---|---|
+| `prompt` | `task` | Required task description |
+| `delaySeconds` | `wake_in_minutes` | Seconds converted to minutes (rounded up, min 1) |
+| `reason` | `background_context` | Optional context |
+
 ## Gotchas
 
 - **bufio.Reader not Scanner**: jcode can emit lines up to 32 MB. We use `ReadBytes('\n')` with a 32 MB buffer, NOT `bufio.Scanner` (which has a 64 KB default limit).
