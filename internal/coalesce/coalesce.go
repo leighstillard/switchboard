@@ -113,6 +113,7 @@ type SessionCoalescer struct {
 
 	// The Slack message being updated (nil = first flush creates it).
 	progressMessageTS *string
+	turnID            uint64 // monotonic counter; guards late OnPosted callbacks
 
 	// segments is an ordered stream of text chunks and completed tool entries,
 	// interleaved in the order they were produced. This replaces the old
@@ -533,6 +534,7 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	// Note: finalMessageText is NOT cleared here; it's read by the router
 	// after the turn ends. It will be overwritten on the next turn's done event.
 	sc.progressMessageTS = nil // next turn gets a new Slack message
+	sc.turnID++                // invalidate any pending OnPosted callbacks
 	sc.firstTurn = false       // header only on the first turn
 	sc.finalized = false
 	sc.dirty = false
@@ -617,6 +619,7 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 		sc.progressMessageTS = &placeholder
 
 		tsCh := make(chan string, 1)
+		postTurnID := sc.turnID // capture for late-callback guard
 		item := &outbound.OutboundItem{
 			Priority:  3, // chat.postMessage
 			ChannelID: sc.channelID,
@@ -627,7 +630,7 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 			Username:  username,
 			IconURL:   iconURL,
 			OnPosted: func(ts string) {
-				sc.SetProgressMessageTS(ts)
+				sc.setProgressMessageTSGuarded(ts, postTurnID)
 				tsCh <- ts
 			},
 		}
@@ -666,6 +669,22 @@ func (sc *SessionCoalescer) flushLocked(isFinal bool) {
 func (sc *SessionCoalescer) SetProgressMessageTS(ts string) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.progressMessageTS = &ts
+	slog.Debug("coalescer: progress message TS set", "session_id", sc.sessionID, "ts", ts)
+}
+
+// setProgressMessageTSGuarded sets the progress TS only if the turn hasn't
+// changed since the PostMessage was enqueued. This prevents late OnPosted
+// callbacks from overwriting the TS after a turn reset.
+func (sc *SessionCoalescer) setProgressMessageTSGuarded(ts string, expectedTurnID uint64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.turnID != expectedTurnID {
+		slog.Warn("coalescer: ignoring late OnPosted callback (turn changed)",
+			"session_id", sc.sessionID, "ts", ts,
+			"expected_turn", expectedTurnID, "current_turn", sc.turnID)
+		return
+	}
 	sc.progressMessageTS = &ts
 	slog.Debug("coalescer: progress message TS set", "session_id", sc.sessionID, "ts", ts)
 }
