@@ -243,13 +243,21 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("v4: %w", err)
 		}
 	}
+	if version < 5 {
+		if err := migrateV5(db); err != nil {
+			return fmt.Errorf("v5: %w", err)
+		}
+	}
 
-	// Self-heal backstop. Branch worktrees that share one data_dir can advance
-	// user_version past 4 via a different migration lineage, which makes the
-	// version-gated migrateV4 above a no-op and strands the backend column the
-	// current code requires. Re-add it idempotently regardless of version.
+	// Self-heal backstops. Branch worktrees that share one data_dir can advance
+	// user_version past a given migration via a different migration lineage,
+	// which makes the version-gated migrations above a no-op and strands schema
+	// the current code requires. Re-add idempotently regardless of version.
 	if err := ensureBackendColumn(db); err != nil {
 		return fmt.Errorf("ensure backend column: %w", err)
+	}
+	if err := ensureCronLastFiredTable(db); err != nil {
+		return fmt.Errorf("ensure cron_last_fired table: %w", err)
 	}
 
 	return nil
@@ -264,6 +272,16 @@ func ensureBackendColumn(db *sql.DB) error {
 		return err
 	}
 	return nil
+}
+
+// ensureCronLastFiredTable guarantees the cron_last_fired table exists
+// independent of user_version. CREATE TABLE IF NOT EXISTS is idempotent.
+func ensureCronLastFiredTable(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS cron_last_fired (
+		job_id        TEXT PRIMARY KEY,
+		fired_at_unix INTEGER NOT NULL
+	)`)
+	return err
 }
 
 func migrateV1(db *sql.DB) error {
@@ -450,6 +468,30 @@ func migrateV4(db *sql.DB) error {
 	return err
 }
 
+// migrateV5 creates the cron_last_fired table used to persist cron dedup state
+// across process restarts (see store.ClaimCronFire).
+func migrateV5(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS cron_last_fired (
+		job_id        TEXT PRIMARY KEY,
+		fired_at_unix INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("exec create cron_last_fired: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec("PRAGMA user_version = 5")
+	return err
+}
+
 // isDuplicateColumnErr checks if a SQLite error is a "duplicate column name" error.
 func isDuplicateColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column name")
@@ -554,6 +596,27 @@ func (s *Store) UpdateCronJobEnabled(id string, enabled bool) error {
 		return fmt.Errorf("store: cron job %q not found", id)
 	}
 	return nil
+}
+
+// ClaimCronFire atomically claims a cron job firing for the given minute.
+// Returns true if the claim was successful (job has not yet fired for this
+// minute), false if it was already claimed. This survives process restarts
+// because the state is persisted in SQLite.
+func (s *Store) ClaimCronFire(jobID string, firedAtUnix int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`
+		INSERT INTO cron_last_fired (job_id, fired_at_unix) VALUES (?, ?)
+		ON CONFLICT(job_id) DO UPDATE SET fired_at_unix = ?
+		WHERE fired_at_unix < ?`,
+		jobID, firedAtUnix, firedAtUnix, firedAtUnix,
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: claim cron fire: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // boolToInt converts a bool to 0/1 for SQLite storage.

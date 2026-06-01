@@ -1264,3 +1264,43 @@ func TestCronJob_ConcurrentDaemonAndCLI(t *testing.T) {
 		t.Errorf("daemon sees wrong job ID: %q", daemonJobs[0].ID)
 	}
 }
+
+func TestClaimCronFire(t *testing.T) {
+	s := newTestStore(t)
+
+	// First claim should succeed.
+	claimed, err := s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("first claim should succeed")
+	}
+
+	// Second claim for the same minute should fail.
+	claimed, err = s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Error("second claim for same minute should fail")
+	}
+
+	// Claim for the next minute should succeed.
+	claimed, err = s.ClaimCronFire("test-job", 1780210860)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("claim for next minute should succeed")
+	}
+
+	// Different job, same minute as first, should succeed.
+	claimed, err = s.ClaimCronFire("other-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("different job same minute should succeed")
+	}
+}

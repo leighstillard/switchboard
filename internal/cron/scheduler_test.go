@@ -192,3 +192,53 @@ func TestMultipleJobsSameMinute(t *testing.T) {
 
 	assert.Equal(t, 2, disp.callCount())
 }
+
+func TestDedupSurvivesRestart(t *testing.T) {
+	st := testStore(t)
+	disp := &mockDispatcher{}
+
+	// First scheduler fires the job.
+	sched1, err := New([]Job{
+		{ID: "restart-test", Schedule: "* * * * *", ChannelID: "C123", Prompt: "hello", Enabled: true},
+	}, disp, st)
+	require.NoError(t, err)
+
+	sched1.tick(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 1, disp.callCount())
+
+	// Simulate restart: create a new scheduler with the same store.
+	// The job should NOT fire again for the same minute.
+	sched2, err := New([]Job{
+		{ID: "restart-test", Schedule: "* * * * *", ChannelID: "C123", Prompt: "hello", Enabled: true},
+	}, disp, st)
+	require.NoError(t, err)
+
+	sched2.tick(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 1, disp.callCount(), "job should not fire again after restart within the same minute")
+}
+
+func TestDedupConcurrentTicks(t *testing.T) {
+	st := testStore(t)
+	disp := &mockDispatcher{}
+
+	sched, err := New([]Job{
+		{ID: "concurrent-test", Schedule: "* * * * *", ChannelID: "C123", Prompt: "hello", Enabled: true},
+	}, disp, st)
+	require.NoError(t, err)
+
+	// Fire 10 concurrent ticks -- only one should dispatch.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sched.tick(context.Background())
+		}()
+	}
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Equal(t, 1, disp.callCount(), "concurrent ticks should only dispatch once")
+}
