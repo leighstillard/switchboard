@@ -37,8 +37,8 @@ func TestNew_WALAndIntegrity(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 }
 
@@ -115,13 +115,13 @@ func TestMigrateV4(t *testing.T) {
 		t.Errorf("Backend = %q, want jcode (default)", got2.Backend)
 	}
 
-	// Verify version is 5 (latest migration).
+	// Verify version is 6 (latest migration).
 	var version int
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("user_version = %d, want 6", version)
 	}
 
 	s.Close()
@@ -159,7 +159,7 @@ func TestMigrate_SelfHealsStrandedBackendColumn(t *testing.T) {
 	if _, err := s.db.Exec(`ALTER TABLE sessions DROP COLUMN backend`); err != nil {
 		t.Fatalf("drop backend: %v", err)
 	}
-	if _, err := s.db.Exec(`PRAGMA user_version = 6`); err != nil {
+	if _, err := s.db.Exec(`PRAGMA user_version = 7`); err != nil {
 		t.Fatalf("bump user_version: %v", err)
 	}
 	s.Close()

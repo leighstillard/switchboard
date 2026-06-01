@@ -675,6 +675,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		item := &store.TurnQueueItem{
 			ChannelID:  msg.ChannelID,
 			ThreadTS:   threadTS,
+			MessageTS:  msg.MessageTS,
 			EnqueuedAt: time.Now().Unix(),
 			UserID:     msg.UserID,
 			Text:       msg.Text,
@@ -942,6 +943,14 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 		}
 		r.store.UpdateSessionStatus(channelID, threadTS, "idle")
 		return
+	}
+
+	// Swap reactions on the queued messages: remove 📋, add 👀.
+	for _, t := range turns {
+		if t.MessageTS != "" {
+			r.edge.RemoveReaction(t.ChannelID, t.MessageTS, "clipboard")
+			r.edge.AddReaction(t.ChannelID, t.MessageTS, "eyes")
+		}
 	}
 
 	r.store.UpdateSessionActivity(channelID, threadTS)
