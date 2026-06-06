@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Query switchboard SQLite database. Usage: dbq.py "SQL QUERY" """
-import sqlite3, sys, os, json
+import sqlite3, sys, os
 
 DB = os.path.expanduser("~/.local/share/switchboard/switchboard.db")
 conn = sqlite3.connect(DB)
