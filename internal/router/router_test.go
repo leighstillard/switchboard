@@ -3,7 +3,7 @@ package router
 import (
 	"testing"
 
-	"github.com/format5/switchboard/internal/jcodeproto"
+	"github.com/format5/switchboard/internal/agent"
 	"github.com/format5/switchboard/internal/llmrouter"
 )
 
@@ -12,24 +12,24 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestShouldNotifySuccess validates the logic for when to send the success
-// notification. Only EventDone should trigger ✅; errors and interruptions
+// notification. Only EventTurnDone should trigger ✅; errors and interruptions
 // should be silent (the coalescer already shows them).
 func TestShouldNotifySuccess(t *testing.T) {
 	tests := []struct {
 		name      string
-		eventType string
+		eventType agent.EventType
 		want      bool
 	}{
-		{"done event sends success", jcodeproto.EventDone, true},
-		{"error event skips success", jcodeproto.EventError, false},
-		{"interrupted event skips success", jcodeproto.EventInterrupted, false},
+		{"done event sends success", agent.EventTurnDone, true},
+		{"error event skips success", agent.EventTurnError, false},
+		{"interrupted event skips success", agent.EventInterrupted, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := shouldNotifySuccess(tt.eventType)
 			if got != tt.want {
-				t.Errorf("shouldNotifySuccess(%q) = %v, want %v", tt.eventType, got, tt.want)
+				t.Errorf("shouldNotifySuccess(%v) = %v, want %v", tt.eventType, got, tt.want)
 			}
 		})
 	}

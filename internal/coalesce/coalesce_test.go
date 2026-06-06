@@ -1,14 +1,13 @@
 package coalesce
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/format5/switchboard/internal/jcodeproto"
+	"github.com/format5/switchboard/internal/agent"
 	"github.com/format5/switchboard/internal/outbound"
 )
 
@@ -35,15 +34,6 @@ func (m *mockOutbound) getItems() []*outbound.OutboundItem {
 	return append([]*outbound.OutboundItem{}, m.items...)
 }
 
-func makeEvent(t *testing.T, evType string, data interface{}) *jcodeproto.ServerEvent {
-	t.Helper()
-	raw, err := json.Marshal(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &jcodeproto.ServerEvent{Type: evType, Raw: raw}
-}
-
 func TestCoalescer_TextDelta(t *testing.T) {
 	out := &mockOutbound{}
 	coal := NewSessionCoalescer("sess-1", "fox", "C123", "ts1", "/workspace/test",
@@ -51,17 +41,11 @@ func TestCoalescer_TextDelta(t *testing.T) {
 	defer coal.Close()
 
 	// Send text deltas.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "Hello ",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "world!",
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Hello "})
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "world!"})
 
 	// Trigger flush via Done.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	if len(items) == 0 {
@@ -88,15 +72,9 @@ func TestCoalescer_TextReplace(t *testing.T) {
 	defer coal.Close()
 
 	// Send text delta then replace.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "garbled output",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextReplace, map[string]string{
-		"type": "text_replace", "text": "clean output",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "garbled output"})
+	coal.HandleEvent(agent.Event{Type: agent.EventTextReplace, Text: "clean output"})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	if len(items) == 0 {
@@ -118,18 +96,16 @@ func TestCoalescer_ToolProgress(t *testing.T) {
 	defer coal.Close()
 
 	// Tool lifecycle.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]string{
-		"type": "tool_start", "id": "t1", "name": "Read",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolExec, map[string]string{
-		"type": "tool_exec", "id": "t1", "name": "Read",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "t1", "name": "Read", "output": "file contents",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t1", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolExec, ToolID: "t1", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t1", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	if len(items) == 0 {
@@ -155,9 +131,9 @@ func TestCoalescer_ErrorEvent(t *testing.T) {
 		Identity{DisplayName: "Worker"}, out, nil)
 	defer coal.Close()
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventError, map[string]interface{}{
-		"type": "error", "id": float64(1), "message": "rate limited",
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventTurnError, ErrorMessage: "rate limited",
+	})
 
 	items := out.getItems()
 	if len(items) == 0 {
@@ -182,15 +158,9 @@ func TestCoalescer_UpstreamProvider(t *testing.T) {
 		Identity{DisplayName: "Worker"}, out, nil)
 	defer coal.Close()
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventUpstreamProvider, map[string]string{
-		"type": "upstream_provider", "provider": "gpt-4o",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "response",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventProvider, ProviderName: "gpt-4o"})
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "response"})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	found := false
@@ -212,9 +182,7 @@ func TestCoalescer_LazyFlush(t *testing.T) {
 	defer coal.Close()
 
 	// Send text delta without triggering a terminal event.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "streaming...",
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "streaming..."})
 
 	// Should not have flushed yet (less than 1s).
 	items := out.getItems()
@@ -255,18 +223,14 @@ func TestCoalescer_ToolDescription_Read(t *testing.T) {
 	defer coal.Close()
 
 	// ToolStart with input containing file_path.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type":  "tool_start",
-		"id":    "t1",
-		"name":  "Read",
-		"input": map[string]interface{}{"file_path": "/home/user/workspace/auth.go"},
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "t1", "name": "Read", "output": "contents",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t1", ToolName: "Read",
+		ToolInput: map[string]any{"file_path": "/home/user/workspace/auth.go"},
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t1", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	found := false
@@ -290,21 +254,17 @@ func TestCoalescer_ToolDescription_Bash(t *testing.T) {
 		Identity{DisplayName: "Worker"}, out, nil)
 	defer coal.Close()
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type":  "tool_start",
-		"id":    "t2",
-		"name":  "Bash",
-		"input": map[string]interface{}{"command": "go test ./..."},
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolExec, map[string]interface{}{
-		"type": "tool_exec", "id": "t2", "name": "Bash",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "t2", "name": "Bash", "output": "ok",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t2", ToolName: "Bash",
+		ToolInput: map[string]any{"command": "go test ./..."},
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolExec, ToolID: "t2", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t2", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	found := false
@@ -329,15 +289,13 @@ func TestCoalescer_ToolDescription_Fallback(t *testing.T) {
 	defer coal.Close()
 
 	// Tool with no input -- should fall back to "Running Read".
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type": "tool_start", "id": "t3", "name": "Read",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "t3", "name": "Read", "output": "ok",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t3", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t3", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	items := out.getItems()
 	found := false
@@ -361,12 +319,10 @@ func TestCoalescer_ToolDescription_PendingShowsDescription(t *testing.T) {
 		Identity{DisplayName: "Worker"}, out, nil)
 	defer coal.Close()
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type":  "tool_start",
-		"id":    "t4",
-		"name":  "Grep",
-		"input": map[string]interface{}{"pattern": "TODO"},
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t4", ToolName: "Grep",
+		ToolInput: map[string]any{"pattern": "TODO"},
+	})
 
 	// Wait for timer flush so we see the pending tool.
 	time.Sleep(1500 * time.Millisecond)
@@ -400,16 +356,10 @@ func TestCoalescer_DirectiveExtraction(t *testing.T) {
 	// Send text that includes a render directive.
 	directiveText := "Here's the plan:\n```switchboard\n{\"render\": \"plan\", \"title\": \"Deploy\", \"tasks\": [{\"id\": \"1\", \"title\": \"Build\", \"status\": \"complete\"}, {\"id\": \"2\", \"title\": \"Test\", \"status\": \"pending\"}]}\n```\nDone explaining."
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta",
-		"text": directiveText,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: directiveText})
 
 	// Trigger a final flush.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done",
-		"id":   1,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	// Wait for flush.
 	time.Sleep(200 * time.Millisecond)
@@ -455,16 +405,10 @@ func TestCoalescer_DirectiveInvalid_LeftInText(t *testing.T) {
 	// Send text with an invalid directive (unknown type).
 	directiveText := "Check this:\n```switchboard\n{\"render\": \"unknown_type\", \"data\": 123}\n```\nEnd."
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta",
-		"text": directiveText,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: directiveText})
 
 	// Final flush.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done",
-		"id":   1,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -498,15 +442,9 @@ func TestCoalescer_PlainCodeBlock_NotIntercepted(t *testing.T) {
 	// Send text with a plain code block (python).
 	text := "Here's code:\n```python\ndef hello():\n    print('hi')\n```\nDone."
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta",
-		"text": text,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: text})
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done",
-		"id":   1,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -544,28 +482,19 @@ func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
 	// Send text with a directive.
 	directiveText := "Here:\n```switchboard\n{\"render\": \"todos\", \"items\": [{\"text\": \"A\", \"done\": false}]}\n```\nMore text."
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta",
-		"text": directiveText,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: directiveText})
 
 	// Wait for a timer flush (first render).
 	time.Sleep(1500 * time.Millisecond)
 
 	// Append more text (triggers another flush with the same directive still in buffer).
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta",
-		"text": " Even more text.",
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: " Even more text."})
 
 	// Wait for second timer flush.
 	time.Sleep(1500 * time.Millisecond)
 
 	// Final flush.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done",
-		"id":   1,
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -607,36 +536,23 @@ func TestCoalescer_OverflowFromManyTools(t *testing.T) {
 	defer coal.Close()
 
 	// Add a small text buffer.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "Starting work...\n",
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Starting work...\n"})
 
-	// Simulate 150 tool calls with UNIQUE file names (render.Describe uses
-	// basename, so each file must have a distinct name to avoid dedup).
-	// Each description is ~25 chars; 150 * (25+10) = 5250, which exceeds 3000.
+	// Simulate 150 tool calls with UNIQUE file names.
 	for i := 0; i < 150; i++ {
 		toolID := fmt.Sprintf("tool-%d", i)
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-			"type":  "tool_start",
-			"id":    toolID,
-			"name":  "Read",
-			"input": map[string]interface{}{"file_path": fmt.Sprintf("/workspace/handler_%d.go", i)},
-		}))
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-			"type":   "tool_done",
-			"id":     toolID,
-			"name":   "Read",
-			"output": "file contents",
-		}))
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolStart, ToolID: toolID, ToolName: "Read",
+			ToolInput: map[string]any{"file_path": fmt.Sprintf("/workspace/handler_%d.go", i)},
+		})
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolDone, ToolID: toolID, ToolName: "Read",
+		})
 	}
 
 	// Final text + done.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "All done reviewing files.",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "All done reviewing files."})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	// Wait for async callbacks.
 	time.Sleep(200 * time.Millisecond)
@@ -662,63 +578,49 @@ func TestCoalescer_OverflowFromManyTools(t *testing.T) {
 }
 
 // TestCoalescer_SequentialToolDedup verifies that sequential identical tool
-// descriptions are collapsed into a single entry with a count (×N).
+// descriptions are collapsed into a single entry with a count.
 func TestCoalescer_SequentialToolDedup(t *testing.T) {
 	out := &mockOutbound{}
 	coal := NewSessionCoalescer("sess-dedup", "fox", "C300", "ts300", "/workspace/dedup",
 		Identity{DisplayName: "Worker"}, out, nil)
 	defer coal.Close()
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "Querying databases...\n",
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Querying databases...\n"})
 
 	// Three sequential identical tool calls.
 	for i := 0; i < 3; i++ {
 		toolID := fmt.Sprintf("pg-%d", i)
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-			"type":  "tool_start",
-			"id":    toolID,
-			"name":  "postgres",
-			"input": map[string]interface{}{"query": "SELECT * FROM users"},
-		}))
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-			"type":   "tool_done",
-			"id":     toolID,
-			"name":   "postgres",
-			"output": "3 rows",
-		}))
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolStart, ToolID: toolID, ToolName: "postgres",
+			ToolInput: map[string]any{"query": "SELECT * FROM users"},
+		})
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolDone, ToolID: toolID, ToolName: "postgres",
+		})
 	}
 
 	// Then a different tool.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type": "tool_start", "id": "read-1", "name": "Read",
-		"input": map[string]interface{}{"file_path": "/workspace/config.go"},
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "read-1", "name": "Read", "output": "contents",
-	}))
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "read-1", ToolName: "Read",
+		ToolInput: map[string]any{"file_path": "/workspace/config.go"},
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "read-1", ToolName: "Read",
+	})
 
 	// Then two more identical tool calls.
 	for i := 0; i < 2; i++ {
 		toolID := fmt.Sprintf("pg-extra-%d", i)
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-			"type":  "tool_start",
-			"id":    toolID,
-			"name":  "postgres",
-			"input": map[string]interface{}{"query": "SELECT * FROM users"},
-		}))
-		coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-			"type":   "tool_done",
-			"id":     toolID,
-			"name":   "postgres",
-			"output": "3 rows",
-		}))
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolStart, ToolID: toolID, ToolName: "postgres",
+			ToolInput: map[string]any{"query": "SELECT * FROM users"},
+		})
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolDone, ToolID: toolID, ToolName: "postgres",
+		})
 	}
 
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -727,33 +629,28 @@ func TestCoalescer_SequentialToolDedup(t *testing.T) {
 		t.Fatal("expected outbound items")
 	}
 
-	// Find the last item (final flush).
 	lastItem := items[len(items)-1]
 
-	// Should contain "×3" for the first batch.
-	if !contains(lastItem.Text, "×3") {
-		t.Error("expected ×3 dedup count for first batch of postgres calls")
+	if !contains(lastItem.Text, "\u00d73") {
+		t.Error("expected \u00d73 dedup count for first batch of postgres calls")
 		t.Logf("text: %s", lastItem.Text)
 	}
 
-	// Should contain "×2" for the second batch.
-	if !contains(lastItem.Text, "×2") {
-		t.Error("expected ×2 dedup count for second batch of postgres calls")
+	if !contains(lastItem.Text, "\u00d72") {
+		t.Error("expected \u00d72 dedup count for second batch of postgres calls")
 		t.Logf("text: %s", lastItem.Text)
 	}
 
-	// Should contain Reading `config.go` (the non-deduped tool).
 	if !contains(lastItem.Text, "config.go") {
 		t.Error("expected Reading config.go in output")
 		t.Logf("text: %s", lastItem.Text)
 	}
 
-	// The ×3 and Reading should appear in order (not all tools at the end).
-	idx3 := strings.Index(lastItem.Text, "×3")
+	idx3 := strings.Index(lastItem.Text, "\u00d73")
 	idxRead := strings.Index(lastItem.Text, "config.go")
-	idx2 := strings.Index(lastItem.Text, "×2")
+	idx2 := strings.Index(lastItem.Text, "\u00d72")
 	if idx3 >= idxRead || idxRead >= idx2 {
-		t.Errorf("tool entries should be interleaved in order: ×3 (at %d) < config.go (at %d) < ×2 (at %d)",
+		t.Errorf("tool entries should be interleaved in order: \u00d73 (at %d) < config.go (at %d) < \u00d72 (at %d)",
 			idx3, idxRead, idx2)
 		t.Logf("text: %s", lastItem.Text)
 	}
@@ -768,22 +665,16 @@ func TestCoalescer_InlineToolOrdering(t *testing.T) {
 	defer coal.Close()
 
 	// Text, then tool, then more text.
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "Let me check the file.\n",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolStart, map[string]interface{}{
-		"type": "tool_start", "id": "t1", "name": "Read",
-		"input": map[string]interface{}{"file_path": "/workspace/main.go"},
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventToolDone, map[string]interface{}{
-		"type": "tool_done", "id": "t1", "name": "Read", "output": "package main",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventTextDelta, map[string]string{
-		"type": "text_delta", "text": "The file looks good.\n",
-	}))
-	coal.HandleEvent(makeEvent(t, jcodeproto.EventDone, map[string]interface{}{
-		"type": "done", "id": float64(1),
-	}))
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Let me check the file.\n"})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t1", ToolName: "Read",
+		ToolInput: map[string]any{"file_path": "/workspace/main.go"},
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t1", ToolName: "Read",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "The file looks good.\n"})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -866,5 +757,101 @@ func TestStartCountdownSetsTarget(t *testing.T) {
 	}
 	if coal.countdownElapsed {
 		t.Error("expected countdownElapsed to be false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ToolInputDelta routing: empty ID (jcode) vs non-empty ID (claude)
+// ---------------------------------------------------------------------------
+
+func TestCoalescer_ToolInputDelta_EmptyID_JcodeCompat(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-input-jcode", "fox", "C500", "ts500", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Start a tool, send input with empty ID (jcode path), then exec.
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{
+		Type:        agent.EventToolInputDelta,
+		ToolID:      "", // jcode: empty ID
+		PartialJSON: `{"command":"go test"}`,
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolExec, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected outbound items")
+	}
+
+	// Should have parsed the input and generated a description from it.
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Go tests") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected parsed tool input description (jcode empty-ID path)")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
+	}
+}
+
+func TestCoalescer_ToolInputDelta_WithID_ClaudePath(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-input-claude", "fox", "C501", "ts501", "/workspace",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Start a tool, send input with explicit ID (claude path), then exec.
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolStart, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{
+		Type:        agent.EventToolInputDelta,
+		ToolID:      "t1", // claude: explicit ID
+		PartialJSON: `{"command":"go test"}`,
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolExec, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{
+		Type: agent.EventToolDone, ToolID: "t1", ToolName: "Bash",
+	})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+
+	time.Sleep(200 * time.Millisecond)
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected outbound items")
+	}
+
+	// Should have the same result as the jcode path.
+	found := false
+	for _, item := range items {
+		if contains(item.Text, "Go tests") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected parsed tool input description (claude ID path)")
+		for _, item := range items {
+			t.Logf("  item text: %s", item.Text)
+		}
 	}
 }
