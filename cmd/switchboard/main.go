@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/format5/switchboard/internal/agent/jcodeadapter"
 	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/cron"
 	"github.com/format5/switchboard/internal/ingest"
@@ -102,6 +103,9 @@ func main() {
 	}
 	defer jc.Close()
 
+	// Wrap jcode client in the agent backend adapter.
+	backend := jcodeadapter.New(jc)
+
 	// 3. Slack edge
 	edge, err := slack.NewEdge(cfg.Slack, cfg.Channels, cfg.Identities)
 	if err != nil {
@@ -117,7 +121,7 @@ func main() {
 	ing := ingest.NewServer(cfg.Ingest, st)
 
 	// 6. Router (wires everything together)
-	rt := router.New(cfg, st, jc, edge, out, *configPath)
+	rt := router.New(cfg, st, backend, edge, out, *configPath)
 
 	// 7. Cron scheduler (merge config + DB jobs)
 	cronJobs := mergeCronJobs(cronJobsFromConfig(cfg.Crons), cronJobsFromDB(st))

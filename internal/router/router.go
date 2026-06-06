@@ -1,6 +1,6 @@
 // Package router implements the decision-making core of Switchboard.
 // It receives inbound Slack messages and webhook events, orchestrates
-// jcode session lifecycle, and routes notifications to the appropriate
+// agent session lifecycle, and routes notifications to the appropriate
 // Slack threads.
 package router
 
@@ -18,10 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/format5/switchboard/internal/agent"
 	"github.com/format5/switchboard/internal/coalesce"
 	"github.com/format5/switchboard/internal/config"
-	"github.com/format5/switchboard/internal/jcode"
-	"github.com/format5/switchboard/internal/jcodeproto"
 	"github.com/format5/switchboard/internal/llmrouter"
 	"github.com/format5/switchboard/internal/outbound"
 	"github.com/format5/switchboard/internal/slack"
@@ -46,24 +45,24 @@ type WebhookEvent struct {
 type Router struct {
 	cfg      *config.Config
 	store    *store.Store
-	jcode    *jcode.Client
+	backend  agent.Backend
 	edge     *slack.Edge
 	outbound *outbound.Queue
 
 	mu         sync.RWMutex
 	routes     []config.RouteConfig
 	coalescers map[string]*coalesce.SessionCoalescer // key: "channelID:threadTS"
-	// coalescerQueue maps jcode session ID to an ordered queue of coalescer keys.
+	// coalescerQueue maps agent session ID to an ordered queue of coalescer keys.
 	// Events are routed to the first entry. On "done", the front is popped so
 	// subsequent turns route to the next waiting coalescer (thread).
 	coalescerQueue map[string][]string // jcodeSessionID -> []coalescerKey
 
 	// threadLock enforces that only one thread at a time receives events from
-	// a jcode session. When a thread starts a turn, it acquires the lock.
+	// a agent session. When a thread starts a turn, it acquires the lock.
 	// consumeEvents routes events exclusively to the locked thread. On turn
 	// completion the lock is released and the next queued thread (if any)
 	// is promoted. This prevents events from leaking to the wrong Slack
-	// thread when multiple threads share a jcode session.
+	// thread when multiple threads share a agent session.
 	threadLock map[string]string // jcodeSessionID -> coalescerKey (active lock holder)
 
 	// turnRequester tracks which user triggered the current active turn,
@@ -82,7 +81,7 @@ type Router struct {
 func New(
 	cfg *config.Config,
 	st *store.Store,
-	jc *jcode.Client,
+	backend agent.Backend,
 	edge *slack.Edge,
 	out *outbound.Queue,
 	configPath string,
@@ -90,7 +89,7 @@ func New(
 	r := &Router{
 		cfg:                cfg,
 		store:              st,
-		jcode:              jc,
+		backend:            backend,
 		edge:               edge,
 		outbound:           out,
 		routes:             cfg.Routes,
@@ -403,7 +402,7 @@ func titleCase(s string) string {
 	return strings.Join(words, " ")
 }
 
-// handleNewSession creates a new jcode session and starts processing.
+// handleNewSession creates a new agent session and starts processing.
 func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage, workdir string, identity coalesce.Identity, threadTS string) {
 	slog.Info("router: creating new session",
 		"channel", msg.ChannelID,
@@ -414,10 +413,10 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Audit the inbound message.
 	r.auditSlackMessage(msg, threadTS)
 
-	// Subscribe to a new jcode session (may reuse existing for same workdir).
-	sessionID, events, err := r.jcode.Subscribe(ctx, workdir)
+	// Subscribe to a new agent session (may reuse existing for same workdir).
+	sessionID, events, err := r.backend.Subscribe(ctx, workdir)
 	if err != nil {
-		slog.Error("router: failed to subscribe to jcode", "err", err, "workdir", workdir)
+		slog.Error("router: failed to subscribe to agent", "err", err, "workdir", workdir)
 		r.postError(msg.ChannelID, threadTS, "Agent is temporarily unavailable. Try again in a moment.")
 		return
 	}
@@ -464,11 +463,11 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Add 👀 reaction to acknowledge receipt.
 	r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
-	// Send the user's message to jcode.
-	var images []jcodeproto.ImagePair
+	// Send the user's message to agent.
+	var images []agent.Image
 	// TODO: handle file attachments -> images
-	if err := r.jcode.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
-		slog.Error("router: failed to send message to jcode", "err", err)
+	if err := r.backend.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
+		slog.Error("router: failed to send message to agent", "err", err)
 		r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
 		return
 	}
@@ -478,7 +477,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	if !isReused {
 		go r.consumeEvents(ctx, sessionID, events)
 	} else {
-		slog.Info("router: reusing existing jcode session", "session_id", sessionID, "new_thread", threadTS)
+		slog.Info("router: reusing existing agent session", "session_id", sessionID, "new_thread", threadTS)
 	}
 }
 
@@ -519,14 +518,14 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		// Add 👀 reaction.
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
-		// Send message to jcode. If the session is stale (e.g. jcode restarted),
+		// Send message to agent. If the session is stale (e.g. jcode restarted),
 		// attempt to re-subscribe before giving up.
-		var images []jcodeproto.ImagePair
-		if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+		var images []agent.Image
+		if err := r.backend.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 			slog.Warn("router: send failed, attempting re-subscribe",
 				"session_id", session.JcodeSession, "err", err)
 
-			events, subErr := r.jcode.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
+			events, subErr := r.backend.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
 			if subErr != nil {
 				// Session is truly gone. Transparently create a new session
 				// in the same thread so the user doesn't notice the interruption.
@@ -545,7 +544,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 			// Re-subscribe succeeded; start event consumer and retry send.
 			go r.consumeEvents(ctx, session.JcodeSession, events)
-			if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+			if err := r.backend.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 				// Send still fails after re-subscribe. Create replacement session.
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
@@ -630,7 +629,7 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 			return false
 		}
 		if session.Status == "processing" {
-			if err := r.jcode.Cancel(ctx, session.JcodeSession); err != nil {
+			if err := r.backend.Cancel(ctx, session.JcodeSession); err != nil {
 				slog.Error("router: cancel failed", "err", err)
 			}
 			r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
@@ -657,7 +656,7 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		return true
 	}
 
-	// Slash command passthrough: "!/<cmd>" sends "/<cmd>" to jcode.
+	// Slash command passthrough: "!/<cmd>" sends "/<cmd>" to agent.
 	// Must come after specific !commands above.
 	if strings.HasPrefix(text, "!/") {
 		session, err := r.store.GetSession(msg.ChannelID, threadTS)
@@ -678,7 +677,7 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		}
 		r.mu.Unlock()
 
-		if err := r.jcode.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
+		if err := r.backend.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
 			slog.Error("router: slash passthrough send failed", "err", err)
 			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
 		}
@@ -689,11 +688,11 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 }
 
 // ---------------------------------------------------------------------------
-// Event consumption from jcode
+// Event consumption from agent
 // ---------------------------------------------------------------------------
 
-// consumeEvents reads from a jcode session event channel and dispatches to coalescer.
-func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-chan *jcodeproto.ServerEvent) {
+// consumeEvents reads from an agent backend event channel and dispatches to coalescer.
+func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-chan agent.Event) {
 	slog.Info("router: consumeEvents started", "session_id", sessionID)
 	for {
 		select {
@@ -720,22 +719,10 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				continue
 			}
 
-			// Handle session event (friendly name).
-			if ev.Type == jcodeproto.EventSession {
-				var sessEv jcodeproto.SessionEvent
-				if json.Unmarshal(ev.Raw, &sessEv) == nil {
-					coal.SetFriendlyName(sessEv.SessionID)
-				}
-				continue
-			}
-
-			// Handle history event (extract was_interrupted, then discard).
-			if ev.Type == jcodeproto.EventHistory {
-				var histEv jcodeproto.HistoryEvent
-				if json.Unmarshal(ev.Raw, &histEv) == nil {
-					if histEv.WasInterrupted != nil && *histEv.WasInterrupted {
-						slog.Info("router: session was interrupted", "session_id", sessionID)
-					}
+			// Handle session ready event (friendly name update).
+			if ev.Type == agent.EventSessionReady {
+				if ev.SessionID != "" {
+					coal.SetFriendlyName(ev.SessionID)
 				}
 				continue
 			}
@@ -744,7 +731,7 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 			coal.HandleEvent(ev)
 
 			// Handle turn completion.
-			if ev.Type == jcodeproto.EventDone || ev.Type == jcodeproto.EventError || ev.Type == jcodeproto.EventInterrupted {
+			if ev.Type == agent.EventTurnDone || ev.Type == agent.EventTurnError || ev.Type == agent.EventInterrupted {
 				r.mu.Lock()
 				// Release the lock.
 				delete(r.threadLock, sessionID)
@@ -769,8 +756,8 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 // shouldNotifySuccess returns true if the event type warrants a ✅ success
 // notification. Error and interrupted events are handled by the coalescer
 // with their own messaging, so sending ✅ would be misleading.
-func shouldNotifySuccess(eventType string) bool {
-	return eventType == jcodeproto.EventDone
+func shouldNotifySuccess(eventType agent.EventType) bool {
+	return eventType == agent.EventTurnDone
 }
 
 // dropNextKeyFromQueue removes the front entry from the coalescerQueue for the
@@ -799,7 +786,7 @@ func isValidLLMThreadID(threadID string, threads []llmrouter.ThreadContext) bool
 }
 
 // handleTurnEnd drains the turn queue and either sends the next batch or marks idle.
-func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventType string) {
+func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, eventType agent.EventType) {
 	// Parse channelID and threadTS from the coalescer key.
 	channelID, threadTS := parseCoalescerKey(coalKey)
 	if channelID == "" {
@@ -856,8 +843,8 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey, eventTyp
 	}
 	r.mu.Unlock()
 
-	// Send combined message to jcode.
-	if err := r.jcode.SendMessage(ctx, sessionID, combined, nil); err != nil {
+	// Send combined message to agent.
+	if err := r.backend.SendMessage(ctx, sessionID, combined, nil); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
 		// Remove the coalKey we just added since the send failed.
@@ -1121,12 +1108,12 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 
 	slog.Info("router: recovering sessions", "count", len(sessions))
 
-	// Track which jcode sessions we've already started consumers for.
+	// Track which agent sessions we've already started consumers for.
 	startedConsumers := make(map[string]bool)
 
 	for _, sess := range sessions {
-		// Try to re-attach to the jcode session.
-		events, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
+		// Try to re-attach to the agent session.
+		events, err := r.backend.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
 		if err != nil {
 			slog.Warn("router: failed to recover session",
 				"session_id", sess.JcodeSession,
@@ -1160,7 +1147,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		}
 		r.mu.Unlock()
 
-		// Start consuming events (only one consumer per jcode session).
+		// Start consuming events (only one consumer per agent session).
 		if !startedConsumers[sess.JcodeSession] {
 			startedConsumers[sess.JcodeSession] = true
 			go r.consumeEvents(ctx, sess.JcodeSession, events)
@@ -1385,12 +1372,12 @@ type DispatchRequest struct {
 // DispatchResult contains the outcome of a Dispatch call.
 type DispatchResult struct {
 	ThreadTS  string // the Slack thread that was created
-	SessionID string // the jcode session that is processing the request
+	SessionID string // the agent session that is processing the request
 }
 
 // Dispatch programmatically starts a jcode turn in a channel. It posts the
 // prompt as a top-level Slack message (creating a thread), then routes the
-// prompt to jcode exactly like a human-initiated message. The agent response
+// prompt to agent exactly like a human-initiated message. The agent response
 // streams into the newly created thread via the normal coalescer path.
 func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchResult, error) {
 	if req.ChannelID == "" || req.Prompt == "" {
@@ -1616,7 +1603,7 @@ func truncateJSON(payload map[string]interface{}, maxLen int) string {
 	return s
 }
 
-// extractFriendlyName extracts the animal name from a jcode session ID.
+// extractFriendlyName extracts the animal name from a agent session ID.
 // Session IDs follow the pattern: session_<animal>_<timestamp>_<hash>
 func extractFriendlyName(sessionID string) string {
 	parts := strings.SplitN(sessionID, "_", 4)

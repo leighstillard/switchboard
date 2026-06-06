@@ -1,5 +1,5 @@
 // Package coalesce implements per-session message buffering that accumulates
-// jcode events and flushes them lazily to Slack. Each active agent session
+// agent events and flushes them lazily to Slack. Each active agent session
 // gets one SessionCoalescer that batches text deltas, tool progress, and
 // other output into periodic chat.update calls (at most 1 Hz).
 package coalesce
@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/format5/switchboard/internal/jcodeproto"
+	"github.com/format5/switchboard/internal/agent"
 	"github.com/format5/switchboard/internal/outbound"
 	"github.com/format5/switchboard/internal/render"
 )
@@ -295,8 +295,8 @@ func (sc *SessionCoalescer) hasContent() bool {
 	return len(sc.pendingTools) > 0
 }
 
-// HandleEvent processes a single jcode server event.
-func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
+// HandleEvent processes a single normalized agent event.
+func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -305,155 +305,131 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 	}
 
 	switch ev.Type {
-	case jcodeproto.EventTextDelta:
-		var e jcodeproto.TextDeltaEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			seg := sc.currentTextSegment()
-			seg.text.WriteString(e.Text)
-			sc.dirty = true
-			sc.checkOverflow()
-		}
+	case agent.EventTextDelta:
+		seg := sc.currentTextSegment()
+		seg.text.WriteString(ev.Text)
+		sc.dirty = true
+		sc.checkOverflow()
 
-	case jcodeproto.EventTextReplace:
-		var e jcodeproto.TextReplaceEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Replace only text segments; preserve tool segments.
-			kept := sc.segments[:0]
-			for i := range sc.segments {
-				if sc.segments[i].kind == segTool {
-					kept = append(kept, sc.segments[i])
-				}
+	case agent.EventTextReplace:
+		// Replace only text segments; preserve tool segments.
+		kept := sc.segments[:0]
+		for i := range sc.segments {
+			if sc.segments[i].kind == segTool {
+				kept = append(kept, sc.segments[i])
 			}
-			sc.segments = kept
-			seg := sc.currentTextSegment()
-			seg.text.WriteString(e.Text)
-			sc.dirty = true
 		}
+		sc.segments = kept
+		seg := sc.currentTextSegment()
+		seg.text.WriteString(ev.Text)
+		sc.dirty = true
 
-	case jcodeproto.EventToolStart:
-		var e jcodeproto.ToolStartEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			desc := render.Describe(e.Name, e.Input)
-			sc.driftMonitor.Record(desc)
-			if sc.driftMonitor.IsAboveThreshold() {
-				slog.Warn("tool description drift above threshold",
-					"session_id", sc.sessionID,
-					"avg_words", sc.driftMonitor.Average(),
-				)
-			}
-			sc.pendingTools = append(sc.pendingTools, ToolProgress{
-				ID:          e.ID,
-				Name:        e.Name,
-				Description: desc,
-			})
-			sc.dirty = true
+	case agent.EventToolStart:
+		desc := render.Describe(ev.ToolName, ev.ToolInput)
+		sc.driftMonitor.Record(desc)
+		if sc.driftMonitor.IsAboveThreshold() {
+			slog.Warn("tool description drift above threshold",
+				"session_id", sc.sessionID,
+				"avg_words", sc.driftMonitor.Average(),
+			)
 		}
+		sc.pendingTools = append(sc.pendingTools, ToolProgress{
+			ID:          ev.ToolID,
+			Name:        ev.ToolName,
+			Description: desc,
+		})
+		sc.dirty = true
 
-	case jcodeproto.EventToolInput:
-		var e jcodeproto.ToolInputEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Route input to the last pending tool that hasn't been exec'd yet.
-			// tool_input events don't carry a tool ID, so we assume input
-			// belongs to the most recently started non-exec tool.
-			var targetID string
+	case agent.EventToolInputDelta:
+		// Route input delta to the correct pending tool.
+		// If ToolID is empty (jcode), fall back to the most recently started
+		// non-exec tool. If ToolID is set (claude), route by ID.
+		var targetID string
+		if ev.ToolID != "" {
+			targetID = ev.ToolID
+		} else {
 			for i := len(sc.pendingTools) - 1; i >= 0; i-- {
 				if !sc.pendingTools[i].Exec {
 					targetID = sc.pendingTools[i].ID
 					break
 				}
 			}
-			if targetID != "" {
-				buf, ok := sc.toolInputBufs[targetID]
-				if !ok {
-					buf = &strings.Builder{}
-					sc.toolInputBufs[targetID] = buf
-				}
-				buf.WriteString(e.Delta)
+		}
+		if targetID != "" {
+			buf, ok := sc.toolInputBufs[targetID]
+			if !ok {
+				buf = &strings.Builder{}
+				sc.toolInputBufs[targetID] = buf
 			}
+			buf.WriteString(ev.PartialJSON)
 		}
 
-	case jcodeproto.EventToolExec:
-		var e jcodeproto.ToolExecEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			for i := range sc.pendingTools {
-				if sc.pendingTools[i].ID == e.ID {
-					sc.pendingTools[i].Exec = true
-					// Parse accumulated tool input and update description.
-					if buf, ok := sc.toolInputBufs[e.ID]; ok && buf.Len() > 0 {
-						rawInput := buf.String()
-						var input map[string]any
-						if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
-							desc := render.Describe(e.Name, input)
-							sc.driftMonitor.Record(desc)
-							sc.pendingTools[i].Description = desc
+	case agent.EventToolExec:
+		for i := range sc.pendingTools {
+			if sc.pendingTools[i].ID == ev.ToolID {
+				sc.pendingTools[i].Exec = true
+				// Parse accumulated tool input and update description.
+				if buf, ok := sc.toolInputBufs[ev.ToolID]; ok && buf.Len() > 0 {
+					rawInput := buf.String()
+					var input map[string]any
+					if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
+						desc := render.Describe(ev.ToolName, input)
+						sc.driftMonitor.Record(desc)
+						sc.pendingTools[i].Description = desc
 
-							// Detect ScheduleWakeup and start countdown timer.
-							if e.Name == "ScheduleWakeup" {
-								sc.startCountdown(input)
-							}
-						} else {
-							slog.Debug("coalescer: failed to parse tool input",
-								"tool", e.Name, "err", err, "raw_len", len(rawInput))
+						// Detect ScheduleWakeup and start countdown timer.
+						if ev.ToolName == "ScheduleWakeup" {
+							sc.startCountdown(input)
 						}
-						delete(sc.toolInputBufs, e.ID)
+					} else {
+						slog.Debug("coalescer: failed to parse tool input",
+							"tool", ev.ToolName, "err", err, "raw_len", len(rawInput))
 					}
-					break
+					delete(sc.toolInputBufs, ev.ToolID)
 				}
-			}
-			sc.dirty = true
-		}
-
-	case jcodeproto.EventToolDone:
-		var e jcodeproto.ToolDoneEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			// Resolve description from the pending tool entry.
-			desc := e.Name
-			isError := e.Error != nil
-			for i := range sc.pendingTools {
-				if sc.pendingTools[i].ID == e.ID {
-					desc = sc.pendingTools[i].Description
-					sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
-					delete(sc.toolInputBufs, e.ID) // clean up any remaining input buffer
-					break
-				}
-			}
-			if desc == "" {
-				desc = e.Name
-			}
-
-			// Add to the interleaved stream (with sequential dedup).
-			sc.appendToolSegment(desc, isError)
-			sc.dirty = true
-			sc.checkOverflow()
-		}
-
-	case jcodeproto.EventUpstreamProvider:
-		var e jcodeproto.UpstreamProviderEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			sc.upstreamProvider = &e.Provider
-		}
-
-	case jcodeproto.EventGeneratedImage:
-		var e jcodeproto.GeneratedImageEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			caption := "Generated image"
-			if e.RevisedPrompt != nil {
-				caption = *e.RevisedPrompt
-			}
-			if sc.onImage != nil {
-				sc.onImage(ImageUploadRequest{
-					ChannelID: sc.channelID,
-					ThreadTS:  sc.threadTS,
-					Path:      e.Path,
-					Caption:   caption,
-				})
+				break
 			}
 		}
+		sc.dirty = true
 
-	case jcodeproto.EventMessageEnd:
+	case agent.EventToolDone:
+		// Resolve description from the pending tool entry.
+		desc := ev.ToolName
+		isError := ev.IsError
+		for i := range sc.pendingTools {
+			if sc.pendingTools[i].ID == ev.ToolID {
+				desc = sc.pendingTools[i].Description
+				sc.pendingTools = append(sc.pendingTools[:i], sc.pendingTools[i+1:]...)
+				delete(sc.toolInputBufs, ev.ToolID) // clean up any remaining input buffer
+				break
+			}
+		}
+		if desc == "" {
+			desc = ev.ToolName
+		}
+
+		// Add to the interleaved stream (with sequential dedup).
+		sc.appendToolSegment(desc, isError)
+		sc.dirty = true
+		sc.checkOverflow()
+
+	case agent.EventProvider:
+		sc.upstreamProvider = &ev.ProviderName
+
+	case agent.EventImageGenerated:
+		if sc.onImage != nil {
+			sc.onImage(ImageUploadRequest{
+				ChannelID: sc.channelID,
+				ThreadTS:  sc.threadTS,
+				Path:      ev.ImagePath,
+				Caption:   ev.ImageCaption,
+			})
+		}
+
+	case agent.EventMessageEnd:
 		sc.flushLocked(false)
 
-	case jcodeproto.EventDone:
+	case agent.EventTurnDone:
 		// Capture post-tool text as the final message for the done notification.
 		// Walk segments backwards to find the last text after the last tool.
 		sc.finalMessageText = ""
@@ -487,18 +463,15 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 		// Reset state for the next turn (same session, new response).
 		sc.resetForNextTurn()
 
-	case jcodeproto.EventError:
-		var e jcodeproto.ErrorEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			seg := sc.currentTextSegment()
-			seg.text.WriteString(fmt.Sprintf("\n\n❌ *Error:* %s", e.Message))
-			sc.dirty = true
-		}
+	case agent.EventTurnError:
+		seg := sc.currentTextSegment()
+		seg.text.WriteString(fmt.Sprintf("\n\n❌ *Error:* %s", ev.ErrorMessage))
+		sc.dirty = true
 		sc.finalized = true
 		sc.flushLocked(true)
 		sc.resetForNextTurn()
 
-	case jcodeproto.EventInterrupted:
+	case agent.EventInterrupted:
 		seg := sc.currentTextSegment()
 		seg.text.WriteString("\n\n⚠️ _Agent interrupted_")
 		sc.dirty = true
@@ -506,17 +479,10 @@ func (sc *SessionCoalescer) HandleEvent(ev *jcodeproto.ServerEvent) {
 		sc.flushLocked(true)
 		sc.resetForNextTurn()
 
-	case jcodeproto.EventNotification:
-		var e jcodeproto.NotificationEvent
-		if json.Unmarshal(ev.Raw, &e) == nil {
-			fromName := "agent"
-			if e.FromName != nil {
-				fromName = *e.FromName
-			}
-			seg := sc.currentTextSegment()
-			seg.text.WriteString(fmt.Sprintf("\n\n📢 _%s: %s_", fromName, e.Message))
-			sc.dirty = true
-		}
+	case agent.EventNotification:
+		seg := sc.currentTextSegment()
+		seg.text.WriteString(fmt.Sprintf("\n\n📢 _%s: %s_", ev.NotificationFrom, ev.NotificationMsg))
+		sc.dirty = true
 	}
 }
 
