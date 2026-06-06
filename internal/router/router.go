@@ -45,7 +45,8 @@ type WebhookEvent struct {
 type Router struct {
 	cfg      *config.Config
 	store    *store.Store
-	backend  agent.Backend
+	backend  agent.Backend // default (jcode) backend
+	claudeBackend agent.Backend // optional Claude backend (may be nil)
 	edge     *slack.Edge
 	outbound *outbound.Queue
 
@@ -69,6 +70,9 @@ type Router struct {
 	// keyed by coalescerKey. Used to @mention them when the turn completes.
 	turnRequester map[string]string // coalescerKey -> userID
 
+	// sessionBackend maps session ID to backend name for routing.
+	sessionBackend map[string]string // sessionID -> "jcode" or "claude"
+
 	inboundCh chan *slack.InboundMessage
 	webhookCh chan *WebhookEvent
 
@@ -78,10 +82,12 @@ type Router struct {
 }
 
 // New creates a Router with the given dependencies.
+// claudeBackend may be nil if Claude is not configured.
 func New(
 	cfg *config.Config,
 	st *store.Store,
 	backend agent.Backend,
+	claudeBackend agent.Backend,
 	edge *slack.Edge,
 	out *outbound.Queue,
 	configPath string,
@@ -90,6 +96,7 @@ func New(
 		cfg:                cfg,
 		store:              st,
 		backend:            backend,
+		claudeBackend:      claudeBackend,
 		edge:               edge,
 		outbound:           out,
 		routes:             cfg.Routes,
@@ -97,6 +104,7 @@ func New(
 		coalescerQueue:     make(map[string][]string),
 		threadLock:         make(map[string]string),
 		turnRequester:      make(map[string]string),
+		sessionBackend:     make(map[string]string),
 		inboundCh:          make(chan *slack.InboundMessage, 64),
 		webhookCh:          make(chan *WebhookEvent, 64),
 		maxQueuePerSession: 5,
@@ -402,6 +410,62 @@ func titleCase(s string) string {
 	return strings.Join(words, " ")
 }
 
+// backendFor determines which backend to use for a channel. Returns the
+// backend instance and its name ("jcode" or "claude"). Channel config takes
+// precedence, then the global routing.backend.default, then "jcode".
+func (r *Router) backendFor(channelID string) (agent.Backend, string) {
+	// Check per-channel override.
+	for _, ch := range r.cfg.Channels {
+		if ch.ID == channelID && ch.Backend != "" {
+			if be := r.backendByName(ch.Backend); be != nil {
+				return be, ch.Backend
+			}
+		}
+	}
+
+	// Global default.
+	def := r.cfg.Routing.Backend.Default
+	if def != "" {
+		if be := r.backendByName(def); be != nil {
+			return be, def
+		}
+	}
+
+	return r.backend, "jcode"
+}
+
+// backendByName returns the backend for the given name, or nil if unavailable.
+func (r *Router) backendByName(name string) agent.Backend {
+	switch name {
+	case "claude":
+		return r.claudeBackend // may be nil
+	case "jcode", "":
+		return r.backend
+	default:
+		return nil
+	}
+}
+
+// backendForSession returns the backend for an existing session, using the
+// in-memory sessionBackend map or falling back to the store-persisted value.
+func (r *Router) backendForSession(sessionID string, storeBackend string) agent.Backend {
+	r.mu.RLock()
+	name := r.sessionBackend[sessionID]
+	r.mu.RUnlock()
+
+	if name == "" {
+		name = storeBackend
+	}
+	if name == "" {
+		name = "jcode"
+	}
+
+	if be := r.backendByName(name); be != nil {
+		return be
+	}
+	return r.backend
+}
+
 // handleNewSession creates a new agent session and starts processing.
 func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage, workdir string, identity coalesce.Identity, threadTS string) {
 	slog.Info("router: creating new session",
@@ -413,10 +477,13 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Audit the inbound message.
 	r.auditSlackMessage(msg, threadTS)
 
+	// Select the backend for this channel.
+	be, backendName := r.backendFor(msg.ChannelID)
+
 	// Subscribe to a new agent session (may reuse existing for same workdir).
-	sessionID, events, err := r.backend.Subscribe(ctx, workdir)
+	sessionID, events, err := be.Subscribe(ctx, workdir)
 	if err != nil {
-		slog.Error("router: failed to subscribe to agent", "err", err, "workdir", workdir)
+		slog.Error("router: failed to subscribe to agent", "err", err, "workdir", workdir, "backend", backendName)
 		r.postError(msg.ChannelID, threadTS, "Agent is temporarily unavailable. Try again in a moment.")
 		return
 	}
@@ -437,10 +504,16 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		LastActivity: now,
 		Status:       "processing",
 		ExpiresAt:    &expiresAt,
+		Backend:      backendName,
 	}
 	if err := r.store.CreateSession(sess); err != nil {
 		slog.Error("router: failed to persist session", "err", err)
 	}
+
+	// Track which backend owns this session.
+	r.mu.Lock()
+	r.sessionBackend[sessionID] = backendName
+	r.mu.Unlock()
 
 	// Create coalescer for this thread.
 	friendlyName := extractFriendlyName(sessionID)
@@ -466,7 +539,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	// Send the user's message to agent.
 	var images []agent.Image
 	// TODO: handle file attachments -> images
-	if err := r.backend.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
+	if err := be.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
 		slog.Error("router: failed to send message to agent", "err", err)
 		r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
 		return
@@ -518,14 +591,17 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		// Add 👀 reaction.
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
+		// Resolve the correct backend for this session.
+		be := r.backendForSession(session.JcodeSession, session.Backend)
+
 		// Send message to agent. If the session is stale (e.g. jcode restarted),
 		// attempt to re-subscribe before giving up.
 		var images []agent.Image
-		if err := r.backend.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+		if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 			slog.Warn("router: send failed, attempting re-subscribe",
 				"session_id", session.JcodeSession, "err", err)
 
-			events, subErr := r.backend.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
+			events, subErr := be.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
 			if subErr != nil {
 				// Session is truly gone. Transparently create a new session
 				// in the same thread so the user doesn't notice the interruption.
@@ -544,7 +620,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 			// Re-subscribe succeeded; start event consumer and retry send.
 			go r.consumeEvents(ctx, session.JcodeSession, events)
-			if err := r.backend.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+			if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 				// Send still fails after re-subscribe. Create replacement session.
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
@@ -629,7 +705,8 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 			return false
 		}
 		if session.Status == "processing" {
-			if err := r.backend.Cancel(ctx, session.JcodeSession); err != nil {
+			be := r.backendForSession(session.JcodeSession, session.Backend)
+			if err := be.Cancel(ctx, session.JcodeSession); err != nil {
 				slog.Error("router: cancel failed", "err", err)
 			}
 			r.store.UpdateSessionStatus(msg.ChannelID, threadTS, "idle")
@@ -677,7 +754,7 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 		}
 		r.mu.Unlock()
 
-		if err := r.backend.SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
+		if err := r.backendForSession(session.JcodeSession, session.Backend).SendMessage(ctx, session.JcodeSession, slashCmd, nil); err != nil {
 			slog.Error("router: slash passthrough send failed", "err", err)
 			r.postError(msg.ChannelID, threadTS, "Failed to send command: "+err.Error())
 		}
@@ -844,7 +921,8 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 	r.mu.Unlock()
 
 	// Send combined message to agent.
-	if err := r.backend.SendMessage(ctx, sessionID, combined, nil); err != nil {
+	be := r.backendForSession(sessionID, "")
+	if err := be.SendMessage(ctx, sessionID, combined, nil); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
 		// Remove the coalKey we just added since the send failed.
@@ -1112,8 +1190,16 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 	startedConsumers := make(map[string]bool)
 
 	for _, sess := range sessions {
+		// Resolve backend for this session.
+		be := r.backendForSession(sess.JcodeSession, sess.Backend)
+
+		// Track which backend owns this session.
+		r.mu.Lock()
+		r.sessionBackend[sess.JcodeSession] = sess.Backend
+		r.mu.Unlock()
+
 		// Try to re-attach to the agent session.
-		events, err := r.backend.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
+		events, err := be.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
 		if err != nil {
 			slog.Warn("router: failed to recover session",
 				"session_id", sess.JcodeSession,

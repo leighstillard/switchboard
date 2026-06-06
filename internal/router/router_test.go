@@ -1,11 +1,183 @@
 package router
 
 import (
+	"context"
 	"testing"
 
 	"github.com/format5/switchboard/internal/agent"
+	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/llmrouter"
 )
+
+// ---------------------------------------------------------------------------
+// Mock backend for testing
+// ---------------------------------------------------------------------------
+
+type mockBackend struct {
+	name string
+}
+
+func (m *mockBackend) Subscribe(ctx context.Context, workdir string) (string, <-chan agent.Event, error) {
+	return "", nil, nil
+}
+func (m *mockBackend) SubscribeExisting(ctx context.Context, sessionID, workdir string) (<-chan agent.Event, error) {
+	return nil, nil
+}
+func (m *mockBackend) SendMessage(ctx context.Context, sessionID, content string, images []agent.Image) error {
+	return nil
+}
+func (m *mockBackend) Cancel(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockBackend) Close() error {
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Backend selector tests
+// ---------------------------------------------------------------------------
+
+func TestBackendFor_DefaultJcode(t *testing.T) {
+	jcodeBe := &mockBackend{name: "jcode"}
+	claudeBe := &mockBackend{name: "claude"}
+
+	r := &Router{
+		cfg: &config.Config{
+			Channels: []config.ChannelConfig{
+				{ID: "C111", Name: "test"},
+			},
+		},
+		backend:       jcodeBe,
+		claudeBackend: claudeBe,
+	}
+
+	be, name := r.backendFor("C111")
+	if name != "jcode" {
+		t.Errorf("expected jcode, got %q", name)
+	}
+	if be != jcodeBe {
+		t.Error("expected jcode backend instance")
+	}
+}
+
+func TestBackendFor_GlobalDefault(t *testing.T) {
+	jcodeBe := &mockBackend{name: "jcode"}
+	claudeBe := &mockBackend{name: "claude"}
+
+	r := &Router{
+		cfg: &config.Config{
+			Routing: config.RoutingConfig2{
+				Backend: config.BackendRoutingConfig{Default: "claude"},
+			},
+			Channels: []config.ChannelConfig{
+				{ID: "C111", Name: "test"},
+			},
+		},
+		backend:       jcodeBe,
+		claudeBackend: claudeBe,
+	}
+
+	be, name := r.backendFor("C111")
+	if name != "claude" {
+		t.Errorf("expected claude, got %q", name)
+	}
+	if be != claudeBe {
+		t.Error("expected claude backend instance")
+	}
+}
+
+func TestBackendFor_ChannelOverride(t *testing.T) {
+	jcodeBe := &mockBackend{name: "jcode"}
+	claudeBe := &mockBackend{name: "claude"}
+
+	r := &Router{
+		cfg: &config.Config{
+			Routing: config.RoutingConfig2{
+				Backend: config.BackendRoutingConfig{Default: "jcode"},
+			},
+			Channels: []config.ChannelConfig{
+				{ID: "C111", Name: "jcode-channel"},
+				{ID: "C222", Name: "claude-channel", Backend: "claude"},
+			},
+		},
+		backend:       jcodeBe,
+		claudeBackend: claudeBe,
+	}
+
+	// C111: no override -> default jcode
+	be, name := r.backendFor("C111")
+	if name != "jcode" {
+		t.Errorf("C111: expected jcode, got %q", name)
+	}
+	if be != jcodeBe {
+		t.Error("C111: expected jcode backend")
+	}
+
+	// C222: override to claude
+	be, name = r.backendFor("C222")
+	if name != "claude" {
+		t.Errorf("C222: expected claude, got %q", name)
+	}
+	if be != claudeBe {
+		t.Error("C222: expected claude backend")
+	}
+}
+
+func TestBackendFor_ClaudeNilFallback(t *testing.T) {
+	jcodeBe := &mockBackend{name: "jcode"}
+
+	r := &Router{
+		cfg: &config.Config{
+			Routing: config.RoutingConfig2{
+				Backend: config.BackendRoutingConfig{Default: "claude"},
+			},
+			Channels: []config.ChannelConfig{
+				{ID: "C111", Name: "test"},
+			},
+		},
+		backend:       jcodeBe,
+		claudeBackend: nil, // Claude not configured
+	}
+
+	// Claude is default but nil: should fall back to jcode.
+	be, name := r.backendFor("C111")
+	if name != "jcode" {
+		t.Errorf("expected jcode fallback, got %q", name)
+	}
+	if be != jcodeBe {
+		t.Error("expected jcode backend when claude is nil")
+	}
+}
+
+func TestBackendForSession(t *testing.T) {
+	jcodeBe := &mockBackend{name: "jcode"}
+	claudeBe := &mockBackend{name: "claude"}
+
+	r := &Router{
+		cfg:            &config.Config{},
+		backend:        jcodeBe,
+		claudeBackend:  claudeBe,
+		sessionBackend: map[string]string{"sess-1": "claude", "sess-2": "jcode"},
+	}
+
+	// In-memory lookup.
+	be := r.backendForSession("sess-1", "")
+	if be != claudeBe {
+		t.Error("sess-1: expected claude backend from in-memory map")
+	}
+
+	// Fallback to store value.
+	be = r.backendForSession("sess-3", "claude")
+	if be != claudeBe {
+		t.Error("sess-3: expected claude backend from store fallback")
+	}
+
+	// Default jcode.
+	be = r.backendForSession("sess-4", "")
+	if be != jcodeBe {
+		t.Error("sess-4: expected jcode backend as default")
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Issue 2: handleTurnEnd should not send ✅ for error/interrupted events

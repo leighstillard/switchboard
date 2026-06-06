@@ -17,6 +17,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/format5/switchboard/internal/agent"
+	"github.com/format5/switchboard/internal/agent/claude"
 	"github.com/format5/switchboard/internal/agent/jcodeadapter"
 	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/cron"
@@ -106,6 +108,20 @@ func main() {
 	// Wrap jcode client in the agent backend adapter.
 	backend := jcodeadapter.New(jc)
 
+	// 2b. Claude backend (optional, constructed if configured)
+	var claudeBackend agent.Backend
+	if claudeNeeded(cfg) {
+		claudeCfg := claude.Config{
+			Binary:             cfg.Claude.Binary,
+			PermissionMode:     cfg.Claude.PermissionMode,
+			Model:              cfg.Claude.Model,
+			AppendSystemPrompt: cfg.Claude.AppendSystemPrompt,
+			ExtraArgs:          cfg.Claude.ExtraArgs,
+		}
+		claudeBackend = claude.New(claudeCfg)
+		slog.Info("claude backend initialized", "model", claudeCfg.Model)
+	}
+
 	// 3. Slack edge
 	edge, err := slack.NewEdge(cfg.Slack, cfg.Channels, cfg.Identities)
 	if err != nil {
@@ -121,7 +137,7 @@ func main() {
 	ing := ingest.NewServer(cfg.Ingest, st)
 
 	// 6. Router (wires everything together)
-	rt := router.New(cfg, st, backend, edge, out, *configPath)
+	rt := router.New(cfg, st, backend, claudeBackend, edge, out, *configPath)
 
 	// 7. Cron scheduler (merge config + DB jobs)
 	cronJobs := mergeCronJobs(cronJobsFromConfig(cfg.Crons), cronJobsFromDB(st))
@@ -246,6 +262,20 @@ func defaultConfigPath() string {
 		return "config.toml"
 	}
 	return fmt.Sprintf("%s/.config/switchboard/config.toml", home)
+}
+
+// claudeNeeded returns true if any channel or the global default uses the
+// "claude" backend.
+func claudeNeeded(cfg *config.Config) bool {
+	if cfg.Routing.Backend.Default == "claude" {
+		return true
+	}
+	for _, ch := range cfg.Channels {
+		if ch.Backend == "claude" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseLogLevel(s string) slog.Level {
