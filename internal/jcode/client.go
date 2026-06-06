@@ -134,7 +134,11 @@ func (c *Client) Subscribe(ctx context.Context, workdir string) (string, <-chan 
 		if attempt < maxAttempts && strings.Contains(err.Error(), "no session_id received") {
 			slog.Warn("jcode: subscribe race detected, retrying",
 				"workdir", workdir, "attempt", attempt, "err", err)
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 			continue
 		}
 		return "", nil, err
@@ -190,27 +194,32 @@ func (c *Client) trySubscribe(ctx context.Context, workdir string) (string, <-ch
 
 // SubscribeExisting reconnects to an existing session by ID.
 // workdir is stored for deduplication (Subscribe reuses sessions with matching workdir).
-func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir string) (<-chan *jcodeproto.ServerEvent, error) {
+//
+// The returned bool reports whether a new connection (and reader goroutine) was
+// created. When false, the channel belongs to an already-connected session that
+// already has a single event consumer; callers MUST NOT start another consumer
+// on it, or events will be split nondeterministically between goroutines.
+func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir string) (<-chan *jcodeproto.ServerEvent, bool, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, errors.New("jcode: client closed")
+		return nil, false, errors.New("jcode: client closed")
 	}
 	// Check if we already have this session connected.
 	if sc, ok := c.sessions[targetSessionID]; ok {
 		c.mu.Unlock()
 		slog.Info("jcode: reusing existing connection for session", "session_id", targetSessionID)
-		return sc.events, nil
+		return sc.events, false, nil
 	}
 	c.mu.Unlock()
 
 	if err := c.ensureDaemon(ctx); err != nil {
-		return nil, fmt.Errorf("jcode: ensure daemon: %w", err)
+		return nil, false, fmt.Errorf("jcode: ensure daemon: %w", err)
 	}
 
 	conn, err := c.dial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("jcode: dial: %w", err)
+		return nil, false, fmt.Errorf("jcode: dial: %w", err)
 	}
 
 	sc := &sessionConn{
@@ -228,14 +237,14 @@ func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir
 	req := jcodeproto.NewSubscribeResume(reqID, targetSessionID, false)
 	if err := sc.writeJSON(req); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("jcode: send subscribe: %w", err)
+		return nil, false, fmt.Errorf("jcode: send subscribe: %w", err)
 	}
 
 	// Wait for session confirmation.
 	gotID, err := sc.waitForSession(ctx)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("jcode: wait for session: %w", err)
+		return nil, false, fmt.Errorf("jcode: wait for session: %w", err)
 	}
 	if gotID != targetSessionID {
 		slog.Warn("jcode: session ID mismatch", "expected", targetSessionID, "got", gotID)
@@ -250,7 +259,7 @@ func (c *Client) SubscribeExisting(ctx context.Context, targetSessionID, workdir
 	go sc.keepaliveLoop()
 
 	slog.Info("jcode: subscribed to existing session", "session_id", sc.sessionID)
-	return sc.events, nil
+	return sc.events, true, nil
 }
 
 // SendMessage sends a user message to the specified session.

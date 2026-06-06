@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/format5/switchboard/internal/coalesce"
@@ -44,7 +45,10 @@ type WebhookEvent struct {
 
 // Router orchestrates message flow between Slack, jcode, and webhook sources.
 type Router struct {
-	cfg      *config.Config
+	// cfg holds the active configuration. It is swapped wholesale on SIGHUP
+	// reload via Reload and read concurrently by hot-path handlers, so it is
+	// stored in an atomic.Pointer to avoid data races. Read it via r.config().
+	cfg      atomic.Pointer[config.Config]
 	store    *store.Store
 	jcode    *jcode.Client
 	edge     *slack.Edge
@@ -88,7 +92,6 @@ func New(
 	configPath string,
 ) *Router {
 	r := &Router{
-		cfg:                cfg,
 		store:              st,
 		jcode:              jc,
 		edge:               edge,
@@ -103,6 +106,7 @@ func New(
 		maxQueuePerSession: 5,
 		configPath:         configPath,
 	}
+	r.cfg.Store(cfg)
 
 	// Initialize LLM router if configured.
 	if cfg.Routing.LLM.Enabled {
@@ -206,9 +210,10 @@ func (r *Router) InjectMessage(channelID, threadTS, userID, text string) string 
 // Reload updates the full configuration (called on SIGHUP).
 // This replaces routes, channels, GitHub config, and identities.
 func (r *Router) Reload(newCfg *config.Config) {
+	r.cfg.Store(newCfg)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cfg = newCfg
 	r.routes = newCfg.Routes
 
 	// Recreate or tear down LLM router based on new config.
@@ -449,7 +454,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 		sessionID, friendlyName, msg.ChannelID, threadTS, workdir,
 		identity, r.outbound, r.handleImage,
 	)
-	coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
+	coal.SetStrictDirectives(r.config().Render.StrictDirectiveValidation)
 	key := coalescerKey(msg.ChannelID, threadTS)
 	r.mu.Lock()
 	r.coalescers[key] = coal
@@ -526,7 +531,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 			slog.Warn("router: send failed, attempting re-subscribe",
 				"session_id", session.JcodeSession, "err", err)
 
-			events, subErr := r.jcode.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
+			events, newConn, subErr := r.jcode.SubscribeExisting(ctx, session.JcodeSession, session.Workdir)
 			if subErr != nil {
 				// Session is truly gone. Transparently create a new session
 				// in the same thread so the user doesn't notice the interruption.
@@ -543,8 +548,13 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				return
 			}
 
-			// Re-subscribe succeeded; start event consumer and retry send.
-			go r.consumeEvents(ctx, session.JcodeSession, events)
+			// Re-subscribe succeeded; start an event consumer only if a new
+			// connection was created. If the session was already connected,
+			// SubscribeExisting returns the existing channel which already has a
+			// consumer; starting another would split events nondeterministically.
+			if newConn {
+				go r.consumeEvents(ctx, session.JcodeSession, events)
+			}
 			if err := r.jcode.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 				// Send still fails after re-subscribe. Create replacement session.
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
@@ -571,7 +581,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 				msg.ChannelID, threadTS, session.Workdir,
 				identity, r.outbound, r.handleImage,
 			)
-			coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
+			coal.SetStrictDirectives(r.config().Render.StrictDirectiveValidation)
 			r.coalescers[key] = coal
 		}
 		// Ensure event consumer routes to this coalescer for the next turn.
@@ -773,12 +783,19 @@ func shouldNotifySuccess(eventType string) bool {
 	return eventType == jcodeproto.EventDone
 }
 
-// dropNextKeyFromQueue removes the front entry from the coalescerQueue for the
-// given sessionID, but only if it matches expectedKey. This is used to clean up
-// after a failed SendMessage for a next-thread batch.
+// dropNextKeyFromQueue removes the entry that handleTurnEnd appended to the tail
+// of the coalescerQueue for the given sessionID, used to clean up after a failed
+// SendMessage for a next-thread batch. It removes the last entry matching
+// expectedKey (the one just appended) so a different thread already at the front
+// of the queue is preserved; otherwise the appended key would leak and could
+// later acquire the session lock without an active turn.
 func dropNextKeyFromQueue(queue map[string][]string, sessionID, expectedKey string) {
-	if q := queue[sessionID]; len(q) > 0 && q[0] == expectedKey {
-		queue[sessionID] = q[1:]
+	q := queue[sessionID]
+	for i := len(q) - 1; i >= 0; i-- {
+		if q[i] == expectedKey {
+			queue[sessionID] = append(q[:i:i], q[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -920,7 +937,7 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 		}
 
 		// No LLM router: post to fallback channel.
-		fallbackID := r.cfg.Ingest.FallbackChannelID
+		fallbackID := r.config().Ingest.FallbackChannelID
 		if fallbackID != "" {
 			text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
 				evt.Source, evt.EventType, truncateJSON(evt.Payload, 500))
@@ -931,7 +948,7 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 				Text:      text,
 			})
 		}
-		r.auditWebhookRouting(evt, "fallback", r.cfg.Ingest.FallbackChannelID)
+		r.auditWebhookRouting(evt, "fallback", r.config().Ingest.FallbackChannelID)
 		return
 	}
 
@@ -1015,17 +1032,18 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 // from config, formats the message with GitHub-aware rendering, and posts to
 // the appropriate channel (or fallback).
 func (r *Router) handleGitHubWebhook(ctx context.Context, evt *WebhookEvent) {
+	cfg := r.config()
 	repo := ghRepoName(evt.Payload)
 	destChannelID := ""
 
 	// Look up repo in the github.repos mapping.
-	if repo != "" && r.cfg.GitHub.Repos != nil {
-		destChannelID = r.cfg.GitHub.Repos[repo]
+	if repo != "" && cfg.GitHub.Repos != nil {
+		destChannelID = cfg.GitHub.Repos[repo]
 	}
 
 	// Fallback to configured fallback channel.
 	if destChannelID == "" {
-		destChannelID = r.cfg.Ingest.FallbackChannelID
+		destChannelID = cfg.Ingest.FallbackChannelID
 	}
 
 	if destChannelID == "" {
@@ -1126,7 +1144,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 
 	for _, sess := range sessions {
 		// Try to re-attach to the jcode session.
-		events, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
+		events, newConn, err := r.jcode.SubscribeExisting(ctx, sess.JcodeSession, sess.Workdir)
 		if err != nil {
 			slog.Warn("router: failed to recover session",
 				"session_id", sess.JcodeSession,
@@ -1144,7 +1162,7 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 			sess.ChannelID, sess.ThreadTS, sess.Workdir,
 			identity, r.outbound, r.handleImage,
 		)
-		coal.SetStrictDirectives(r.cfg.Render.StrictDirectiveValidation)
+		coal.SetStrictDirectives(r.config().Render.StrictDirectiveValidation)
 
 		key := coalescerKey(sess.ChannelID, sess.ThreadTS)
 		r.mu.Lock()
@@ -1160,8 +1178,10 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 		}
 		r.mu.Unlock()
 
-		// Start consuming events (only one consumer per jcode session).
-		if !startedConsumers[sess.JcodeSession] {
+		// Start consuming events (only one consumer per jcode session). Skip if
+		// SubscribeExisting reused an already-connected session, which already
+		// has a consumer.
+		if newConn && !startedConsumers[sess.JcodeSession] {
 			startedConsumers[sess.JcodeSession] = true
 			go r.consumeEvents(ctx, sess.JcodeSession, events)
 		}
@@ -1186,8 +1206,8 @@ func (r *Router) recoverSessions(ctx context.Context) error {
 func (r *Router) handleWebhookLLMRouting(ctx context.Context, evt *WebhookEvent) {
 	r.mu.RLock()
 	llm := r.llmRouter
-	fallbackID := r.cfg.Ingest.FallbackChannelID
 	r.mu.RUnlock()
+	fallbackID := r.config().Ingest.FallbackChannelID
 
 	if llm == nil {
 		return
@@ -1360,7 +1380,7 @@ func (r *Router) buildThreadContext() []llmrouter.ThreadContext {
 	}
 
 	// Cap to include_thread_count (default 30).
-	limit := r.cfg.Routing.LLM.IncludeThreadCount
+	limit := r.config().Routing.LLM.IncludeThreadCount
 	if limit == 0 {
 		limit = 30
 	}
@@ -1460,9 +1480,16 @@ func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchRe
 // Helpers
 // ---------------------------------------------------------------------------
 
+// config returns the current configuration. It is safe to call concurrently
+// with Reload, which swaps the pointer atomically.
+func (r *Router) config() *config.Config {
+	return r.cfg.Load()
+}
+
 // resolveChannel looks up the workdir and identity for a channel_id.
 func (r *Router) resolveChannel(channelID string) (string, coalesce.Identity) {
-	for _, ch := range r.cfg.Channels {
+	cfg := r.config()
+	for _, ch := range cfg.Channels {
 		if ch.ID == channelID {
 			return ch.Workdir, coalesce.Identity{
 				DisplayName: ch.Identity,
@@ -1472,12 +1499,12 @@ func (r *Router) resolveChannel(channelID string) (string, coalesce.Identity) {
 	}
 
 	// DMs: use default workdir if configured.
-	if strings.HasPrefix(channelID, "D") && r.cfg.Bridge.DefaultWorkdir != "" {
-		return r.cfg.Bridge.DefaultWorkdir, coalesce.Identity{DisplayName: "Assistant"}
+	if strings.HasPrefix(channelID, "D") && cfg.Bridge.DefaultWorkdir != "" {
+		return cfg.Bridge.DefaultWorkdir, coalesce.Identity{DisplayName: "Assistant"}
 	}
 
 	// Workspace fallback.
-	if r.cfg.Bridge.Routing.WorkspaceFallback {
+	if cfg.Bridge.Routing.WorkspaceFallback {
 		name := r.edge.ChannelName(channelID)
 		if name != "" {
 			home, _ := filepath.Abs(filepath.Join("~/workspace", name))
@@ -1548,7 +1575,7 @@ func (r *Router) NotifyShutdown() {
 
 func (r *Router) runMaintenance() {
 	cfg := store.MaintenanceConfig{
-		AuditRetentionDays:         r.cfg.Bridge.Audit.RetentionDays,
+		AuditRetentionDays:         r.config().Bridge.Audit.RetentionDays,
 		DoneWebhookRetentionDays:   7,
 		FailedWebhookRetentionDays: 30,
 		MaxCorrelationRows:         10000,

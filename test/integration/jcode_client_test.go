@@ -93,7 +93,7 @@ func TestJcodeClient(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		events, err := c.SubscribeExisting(ctx, sharedSessionID, testWorkdir)
+		events, _, err := c.SubscribeExisting(ctx, sharedSessionID, testWorkdir)
 		if err != nil {
 			t.Fatalf("SubscribeExisting: %v", err)
 		}

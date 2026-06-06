@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,15 +27,15 @@ func TestSubscribeRetryOnNoSessionID(t *testing.T) {
 	}
 	defer listener.Close()
 
-	attempt := 0
+	var attempt atomic.Int32
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			attempt++
-			go handleFakeConn(t, conn, attempt)
+			currentAttempt := int(attempt.Add(1))
+			go handleFakeConn(t, conn, currentAttempt)
 		}
 	}()
 
@@ -61,8 +62,8 @@ func TestSubscribeRetryOnNoSessionID(t *testing.T) {
 	}
 
 	// Verify it took 2 attempts (first failed with race, second succeeded).
-	if attempt != 2 {
-		t.Errorf("expected 2 attempts, got %d", attempt)
+	if got := attempt.Load(); got != 2 {
+		t.Errorf("expected 2 attempts, got %d", got)
 	}
 
 	// Close client to stop background goroutines.

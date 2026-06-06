@@ -1,8 +1,10 @@
 package router
 
 import (
+	"sync"
 	"testing"
 
+	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/jcodeproto"
 	"github.com/format5/switchboard/internal/llmrouter"
 )
@@ -33,6 +35,54 @@ func TestShouldNotifySuccess(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Config reload race: r.cfg is read on hot paths while Reload swaps it on
+// SIGHUP. The atomic.Pointer must allow concurrent reads and writes without a
+// data race. Run with -race to validate.
+// ---------------------------------------------------------------------------
+
+func TestConfigReloadRace(t *testing.T) {
+	r := &Router{}
+	r.cfg.Store(&config.Config{
+		Channels: []config.ChannelConfig{
+			{ID: "C123", Workdir: "/tmp/a", Identity: "alpha"},
+		},
+	})
+
+	var wg sync.WaitGroup
+	const iterations = 1000
+
+	// Writer: swap the config pointer repeatedly (mirrors Reload's r.cfg.Store).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			r.cfg.Store(&config.Config{
+				Channels: []config.ChannelConfig{
+					{ID: "C123", Workdir: "/tmp/a", Identity: "alpha"},
+				},
+			})
+		}
+	}()
+
+	// Readers: hit resolveChannel (reads r.cfg) concurrently. The matching
+	// channel returns before any edge access, so nil deps are safe here.
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if wd, _ := r.resolveChannel("C123"); wd != "/tmp/a" {
+					t.Errorf("resolveChannel: got %q, want /tmp/a", wd)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +126,26 @@ func TestDropNextKeyOnSendFailure_PreservesOtherKeys(t *testing.T) {
 
 	if q := queue[sessionID]; len(q) != 1 || q[0] != otherKey {
 		t.Errorf("expected queue to contain only otherKey, got %v", q)
+	}
+}
+
+// TestDropNextKeyOnSendFailure_RemovesAppendedTail reproduces the case where
+// handleTurnEnd appends the coalKey to the TAIL of the queue while a different
+// thread is already at the front. On send failure the appended tail entry must
+// be removed, not the front entry (which belongs to another active thread).
+func TestDropNextKeyOnSendFailure_RemovesAppendedTail(t *testing.T) {
+	sessionID := "session_fox_123_abc"
+	frontKey := "C456:9876543210.654321" // another thread already at front
+	coalKey := "C123:1234567890.123456"  // the key handleTurnEnd appended
+
+	queue := map[string][]string{
+		sessionID: {frontKey, coalKey},
+	}
+
+	dropNextKeyFromQueue(queue, sessionID, coalKey)
+
+	if q := queue[sessionID]; len(q) != 1 || q[0] != frontKey {
+		t.Errorf("expected queue to retain only frontKey, got %v", q)
 	}
 }
 
