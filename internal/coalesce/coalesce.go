@@ -682,6 +682,14 @@ func (sc *SessionCoalescer) setProgressMessageTSGuarded(ts string, expectedTurnI
 func (sc *SessionCoalescer) checkOverflow() {
 	estimated := sc.estimateRenderedLen()
 	if estimated > maxSlackTextLen {
+		// Don't split while the initial Slack post is still awaiting its TS
+		// (placeholder ""). flushLocked can't update a message that hasn't
+		// been posted yet, so clearing segments here would drop buffered
+		// content and fork the turn into a second top-level message once the
+		// first post finally resolves. Hold off until the TS is known.
+		if sc.progressMessageTS != nil && *sc.progressMessageTS == "" {
+			return
+		}
 		// Flush current content as a finalized message, then reset.
 		sc.flushLocked(false)
 		// Start new progress message. Bump turnID so any in-flight OnPosted
