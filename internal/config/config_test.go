@@ -264,6 +264,90 @@ name = "test"
 	}
 }
 
+func TestBackendConfig(t *testing.T) {
+	os.Setenv("SLACK_APP_TOKEN", "xapp-test")
+	os.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
+	defer func() {
+		os.Unsetenv("SLACK_APP_TOKEN")
+		os.Unsetenv("SLACK_BOT_TOKEN")
+	}()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	content := `
+[bridge]
+name = "test"
+data_dir = "` + dir + `/data"
+
+[slack]
+app_token = "${SLACK_APP_TOKEN}"
+bot_token = "${SLACK_BOT_TOKEN}"
+
+[jcode]
+socket_path = ""
+
+[routing.backend]
+default = "claude"
+
+[claude]
+binary = "/usr/local/bin/claude"
+permission_mode = "bypassPermissions"
+model = "claude-sonnet-4-20250514"
+append_system_prompt = "Be concise"
+extra_args = ["--max-turns", "5"]
+
+[[channels]]
+id = "C0123ABCDEF"
+name = "jcode-chan"
+workdir = "` + dir + `/w1"
+
+[[channels]]
+id = "C0456GHIJKL"
+name = "claude-chan"
+workdir = "` + dir + `/w2"
+backend = "claude"
+model = "claude-sonnet-4-20250514"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Global backend default.
+	if cfg.Routing.Backend.Default != "claude" {
+		t.Errorf("routing.backend.default = %q, want claude", cfg.Routing.Backend.Default)
+	}
+
+	// Claude config.
+	if cfg.Claude.Binary != "/usr/local/bin/claude" {
+		t.Errorf("claude.binary = %q", cfg.Claude.Binary)
+	}
+	if cfg.Claude.Model != "claude-sonnet-4-20250514" {
+		t.Errorf("claude.model = %q", cfg.Claude.Model)
+	}
+	if cfg.Claude.AppendSystemPrompt != "Be concise" {
+		t.Errorf("claude.append_system_prompt = %q", cfg.Claude.AppendSystemPrompt)
+	}
+	if len(cfg.Claude.ExtraArgs) != 2 || cfg.Claude.ExtraArgs[0] != "--max-turns" {
+		t.Errorf("claude.extra_args = %v", cfg.Claude.ExtraArgs)
+	}
+
+	// Per-channel backend.
+	if cfg.Channels[0].Backend != "" {
+		t.Errorf("channels[0].backend = %q, want empty", cfg.Channels[0].Backend)
+	}
+	if cfg.Channels[1].Backend != "claude" {
+		t.Errorf("channels[1].backend = %q, want claude", cfg.Channels[1].Backend)
+	}
+	if cfg.Channels[1].Model != "claude-sonnet-4-20250514" {
+		t.Errorf("channels[1].model = %q", cfg.Channels[1].Model)
+	}
+}
+
 func TestExpandPath(t *testing.T) {
 	home, _ := os.UserHomeDir()
 
