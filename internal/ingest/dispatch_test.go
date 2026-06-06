@@ -30,7 +30,7 @@ func TestDispatchEndpoint_Success(t *testing.T) {
 		"user_id":    "U0USER",
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/dispatch", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.srv.Handler.ServeHTTP(w, req)
 
@@ -71,7 +71,7 @@ func TestDispatchEndpoint_NotConfigured(t *testing.T) {
 		"prompt":     "deploy",
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/dispatch", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.srv.Handler.ServeHTTP(w, req)
 
@@ -93,12 +93,41 @@ func TestDispatchEndpoint_MissingFields(t *testing.T) {
 		// no prompt
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/dispatch", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.srv.Handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestDispatchEndpoint_UnauthorizedWhenSecretConfigured(t *testing.T) {
+	st := testStore(t)
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources: map[string]config.SourceConfig{
+			"dispatch": {Secret: "0123456789abcdef0123456789abcdef"},
+		},
+	}
+	srv := NewServer(cfg, st)
+	srv.SetDispatchHandler(func(ctx context.Context, channelID, prompt, userID string) (string, string, error) {
+		return "1234567890.123456", "session_test_123", nil
+	})
+
+	body, _ := json.Marshal(map[string]string{
+		"channel_id": "C0ABC123",
+		"prompt":     "deploy",
+	})
+
+	// No signature header => verification must fail.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/dispatch", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
 	}
 }
 
@@ -110,7 +139,7 @@ func TestDispatchEndpoint_MethodNotAllowed(t *testing.T) {
 		return "", "", nil
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/dispatch", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dispatch", nil)
 	w := httptest.NewRecorder()
 	srv.srv.Handler.ServeHTTP(w, req)
 

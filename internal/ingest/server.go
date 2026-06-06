@@ -214,14 +214,20 @@ func (s *Server) handleWebhook(source string) http.HandlerFunc {
 				"idempotency_key": idempotencyKey,
 			})
 			routedBy := "ingested"
-			s.store.InsertAudit(&store.AuditEntry{
+			if err := s.store.InsertAudit(&store.AuditEntry{
 				TS:                 time.Now().Unix(),
 				Source:             source,
 				EventType:          "webhook_received",
 				RoutedBy:           &routedBy,
 				PayloadSummaryJSON: string(summary),
 				PayloadHash:        hex.EncodeToString(hash[:]),
-			})
+			}); err != nil {
+				slog.Warn("ingest: failed to write webhook audit entry",
+					"source", source,
+					"idempotency_key", idempotencyKey,
+					"err", err,
+				)
+			}
 		}
 
 		w.WriteHeader(http.StatusAccepted)
@@ -255,12 +261,37 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the request body before reading to avoid memory/CPU pressure from
+	// oversized prompts. Mirrors the limit used by the webhook handler.
+	maxBody := int64(s.cfg.MaxBodyKB) * 1024
+	if maxBody <= 0 {
+		maxBody = 1024 * 1024 // default 1MB
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxBody {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Authenticate using the same HMAC scheme as the webhook routes, keyed by
+	// the "dispatch" source. If no secret is configured for "dispatch",
+	// verifySignature skips the check (dev mode), matching webhook behavior.
+	if !s.verifySignature("dispatch", r, body) {
+		slog.Warn("ingest: dispatch HMAC verification failed", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		ChannelID string `json:"channel_id"`
 		Prompt    string `json:"prompt"`
 		UserID    string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}

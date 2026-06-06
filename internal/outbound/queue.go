@@ -622,16 +622,25 @@ func isMsgTooLong(err error) bool {
 
 // truncateForSlack truncates text to fit within Slack's chat.update limit.
 // It tries to break at the last newline before maxLen to avoid mid-line cuts.
+// The truncation suffix is accounted for so the returned string never exceeds
+// maxLen (which would otherwise re-trigger msg_too_long).
 func truncateForSlack(text string, maxLen int) string {
+	const suffix = "\n\n_...message truncated (exceeded Slack limit)_"
+
 	if len(text) <= maxLen {
 		return text
 	}
-	// Find last newline before the limit.
-	cutoff := text[:maxLen]
-	if idx := lastIndexByte(cutoff, '\n'); idx > maxLen/2 {
-		return text[:idx] + "\n\n_...message truncated (exceeded Slack limit)_"
+	if maxLen <= len(suffix) {
+		return suffix[:maxLen]
 	}
-	return text[:maxLen] + "\n\n_...message truncated (exceeded Slack limit)_"
+	limit := maxLen - len(suffix)
+
+	// Find last newline before the limit.
+	cutoff := text[:limit]
+	if idx := lastIndexByte(cutoff, '\n'); idx > limit/2 {
+		return text[:idx] + suffix
+	}
+	return text[:limit] + suffix
 }
 
 func lastIndexByte(s string, c byte) int {

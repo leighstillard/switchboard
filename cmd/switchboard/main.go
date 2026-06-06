@@ -178,7 +178,13 @@ func main() {
 		case syscall.SIGINT, syscall.SIGTERM:
 			// Check for active processing sessions before shutting down.
 			if !forceShutdown {
-				sessions, _ := st.ListActiveSessions()
+				sessions, err := st.ListActiveSessions()
+				if err != nil {
+					slog.Warn("shutdown check failed; unable to inspect active sessions", "err", err)
+					slog.Warn("send signal again to force shutdown")
+					forceShutdown = true
+					continue
+				}
 				var processing []string
 				for _, s := range sessions {
 					if s.Status == "processing" {

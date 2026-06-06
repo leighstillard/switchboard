@@ -281,8 +281,16 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	// Reply in owned thread: always process (no mention needed).
 	// DM to bot: always process.
 
-	mentionsBot := strings.Contains(ev.Text, "<@"+e.botUserID+">")
-	mentionsOther := hasMentionOtherThan(ev.Text, e.botUserID)
+	// Only classify mentions when we know our own bot user ID. If AuthTest
+	// failed at startup, botUserID is empty; in that state a "<@U...>" mention
+	// would otherwise be misclassified as MentionsOther and could trigger
+	// downstream ignore logic for valid replies.
+	mentionsBot := false
+	mentionsOther := false
+	if e.botUserID != "" {
+		mentionsBot = strings.Contains(ev.Text, "<@"+e.botUserID+">")
+		mentionsOther = hasMentionOtherThan(ev.Text, e.botUserID)
+	}
 	text := e.stripBotMention(ev.Text)
 
 	// Extract files from the Message field (populated by custom UnmarshalJSON).
