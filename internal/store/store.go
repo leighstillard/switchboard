@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 // Domain types
 // ---------------------------------------------------------------------------
 
-// Session represents a mapping between a Slack thread and a jcode session.
+// Session represents a mapping between a Slack thread and an agent session.
 type Session struct {
 	ChannelID    string
 	ThreadTS     string
@@ -32,6 +33,7 @@ type Session struct {
 	LastActivity int64
 	Status       string // "idle", "processing", "closed"
 	ExpiresAt    *int64
+	Backend      string // "jcode" or "claude"
 }
 
 // TurnQueueItem represents a queued user message awaiting delivery.
@@ -236,6 +238,11 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("v3: %w", err)
 		}
 	}
+	if version < 4 {
+		if err := migrateV4(db); err != nil {
+			return fmt.Errorf("v4: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -408,6 +415,27 @@ func migrateV3(db *sql.DB) error {
 	return err
 }
 
+func migrateV4(db *sql.DB) error {
+	// Add backend column to sessions table. Uses IF NOT EXISTS-style
+	// idempotency: ALTER TABLE ADD COLUMN fails if the column already
+	// exists, which we treat as success (prior partial migration).
+	_, err := db.Exec(`ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'jcode'`)
+	if err != nil {
+		// SQLite returns "duplicate column name" if it already exists.
+		if !isDuplicateColumnErr(err) {
+			return fmt.Errorf("add backend column: %w", err)
+		}
+	}
+
+	_, err = db.Exec("PRAGMA user_version = 4")
+	return err
+}
+
+// isDuplicateColumnErr checks if a SQLite error is a "duplicate column name" error.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
+}
+
 // ---------------------------------------------------------------------------
 // Cron Jobs
 // ---------------------------------------------------------------------------
@@ -526,12 +554,17 @@ func (s *Store) CreateSession(sess *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	backend := sess.Backend
+	if backend == "" {
+		backend = "jcode"
+	}
+
 	_, err := s.db.Exec(`
 		INSERT INTO sessions (channel_id, thread_ts, jcode_session, friendly_name,
-		                      workdir, created_at, last_activity, status, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                      workdir, created_at, last_activity, status, expires_at, backend)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ChannelID, sess.ThreadTS, sess.JcodeSession, nilIfEmpty(sess.FriendlyName),
-		sess.Workdir, sess.CreatedAt, sess.LastActivity, sess.Status, sess.ExpiresAt,
+		sess.Workdir, sess.CreatedAt, sess.LastActivity, sess.Status, sess.ExpiresAt, backend,
 	)
 	if err != nil {
 		return fmt.Errorf("store: create session: %w", err)
@@ -543,7 +576,7 @@ func (s *Store) CreateSession(sess *Session) error {
 func (s *Store) GetSession(channelID, threadTS string) (*Session, error) {
 	return s.scanSession(s.db.QueryRow(`
 		SELECT channel_id, thread_ts, jcode_session, friendly_name,
-		       workdir, created_at, last_activity, status, expires_at
+		       workdir, created_at, last_activity, status, expires_at, backend
 		FROM sessions
 		WHERE channel_id = ? AND thread_ts = ?`, channelID, threadTS))
 }
@@ -552,7 +585,7 @@ func (s *Store) GetSession(channelID, threadTS string) (*Session, error) {
 func (s *Store) GetSessionByJcodeID(jcodeSession string) (*Session, error) {
 	return s.scanSession(s.db.QueryRow(`
 		SELECT channel_id, thread_ts, jcode_session, friendly_name,
-		       workdir, created_at, last_activity, status, expires_at
+		       workdir, created_at, last_activity, status, expires_at, backend
 		FROM sessions
 		WHERE jcode_session = ?`, jcodeSession))
 }
@@ -625,7 +658,7 @@ func (s *Store) SetSessionFriendlyName(channelID, threadTS, name string) error {
 func (s *Store) ListActiveSessions() ([]*Session, error) {
 	rows, err := s.db.Query(`
 		SELECT channel_id, thread_ts, jcode_session, friendly_name,
-		       workdir, created_at, last_activity, status, expires_at
+		       workdir, created_at, last_activity, status, expires_at, backend
 		FROM sessions
 		WHERE status != 'closed'
 		ORDER BY last_activity DESC`)
@@ -1112,6 +1145,7 @@ func (s *Store) scanSession(row *sql.Row) (*Session, error) {
 	err := row.Scan(
 		&sess.ChannelID, &sess.ThreadTS, &sess.JcodeSession, &friendlyName,
 		&sess.Workdir, &sess.CreatedAt, &sess.LastActivity, &sess.Status, &sess.ExpiresAt,
+		&sess.Backend,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1132,6 +1166,7 @@ func (s *Store) scanSessionRow(rows *sql.Rows) (*Session, error) {
 	err := rows.Scan(
 		&sess.ChannelID, &sess.ThreadTS, &sess.JcodeSession, &friendlyName,
 		&sess.Workdir, &sess.CreatedAt, &sess.LastActivity, &sess.Status, &sess.ExpiresAt,
+		&sess.Backend,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: scan session row: %w", err)
