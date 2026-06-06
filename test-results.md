@@ -18,7 +18,7 @@
 - [x] Test channels created: `#sw-test-alpha`, `#sw-test-beta`, `#sw-test-noise`, `#sw-test-fallback`
 - [x] Channel IDs recorded below
 - [x] Bot invited to all channels
-- [x] DM conversation with bot exists - **GAP**: bot does not respond to DMs. Root cause: DM channel IDs (`D...`) are not in `[[channels]]` config, so `resolveChannel()` returns empty workdir and the message is silently dropped. Needs a `[bridge.dm]` config or DM-specific fallback workdir.
+- [ ] DM conversation with bot exists - **FAIL**: bot does not respond to DMs. Root cause: DM channel IDs (`D...`) are not in `[[channels]]` config, so `resolveChannel()` returns empty workdir and the message is silently dropped. Needs a `[bridge.dm]` config or DM-specific fallback workdir.
 - [ ] Second user available
 
 | Channel | ID |

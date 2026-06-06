@@ -4,7 +4,11 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SECRET="6cba07cbb64129a77ac49f150d931932fccf2100"
+SECRET="${SWITCHBOARD_TEST_WEBHOOK_SECRET:-}"
+if [ -z "$SECRET" ]; then
+  echo "ERROR: SWITCHBOARD_TEST_WEBHOOK_SECRET is required" >&2
+  exit 1
+fi
 DBQ="python3 ${SCRIPT_DIR}/dbq.py"
 PASS=0
 FAIL=0
@@ -151,26 +155,26 @@ echo "  Pending/processing before restart: $PENDING_BEFORE"
 if [ "${ALLOW_RESTART:-}" = "true" ]; then
   systemctl --user restart switchboard
   sleep 3
+
+  # Check all eventually get processed
+  DONE_AFTER=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status = 'done'" 2>/dev/null)
+  echo "  Done after restart: $DONE_AFTER"
+  TOTAL=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%'" 2>/dev/null | python3 -c "import sys; print(eval(sys.stdin.read()).get('cnt',0))")
+  if [ "$TOTAL" = "5" ]; then
+    # Wait a bit more for processing
+    sleep 3
+    DONE_FINAL=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status = 'done'" 2>/dev/null | python3 -c "import sys; print(eval(sys.stdin.read()).get('cnt',0))")
+    if [ "$DONE_FINAL" = "5" ]; then
+      result PASS "10.5" "All 5 webhooks processed after restart"
+    else
+      result DEVIATION "10.5" "$DONE_FINAL/5 processed after restart (some may still be processing)"
+    fi
+  else
+    result FAIL "10.5" "Expected 5 total rows, got $TOTAL"
+  fi
 else
   echo "  SKIP: set ALLOW_RESTART=true to run restart test"
   result SKIP "10.5" "Restart test skipped (set ALLOW_RESTART=true)"
-fi
-
-# Check all eventually get processed
-DONE_AFTER=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status = 'done'" 2>/dev/null)
-echo "  Done after restart: $DONE_AFTER"
-TOTAL=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%'" 2>/dev/null | python3 -c "import sys; print(eval(sys.stdin.read()).get('cnt',0))")
-if [ "$TOTAL" = "5" ]; then
-  # Wait a bit more for processing
-  sleep 3
-  DONE_FINAL=$($DBQ "SELECT COUNT(*) as cnt FROM webhook_inbox WHERE idempotency_key LIKE 'restart-test-%' AND status = 'done'" 2>/dev/null | python3 -c "import sys; print(eval(sys.stdin.read()).get('cnt',0))")
-  if [ "$DONE_FINAL" = "5" ]; then
-    result PASS "10.5" "All 5 webhooks processed after restart"
-  else
-    result DEVIATION "10.5" "$DONE_FINAL/5 processed after restart (some may still be processing)"
-  fi
-else
-  result FAIL "10.5" "Expected 5 total rows, got $TOTAL"
 fi
 
 echo ""
