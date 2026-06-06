@@ -261,8 +261,9 @@ func TestTruncateForSlack(t *testing.T) {
 		lines += "This is line number something or other.\n"
 	}
 	got := truncateForSlack(lines, 200)
-	if len(got) > 300 { // 200 + truncation message
-		t.Errorf("truncated text too long: %d chars", len(got))
+	// The suffix is reserved within maxLen, so the result must never exceed it.
+	if len(got) > 200 {
+		t.Errorf("truncated text exceeds maxLen: %d chars (want <= 200)", len(got))
 	}
 	if !containsSubstring(got, "truncated") {
 		t.Error("truncated text should contain truncation notice")
