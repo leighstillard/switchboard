@@ -342,9 +342,20 @@ func (r *Router) tryAutoOnboard(ctx context.Context, msg *slack.InboundMessage) 
 		return
 	}
 
-	// Check for matching workspace directory.
+	// Check for matching workspace directory. Validate that the channel name
+	// cannot escape ~/workspace via path traversal (defense in depth: Slack
+	// channel names are restricted, but the name is attacker-influenced).
 	home, _ := os.UserHomeDir()
-	workspacePath := filepath.Join(home, "workspace", channelName)
+	workspaceBase := filepath.Join(home, "workspace")
+	workspacePath := filepath.Join(workspaceBase, channelName)
+	if cleaned := filepath.Clean(workspacePath); cleaned != filepath.Join(workspaceBase, filepath.Base(cleaned)) {
+		slog.Warn("router: auto-onboard: channel name would escape workspace",
+			"channel_name", channelName, "resolved", workspacePath)
+		r.edge.DMUser(msg.UserID, fmt.Sprintf(
+			"I got your mention in <#%s>, but the channel name `#%s` contains invalid characters.",
+			msg.ChannelID, channelName))
+		return
+	}
 	if info, err := os.Stat(workspacePath); err != nil || !info.IsDir() {
 		r.edge.DMUser(msg.UserID, fmt.Sprintf(
 			"I got your mention in <#%s> (`#%s`), and you're an admin, but there's no matching workspace directory (`~/workspace/%s`). Create the directory first, then mention me again!",
@@ -922,6 +933,11 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 	if _, locked := r.threadLock[sessionID]; !locked {
 		r.threadLock[sessionID] = coalKey
 	}
+	// Update the requester to whoever triggered this drained batch so the
+	// eventual completion ping mentions the right user, not a stale prior one.
+	if last := turns[len(turns)-1].UserID; last != "" {
+		r.turnRequester[coalKey] = last
+	}
 	r.mu.Unlock()
 
 	// Send combined message to agent.
@@ -1000,6 +1016,7 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 		// No matching route: try LLM router, then fall back.
 		r.mu.RLock()
 		llm := r.llmRouter
+		fallbackID := r.cfg.Ingest.FallbackChannelID
 		r.mu.RUnlock()
 		if llm != nil {
 			r.handleWebhookLLMRouting(ctx, evt)
@@ -1007,7 +1024,6 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 		}
 
 		// No LLM router: post to fallback channel.
-		fallbackID := r.cfg.Ingest.FallbackChannelID
 		if fallbackID != "" {
 			text := fmt.Sprintf("📨 *Unrouted webhook* (%s/%s)\n```\n%s\n```",
 				evt.Source, evt.EventType, truncateJSON(evt.Payload, 500))
@@ -1018,7 +1034,7 @@ func (r *Router) handleWebhook(ctx context.Context, evt *WebhookEvent) {
 				Text:      text,
 			})
 		}
-		r.auditWebhookRouting(evt, "fallback", r.cfg.Ingest.FallbackChannelID)
+		r.auditWebhookRouting(evt, "fallback", fallbackID)
 		return
 	}
 
@@ -1520,13 +1536,12 @@ func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchRe
 	)
 
 	// Synthesize an InboundMessage and route through handleInbound.
-	userID := req.UserID
-	if userID == "" {
-		userID = "dispatch"
-	}
+	// Leave UserID empty when the caller did not supply one: a real Slack
+	// user ID is required for completion notifications, and injecting a
+	// placeholder like "dispatch" would emit a broken <@dispatch> mention.
 	msg := &slack.InboundMessage{
 		ChannelID:    req.ChannelID,
-		UserID:       userID,
+		UserID:       req.UserID,
 		Text:         req.Prompt,
 		MessageTS:    threadTS,
 		IsTopLevel:   true,
@@ -1538,16 +1553,17 @@ func (r *Router) Dispatch(ctx context.Context, req DispatchRequest) (*DispatchRe
 	// itself, not for the long-running event consumer.
 	r.handleInbound(context.Background(), msg)
 
-	// Look up the session that was just created.
+	// Look up the session that was just created. If session startup failed
+	// (e.g. subscribe/send errors inside handleNewSession), no agent turn
+	// actually started, so report an error rather than a false success.
 	session, _ := r.store.GetSession(req.ChannelID, threadTS)
-	sessionID := ""
-	if session != nil {
-		sessionID = session.JcodeSession
+	if session == nil {
+		return nil, fmt.Errorf("dispatch: session did not start for channel %s", req.ChannelID)
 	}
 
 	return &DispatchResult{
 		ThreadTS:  threadTS,
-		SessionID: sessionID,
+		SessionID: session.JcodeSession,
 	}, nil
 }
 
