@@ -575,6 +575,10 @@ func (s *Store) DeleteCronJob(id string) error {
 	if n == 0 {
 		return fmt.Errorf("store: cron job %q not found", id)
 	}
+	// Remove the dedup row so deleted jobs don't leave a stale entry behind.
+	if _, err := s.db.Exec(`DELETE FROM cron_last_fired WHERE job_id = ?`, id); err != nil {
+		return fmt.Errorf("store: delete cron dedup row: %w", err)
+	}
 	return nil
 }
 
@@ -602,6 +606,12 @@ func (s *Store) UpdateCronJobEnabled(id string, enabled bool) error {
 // Returns true if the claim was successful (job has not yet fired for this
 // minute), false if it was already claimed. This survives process restarts
 // because the state is persisted in SQLite.
+//
+// The update rejects only an equal timestamp (the same minute) rather than
+// requiring the new timestamp to be strictly greater. This keeps same-minute
+// dedup intact while still allowing claims after the wall clock moves backward
+// (e.g. an NTP correction or a restored VM snapshot), which would otherwise
+// suppress every matching firing until wall time caught up.
 func (s *Store) ClaimCronFire(jobID string, firedAtUnix int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -609,7 +619,7 @@ func (s *Store) ClaimCronFire(jobID string, firedAtUnix int64) (bool, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO cron_last_fired (job_id, fired_at_unix) VALUES (?, ?)
 		ON CONFLICT(job_id) DO UPDATE SET fired_at_unix = ?
-		WHERE fired_at_unix < ?`,
+		WHERE fired_at_unix != ?`,
 		jobID, firedAtUnix, firedAtUnix, firedAtUnix,
 	)
 	if err != nil {
