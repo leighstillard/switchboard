@@ -3,7 +3,6 @@ package render
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 )
 
@@ -445,12 +444,3 @@ func AlertFallbackText(level AlertLevel, message string) string {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// hostnameFromURL extracts just the hostname from a URL string.
-func hostnameFromURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
-		return rawURL
-	}
-	return u.Host
-}

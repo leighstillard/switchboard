@@ -126,7 +126,7 @@ func processDirective(jsonContent string) ([]map[string]interface{}, string, err
 	if version == 0 {
 		version = 1 // default
 	}
-	if version > MaxSupportedVersion {
+	if version < 1 || version > MaxSupportedVersion {
 		return nil, "", fmt.Errorf("unsupported version %d for directive %q (max: %d)",
 			version, dir.Render, MaxSupportedVersion)
 	}

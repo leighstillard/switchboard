@@ -402,11 +402,11 @@ func TestDescribe_CaseInsensitiveLookup_Read(t *testing.T) {
 
 func TestDescribe_HonorsTargetWords(t *testing.T) {
 	// Save and restore defaults.
-	origTarget := targetWords
-	origHard := hardTruncateWords
+	origTarget := targetWords.Load()
+	origHard := hardTruncateWords.Load()
 	defer func() {
-		targetWords = origTarget
-		hardTruncateWords = origHard
+		targetWords.Store(origTarget)
+		hardTruncateWords.Store(origHard)
 	}()
 
 	ConfigureDescriptions(3, 14)
@@ -426,11 +426,11 @@ func TestDescribe_HonorsTargetWords(t *testing.T) {
 }
 
 func TestDescribeWithDirective_HonorsHardTruncateForDirectives(t *testing.T) {
-	origTarget := targetWords
-	origHard := hardTruncateWords
+	origTarget := targetWords.Load()
+	origHard := hardTruncateWords.Load()
 	defer func() {
-		targetWords = origTarget
-		hardTruncateWords = origHard
+		targetWords.Store(origTarget)
+		hardTruncateWords.Store(origHard)
 	}()
 
 	ConfigureDescriptions(5, 8)
@@ -448,11 +448,11 @@ func TestDescribeWithDirective_HonorsHardTruncateForDirectives(t *testing.T) {
 }
 
 func TestDescribe_TargetWordsUsedNotHardTruncate(t *testing.T) {
-	origTarget := targetWords
-	origHard := hardTruncateWords
+	origTarget := targetWords.Load()
+	origHard := hardTruncateWords.Load()
 	defer func() {
-		targetWords = origTarget
-		hardTruncateWords = origHard
+		targetWords.Store(origTarget)
+		hardTruncateWords.Store(origHard)
 	}()
 
 	// Set target to 5, hard to 14. Heuristic output with >5 words should be

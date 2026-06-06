@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -32,7 +33,7 @@ func Describe(tool string, input map[string]any) string {
 	// Use targetWords as the soft truncation limit for heuristic descriptions.
 	if fn, ok := heuristics[tool]; ok {
 		if desc := fn(input); desc != "" {
-			return TruncateWords(desc, targetWords)
+			return TruncateWords(desc, int(targetWords.Load()))
 		}
 	}
 
@@ -41,7 +42,7 @@ func Describe(tool string, input map[string]any) string {
 	if titleTool != tool {
 		if fn, ok := heuristics[titleTool]; ok {
 			if desc := fn(input); desc != "" {
-				return TruncateWords(desc, targetWords)
+				return TruncateWords(desc, int(targetWords.Load()))
 			}
 		}
 	}
@@ -56,7 +57,7 @@ func Describe(tool string, input map[string]any) string {
 //  3. Fallback: "Running <tool>"
 func DescribeWithDirective(tool string, input map[string]any, directive string) string {
 	if directive != "" {
-		return TruncateWords(directive, hardTruncateWords)
+		return TruncateWords(directive, int(hardTruncateWords.Load()))
 	}
 	return Describe(tool, input)
 }
@@ -75,20 +76,29 @@ func TruncateWords(s string, maxWords int) string {
 // Configuration (match [render.descriptions] config)
 // ---------------------------------------------------------------------------
 
+// targetWords and hardTruncateWords are read by Describe/DescribeWithDirective
+// on hot paths and written by ConfigureDescriptions during SIGHUP config
+// reloads. They are stored atomically to avoid data races between concurrent
+// readers and the reload writer.
 var (
-	targetWords       = 12
-	hardTruncateWords = 14
+	targetWords       atomic.Int32
+	hardTruncateWords atomic.Int32
 	argTruncateChars  = 50
 )
+
+func init() {
+	targetWords.Store(12)
+	hardTruncateWords.Store(14)
+}
 
 // ConfigureDescriptions updates the description length limits from config.
 // Values of 0 retain the defaults.
 func ConfigureDescriptions(target, hardTruncate int) {
 	if target > 0 {
-		targetWords = target
+		targetWords.Store(int32(target))
 	}
 	if hardTruncate > 0 {
-		hardTruncateWords = hardTruncate
+		hardTruncateWords.Store(int32(hardTruncate))
 	}
 }
 

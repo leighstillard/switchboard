@@ -229,27 +229,6 @@ func (sc *SessionCoalescer) appendToolSegment(description string, isError bool) 
 	})
 }
 
-// totalTextLen returns the sum of all text segment lengths.
-func (sc *SessionCoalescer) totalTextLen() int {
-	n := 0
-	for i := range sc.segments {
-		if sc.segments[i].kind == segText {
-			n += sc.segments[i].text.Len()
-		}
-	}
-	return n
-}
-
-// lastTextContent returns the text content from the last text segment, or "".
-func (sc *SessionCoalescer) lastTextContent() string {
-	for i := len(sc.segments) - 1; i >= 0; i-- {
-		if sc.segments[i].kind == segText {
-			return sc.segments[i].text.String()
-		}
-	}
-	return ""
-}
-
 // allText concatenates all text segments (used for directive extraction).
 func (sc *SessionCoalescer) allText() string {
 	var sb strings.Builder
