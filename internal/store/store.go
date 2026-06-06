@@ -244,6 +244,25 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// Self-heal backstop. Branch worktrees that share one data_dir can advance
+	// user_version past 4 via a different migration lineage, which makes the
+	// version-gated migrateV4 above a no-op and strands the backend column the
+	// current code requires. Re-add it idempotently regardless of version.
+	if err := ensureBackendColumn(db); err != nil {
+		return fmt.Errorf("ensure backend column: %w", err)
+	}
+
+	return nil
+}
+
+// ensureBackendColumn guarantees sessions.backend exists independent of
+// user_version. ADD COLUMN is idempotent here: a duplicate-column error means
+// it is already present, which we treat as success.
+func ensureBackendColumn(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'jcode'`)
+	if err != nil && !isDuplicateColumnErr(err) {
+		return err
+	}
 	return nil
 }
 

@@ -142,6 +142,57 @@ func TestMigrateV4(t *testing.T) {
 	}
 }
 
+// TestMigrate_SelfHealsStrandedBackendColumn reproduces the shared-data_dir
+// fault: a divergent branch lineage bumps user_version past 4 while the
+// sessions table lacks the backend column, so migrateV4 is skipped and the
+// column is stranded. migrate() must restore it regardless of user_version.
+func TestMigrate_SelfHealsStrandedBackendColumn(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Simulate the fault: drop backend, then advance the version past 4.
+	if _, err := s.db.Exec(`ALTER TABLE sessions DROP COLUMN backend`); err != nil {
+		t.Fatalf("drop backend: %v", err)
+	}
+	if _, err := s.db.Exec(`PRAGMA user_version = 5`); err != nil {
+		t.Fatalf("bump user_version: %v", err)
+	}
+	s.Close()
+
+	// Re-open: the version-gated migrateV4 will be skipped, so the self-heal
+	// backstop is the only thing that can restore the column.
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	defer s2.Close()
+
+	// The router-style write/read path must work again.
+	now := time.Now().Unix()
+	sess := &Session{
+		ChannelID:    "C0HEAL",
+		ThreadTS:     "1.2",
+		JcodeSession: "j-heal",
+		Workdir:      "/tmp/heal",
+		CreatedAt:    now,
+		LastActivity: now,
+		Status:       "idle",
+	}
+	if err := s2.CreateSession(sess); err != nil {
+		t.Fatalf("CreateSession after self-heal: %v", err)
+	}
+	got, err := s2.GetSession("C0HEAL", "1.2")
+	if err != nil {
+		t.Fatalf("GetSession after self-heal: %v", err)
+	}
+	if got.Backend != "jcode" {
+		t.Errorf("Backend = %q, want jcode (default)", got.Backend)
+	}
+}
+
 func TestNew_CorruptedDB(t *testing.T) {
 	dir := t.TempDir()
 	// Write garbage to the db file.
