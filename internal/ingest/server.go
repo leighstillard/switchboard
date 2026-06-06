@@ -308,6 +308,29 @@ func (s *Server) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read body with the same size limit used by webhook handlers.
+	maxBody := int64(s.cfg.MaxBodyKB) * 1024
+	if maxBody <= 0 {
+		maxBody = 1024 * 1024 // default 1MB
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxBody {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Authenticate the request using the same HMAC verification as /webhook/*.
+	// The correlation write is gated by the "api" ingest source secret.
+	if !s.verifySignature("api", r, body) {
+		slog.Warn("api: correlate HMAC verification failed", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		Source      string `json:"source"`
 		ExternalKey string `json:"external_key"`
@@ -316,7 +339,7 @@ func (s *Server) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		TTLDays     int    `json:"ttl_days"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
