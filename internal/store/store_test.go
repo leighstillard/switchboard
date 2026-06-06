@@ -37,8 +37,8 @@ func TestNew_WALAndIntegrity(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 }
 
@@ -56,6 +56,90 @@ func TestNew_IdempotentMigration(t *testing.T) {
 		t.Fatalf("second open: %v", err)
 	}
 	s2.Close()
+}
+
+// TestMigrateV4 validates that the v4 migration adds the backend column to
+// the sessions table and that existing rows get the default value 'jcode'.
+func TestMigrateV4(t *testing.T) {
+	dir := t.TempDir()
+
+	// Open store to apply all migrations up to v4.
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Verify backend column exists by inserting a session with backend.
+	now := time.Now().Unix()
+	sess := &Session{
+		ChannelID:    "C000MIGRTEST",
+		ThreadTS:     "1111.2222",
+		JcodeSession: "j-migr",
+		Workdir:      "/tmp/migr",
+		CreatedAt:    now,
+		LastActivity: now,
+		Status:       "idle",
+		Backend:      "claude",
+	}
+	if err := s.CreateSession(sess); err != nil {
+		t.Fatalf("CreateSession with backend: %v", err)
+	}
+
+	got, err := s.GetSession("C000MIGRTEST", "1111.2222")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Backend != "claude" {
+		t.Errorf("Backend = %q, want claude", got.Backend)
+	}
+
+	// Insert a session without setting Backend - should default to jcode.
+	sess2 := &Session{
+		ChannelID:    "C000MIGRTEST",
+		ThreadTS:     "3333.4444",
+		JcodeSession: "j-default",
+		Workdir:      "/tmp/migr2",
+		CreatedAt:    now,
+		LastActivity: now,
+		Status:       "idle",
+	}
+	if err := s.CreateSession(sess2); err != nil {
+		t.Fatalf("CreateSession without backend: %v", err)
+	}
+
+	got2, err := s.GetSession("C000MIGRTEST", "3333.4444")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got2.Backend != "jcode" {
+		t.Errorf("Backend = %q, want jcode (default)", got2.Backend)
+	}
+
+	// Verify version is 4.
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
+	}
+
+	s.Close()
+
+	// Re-open to verify idempotent migration.
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("re-open after v4: %v", err)
+	}
+	defer s2.Close()
+
+	got3, err := s2.GetSession("C000MIGRTEST", "1111.2222")
+	if err != nil {
+		t.Fatalf("GetSession after re-open: %v", err)
+	}
+	if got3.Backend != "claude" {
+		t.Errorf("Backend after re-open = %q, want claude", got3.Backend)
+	}
 }
 
 func TestNew_CorruptedDB(t *testing.T) {

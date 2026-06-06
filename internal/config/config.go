@@ -22,6 +22,7 @@ type Config struct {
 	Bridge     BridgeConfig                `toml:"bridge"`
 	Slack      SlackConfig                 `toml:"slack"`
 	Jcode      JcodeConfig                 `toml:"jcode"`
+	Claude     ClaudeConfig                `toml:"claude"`
 	Ingest     IngestConfig                `toml:"ingest"`
 	GitHub     GitHubConfig                `toml:"github"`
 	Render     RenderConfig                `toml:"render"`
@@ -87,7 +88,13 @@ type RoutingConfig struct {
 
 // RoutingConfig2 holds the top-level [routing] section with LLM router config.
 type RoutingConfig2 struct {
-	LLM LLMRoutingConfig `toml:"llm"`
+	LLM     LLMRoutingConfig     `toml:"llm"`
+	Backend BackendRoutingConfig `toml:"backend"`
+}
+
+// BackendRoutingConfig selects the default agent backend ("jcode" or "claude").
+type BackendRoutingConfig struct {
+	Default string `toml:"default"` // "jcode" or "claude"; empty defaults to "jcode"
 }
 
 // LLMRoutingConfig holds settings for the LLM-based notification router.
@@ -127,6 +134,15 @@ type JcodeConfig struct {
 	SpawnCommand string `toml:"spawn_command"`
 }
 
+// ClaudeConfig holds Claude Code CLI settings.
+type ClaudeConfig struct {
+	Binary             string   `toml:"binary"`               // default "claude"
+	PermissionMode     string   `toml:"permission_mode"`      // default "bypassPermissions"
+	Model              string   `toml:"model"`                // default "claude-sonnet-4-20250514"
+	AppendSystemPrompt string   `toml:"append_system_prompt"` // appended to system prompt
+	ExtraArgs          []string `toml:"extra_args"`           // additional CLI arguments
+}
+
 // IdentityConfig defines a bot identity persona.
 type IdentityConfig struct {
 	DisplayName string `toml:"display_name"`
@@ -140,6 +156,8 @@ type ChannelConfig struct {
 	Workdir  string `toml:"workdir"`
 	Identity string `toml:"identity"`
 	IconURL  string `toml:"icon_url"`
+	Backend  string `toml:"backend"` // "jcode" or "claude"; empty = inherit default
+	Model    string `toml:"model"`   // optional per-channel model override
 }
 
 // IngestConfig holds webhook ingestion server settings.
