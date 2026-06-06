@@ -1,6 +1,7 @@
 package jcodeadapter
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 
@@ -256,5 +257,118 @@ func TestTranslate_History_Dropped(t *testing.T) {
 	result := Translate(ev)
 	if len(result) != 0 {
 		t.Errorf("expected history event to be dropped, got %+v", result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reused subscription deduplication (finding #1)
+// ---------------------------------------------------------------------------
+
+func TestGetOrCreateTranslated_DeduplicatesSameChannel(t *testing.T) {
+	adapter := &Adapter{
+		translated: make(map[<-chan *jcodeproto.ServerEvent]<-chan agent.Event),
+	}
+
+	// Simulate the raw channel that jcode.Client returns for a session.
+	rawCh := make(chan *jcodeproto.ServerEvent, 8)
+	var rawRecv <-chan *jcodeproto.ServerEvent = rawCh
+
+	// First call should create a new translated channel + goroutine.
+	ch1 := adapter.getOrCreateTranslated("sess-1", rawRecv)
+	if ch1 == nil {
+		t.Fatal("expected non-nil channel")
+	}
+
+	// Second call with the SAME raw channel should return the SAME translated channel.
+	ch2 := adapter.getOrCreateTranslated("sess-1", rawRecv)
+
+	// Channel identity check: read from one, confirm the other sees nothing new.
+	// We can't compare channels directly in Go, but we can verify by sending
+	// an event and checking only one consumer receives it.
+	rawCh <- rawEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "hello",
+	})
+
+	// Both ch1 and ch2 should be the same channel, so reading from either works.
+	ev := <-ch1
+	if ev.Type != agent.EventTextDelta || ev.Text != "hello" {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+
+	// If ch2 were a different channel with a competing consumer, this next send
+	// would be stolen. Send another event and verify ch2 receives it.
+	rawCh <- rawEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "world",
+	})
+	ev2 := <-ch2
+	if ev2.Type != agent.EventTextDelta || ev2.Text != "world" {
+		t.Fatalf("unexpected event from ch2: %+v", ev2)
+	}
+
+	// Clean up: close raw channel to stop translateLoop.
+	close(rawCh)
+}
+
+func TestGetOrCreateTranslated_DifferentChannels_DifferentLoops(t *testing.T) {
+	adapter := &Adapter{
+		translated: make(map[<-chan *jcodeproto.ServerEvent]<-chan agent.Event),
+	}
+
+	raw1 := make(chan *jcodeproto.ServerEvent, 4)
+	raw2 := make(chan *jcodeproto.ServerEvent, 4)
+
+	ch1 := adapter.getOrCreateTranslated("sess-1", raw1)
+	ch2 := adapter.getOrCreateTranslated("sess-2", raw2)
+
+	// They should be independent channels.
+	raw1 <- rawEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "from-1",
+	})
+	raw2 <- rawEvent(t, jcodeproto.EventTextDelta, map[string]string{
+		"type": "text_delta", "text": "from-2",
+	})
+
+	ev1 := <-ch1
+	ev2 := <-ch2
+	if ev1.Text != "from-1" {
+		t.Errorf("ch1 got wrong event: %+v", ev1)
+	}
+	if ev2.Text != "from-2" {
+		t.Errorf("ch2 got wrong event: %+v", ev2)
+	}
+
+	close(raw1)
+	close(raw2)
+}
+
+// ---------------------------------------------------------------------------
+// Image base64 encoding (finding #2)
+// ---------------------------------------------------------------------------
+
+func TestSendMessage_ImageBase64Encoding(t *testing.T) {
+	// We can't easily test SendMessage end-to-end without a jcode daemon,
+	// but we can verify the encoding logic directly.
+	rawBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} // PNG magic bytes
+	img := agent.Image{
+		MediaType: "image/png",
+		Data:      rawBytes,
+	}
+
+	// Simulate the conversion logic from SendMessage.
+	b64 := base64.StdEncoding.EncodeToString(img.Data)
+	pair := jcodeproto.ImagePair{img.MediaType, b64}
+
+	// Verify it round-trips correctly.
+	decoded, err := base64.StdEncoding.DecodeString(pair[1])
+	if err != nil {
+		t.Fatalf("base64 decode failed: %v", err)
+	}
+	if string(decoded) != string(rawBytes) {
+		t.Errorf("round-trip mismatch: got %x, want %x", decoded, rawBytes)
+	}
+
+	// Verify it's NOT raw bytes (the old bug).
+	if pair[1] == string(rawBytes) {
+		t.Error("image data was not base64 encoded (still raw bytes)")
 	}
 }

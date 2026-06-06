@@ -4,8 +4,10 @@ package jcodeadapter
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/format5/switchboard/internal/agent"
 	"github.com/format5/switchboard/internal/jcode"
@@ -15,11 +17,22 @@ import (
 // Adapter wraps a jcode.Client and implements agent.Backend.
 type Adapter struct {
 	client *jcode.Client
+
+	// mu guards translated, which caches the translated channel per raw
+	// channel pointer. When jcode.Client returns the same raw channel for
+	// a reused session (shared workdir or already-connected session), we
+	// must return the same translated channel rather than spawning a second
+	// translateLoop that would create competing consumers.
+	mu         sync.Mutex
+	translated map[<-chan *jcodeproto.ServerEvent]<-chan agent.Event
 }
 
 // New creates a new jcode adapter backed by the given client.
 func New(client *jcode.Client) *Adapter {
-	return &Adapter{client: client}
+	return &Adapter{
+		client:     client,
+		translated: make(map[<-chan *jcodeproto.ServerEvent]<-chan agent.Event),
+	}
 }
 
 // Client returns the underlying jcode.Client for direct access when needed
@@ -33,9 +46,7 @@ func (a *Adapter) Subscribe(ctx context.Context, workdir string) (string, <-chan
 	if err != nil {
 		return "", nil, err
 	}
-	events := make(chan agent.Event, cap(rawEvents))
-	go translateLoop(sessionID, rawEvents, events)
-	return sessionID, events, nil
+	return sessionID, a.getOrCreateTranslated(sessionID, rawEvents), nil
 }
 
 func (a *Adapter) SubscribeExisting(ctx context.Context, sessionID, workdir string) (<-chan agent.Event, error) {
@@ -43,20 +54,16 @@ func (a *Adapter) SubscribeExisting(ctx context.Context, sessionID, workdir stri
 	if err != nil {
 		return nil, err
 	}
-	events := make(chan agent.Event, cap(rawEvents))
-	go translateLoop(sessionID, rawEvents, events)
-	return events, nil
+	return a.getOrCreateTranslated(sessionID, rawEvents), nil
 }
 
 func (a *Adapter) SendMessage(ctx context.Context, sessionID, content string, images []agent.Image) error {
 	// Convert agent.Image to jcodeproto.ImagePair.
+	// agent.Image.Data carries raw bytes; jcodeproto expects base64-encoded data.
 	var pairs []jcodeproto.ImagePair
 	for _, img := range images {
-		// jcode expects [media_type, base64_data]; the router already provides
-		// decoded bytes, but jcode's wire format is base64. For now we pass
-		// through as-is since the router constructs ImagePairs directly.
-		// This will need base64 encoding when images are actually used.
-		pairs = append(pairs, jcodeproto.ImagePair{img.MediaType, string(img.Data)})
+		b64 := base64.StdEncoding.EncodeToString(img.Data)
+		pairs = append(pairs, jcodeproto.ImagePair{img.MediaType, b64})
 	}
 	return a.client.SendMessage(ctx, sessionID, content, pairs)
 }
@@ -70,13 +77,42 @@ func (a *Adapter) Close() error {
 }
 
 // ---------------------------------------------------------------------------
+// Subscription deduplication
+// ---------------------------------------------------------------------------
+
+// getOrCreateTranslated returns an existing translated channel for the raw
+// channel, or creates one with a new translateLoop goroutine. This prevents
+// competing consumers when jcode.Client returns the same raw channel for
+// reused sessions (shared workdir or already-connected session).
+func (a *Adapter) getOrCreateTranslated(sessionID string, rawEvents <-chan *jcodeproto.ServerEvent) <-chan agent.Event {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if ch, ok := a.translated[rawEvents]; ok {
+		slog.Info("jcodeadapter: reusing translated channel", "session_id", sessionID)
+		return ch
+	}
+
+	events := make(chan agent.Event, cap(rawEvents))
+	go a.translateLoop(sessionID, rawEvents, events)
+	a.translated[rawEvents] = events
+	return events
+}
+
+// ---------------------------------------------------------------------------
 // Translation
 // ---------------------------------------------------------------------------
 
 // translateLoop reads jcodeproto.ServerEvent from rawEvents and writes
-// agent.Event to events. It closes events when rawEvents is closed.
-func translateLoop(sessionID string, rawEvents <-chan *jcodeproto.ServerEvent, events chan<- agent.Event) {
-	defer close(events)
+// agent.Event to events. It closes events when rawEvents is closed, and
+// removes the cache entry so a future subscription can start a fresh loop.
+func (a *Adapter) translateLoop(sessionID string, rawEvents <-chan *jcodeproto.ServerEvent, events chan<- agent.Event) {
+	defer func() {
+		close(events)
+		a.mu.Lock()
+		delete(a.translated, rawEvents)
+		a.mu.Unlock()
+	}()
 	for raw := range rawEvents {
 		for _, ev := range Translate(raw) {
 			events <- ev
