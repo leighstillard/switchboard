@@ -702,6 +702,70 @@ func TestCoalescer_InlineToolOrdering(t *testing.T) {
 	}
 }
 
+// TestCoalescer_LateOnPostedAfterOverflowRollover verifies that a delayed
+// OnPosted callback from the first progress message does not repoint
+// progressMessageTS after a same-turn overflow rollover started a new message.
+// Regression test for the turnID-only guard missing same-turn rollovers.
+func TestCoalescer_LateOnPostedAfterOverflowRollover(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-rollover", "ant", "C777", "ts77", "/workspace/roll",
+		Identity{DisplayName: "Worker"}, out, nil)
+	defer coal.Close()
+
+	// Drive enough unique tool calls to trigger at least one overflow split.
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Starting...\n"})
+	for i := 0; i < 150; i++ {
+		toolID := fmt.Sprintf("tool-%d", i)
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolStart, ToolID: toolID, ToolName: "Read",
+			ToolInput: map[string]any{"file_path": fmt.Sprintf("/workspace/handler_%d.go", i)},
+		})
+		coal.HandleEvent(agent.Event{
+			Type: agent.EventToolDone, ToolID: toolID, ToolName: "Read",
+		})
+	}
+	// After the overflow rollover, progressMessageTS was reset to nil. Send a
+	// MessageEnd to force a flush that PostMessages the second (current)
+	// message. Note: deliberately do NOT send Done, so the turn stays in
+	// progress and progressMessageTS reflects the current message — exactly the
+	// state a late callback from the first message could corrupt.
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Continuing after rollover."})
+	coal.HandleEvent(agent.Event{Type: agent.EventMessageEnd})
+
+	// Wait for async OnPosted callbacks to settle.
+	time.Sleep(200 * time.Millisecond)
+
+	// Collect all PostMessage items (each overflow rollover posts a new one).
+	var posts []*outbound.OutboundItem
+	for _, item := range out.getItems() {
+		if item.Action == outbound.ActionPostMessage && item.OnPosted != nil {
+			posts = append(posts, item)
+		}
+	}
+	if len(posts) < 2 {
+		t.Fatalf("expected at least 2 PostMessage items (overflow rollover), got %d", len(posts))
+	}
+
+	// Record the current TS, then replay the FIRST post's (now-stale) OnPosted
+	// callback as if it arrived late. It captured the turnID of the first
+	// message; after the overflow rollover bumped turnID, the guard must reject
+	// it and leave progressMessageTS unchanged.
+	before := coal.ProgressMessageTS()
+	posts[0].OnPosted("stale-ts-from-first-message")
+	after := coal.ProgressMessageTS()
+
+	if after == nil || *after != *before {
+		var b, a string
+		if before != nil {
+			b = *before
+		}
+		if after != nil {
+			a = *after
+		}
+		t.Fatalf("late OnPosted from first message overwrote TS: before=%q after=%q", b, a)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
