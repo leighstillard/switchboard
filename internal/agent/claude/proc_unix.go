@@ -9,6 +9,9 @@ import (
 	"syscall"
 )
 
+// sigTerm is the graceful-termination signal for the process group.
+var sigTerm syscall.Signal = syscall.SIGTERM
+
 // prepareCmdForKill puts the spawned child into its own process group so the
 // whole descendant tree (the claude CLI plus any MCP-server / bridge
 // grandchildren) can be terminated with a single group signal. Without this,

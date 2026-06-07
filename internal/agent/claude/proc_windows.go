@@ -8,6 +8,9 @@ import (
 	"syscall"
 )
 
+// sigTerm is ignored on Windows (signalProcessGroup uses taskkill /T).
+var sigTerm syscall.Signal = syscall.Signal(0)
+
 // prepareCmdForKill puts the child into a new process group so the descendant
 // tree can be terminated together.
 func prepareCmdForKill(cmd *exec.Cmd) {
