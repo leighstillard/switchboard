@@ -76,6 +76,15 @@ signature_header = "X-Switchboard-Signature"
 secret = "${CRON_WEBHOOK_SECRET}"
 signature_header = "X-Switchboard-Signature"
 
+# The "api" source gates POST /api/correlate, which lets agents register
+# external-id -> Slack-thread mappings (e.g. a Temporal workflow_id) so routed
+# webhooks land in the originating thread. This endpoint FAILS CLOSED: if no
+# non-empty secret is configured here, /api/correlate is disabled and returns
+# 401 for every request. Set a secret to enable it.
+[ingest.sources.api]
+secret = "${API_CORRELATE_SECRET}"
+signature_header = "X-Switchboard-Signature"
+
 # Cron jobs: scheduled prompt dispatches.
 # Each job fires on schedule, posts the prompt to the target channel,
 # and streams the agent response into a new Slack thread.

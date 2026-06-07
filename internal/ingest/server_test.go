@@ -189,6 +189,98 @@ func TestWebhookPayloadTooLarge(t *testing.T) {
 	}
 }
 
+func TestCorrelate_Unauthenticated(t *testing.T) {
+	st := testStore(t)
+
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources: map[string]config.SourceConfig{
+			"api": {
+				Secret:          "correlate-secret-abcdef",
+				SignatureHeader: "X-Switchboard-Signature",
+			},
+		},
+	}
+
+	srv := NewServer(cfg, st)
+	handler := srv.srv.Handler
+
+	body := []byte(`{"source":"temporal","external_key":"wf-1","channel_id":"C1","thread_ts":"1.1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/correlate", bytes.NewReader(body))
+	// No signature headers -> must be rejected.
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+func TestCorrelate_NoSecretConfiguredFailsClosed(t *testing.T) {
+	st := testStore(t)
+
+	// No "api" source secret configured. Unlike webhook handlers (which skip
+	// HMAC in dev mode), the correlate endpoint must fail closed.
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources:    map[string]config.SourceConfig{},
+	}
+
+	srv := NewServer(cfg, st)
+	handler := srv.srv.Handler
+
+	body := []byte(`{"source":"temporal","external_key":"wf-1","channel_id":"C1","thread_ts":"1.1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/correlate", bytes.NewReader(body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+func TestCorrelate_AuthenticatedSucceeds(t *testing.T) {
+	st := testStore(t)
+	secret := "correlate-secret-abcdef"
+
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources: map[string]config.SourceConfig{
+			"api": {
+				Secret:          secret,
+				SignatureHeader: "X-Switchboard-Signature",
+			},
+		},
+	}
+
+	srv := NewServer(cfg, st)
+	handler := srv.srv.Handler
+
+	body := []byte(`{"source":"temporal","external_key":"wf-1","channel_id":"C1","thread_ts":"1.1"}`)
+	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	message := []byte(timestamp + "." + string(body))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(message)
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/correlate", bytes.NewReader(body))
+	req.Header.Set("X-Switchboard-Signature", signature)
+	req.Header.Set("X-Switchboard-Timestamp", timestamp)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	st := testStore(t)
 	cfg := config.IngestConfig{ListenAddr: "127.0.0.1:0"}

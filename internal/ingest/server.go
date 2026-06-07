@@ -67,6 +67,7 @@ func NewServer(cfg config.IngestConfig, st *store.Store) *Server {
 	mux.HandleFunc("/webhook/generic", s.handleWebhookGeneric)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/dispatch", s.handleDispatch)
+	mux.HandleFunc("/api/correlate", s.handleCorrelate)
 	mux.HandleFunc("/test/inject", s.handleTestInject)
 
 	s.srv = &http.Server{
@@ -285,6 +286,111 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		"thread_ts":  threadTS,
 		"session_id": sessionID,
 	})
+}
+
+// handleCorrelate creates a thread correlation for webhook routing.
+// POST /api/correlate with JSON body:
+//
+//	{
+//	  "source": "temporal",
+//	  "external_key": "workflow-id-123",
+//	  "channel_id": "C0ALZC59C8Z",
+//	  "thread_ts": "1780306532.346999",
+//	  "ttl_days": 7
+//	}
+//
+// This allows agents to register a mapping from an external ID (e.g. Temporal
+// workflow_id) to a Slack thread, so that when a webhook arrives with that ID,
+// switchboard routes the notification to the originating thread.
+func (s *Server) handleCorrelate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read body with the same size limit used by webhook handlers.
+	maxBody := int64(s.cfg.MaxBodyKB) * 1024
+	if maxBody <= 0 {
+		maxBody = 1024 * 1024 // default 1MB
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxBody {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Fail closed: unlike the webhook handlers (which skip HMAC in dev mode
+	// when no secret is set), the correlate write can redirect routed webhook
+	// notifications, so it must never be reachable unauthenticated. Require a
+	// non-empty "api" source secret to be configured; otherwise reject.
+	if srcCfg, ok := s.cfg.Sources["api"]; !ok || srcCfg.Secret == "" {
+		slog.Warn("api: correlate rejected, no api source secret configured", "remote", r.RemoteAddr)
+		http.Error(w, "correlate endpoint disabled: no api secret configured", http.StatusUnauthorized)
+		return
+	}
+
+	// Authenticate the request using the same HMAC verification as /webhook/*.
+	// The correlation write is gated by the "api" ingest source secret.
+	if !s.verifySignature("api", r, body) {
+		slog.Warn("api: correlate HMAC verification failed", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Source      string `json:"source"`
+		ExternalKey string `json:"external_key"`
+		ChannelID   string `json:"channel_id"`
+		ThreadTS    string `json:"thread_ts"`
+		TTLDays     int    `json:"ttl_days"`
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Source == "" || req.ExternalKey == "" || req.ChannelID == "" || req.ThreadTS == "" {
+		http.Error(w, "source, external_key, channel_id, and thread_ts are required", http.StatusBadRequest)
+		return
+	}
+
+	if req.TTLDays <= 0 {
+		req.TTLDays = 7
+	}
+
+	now := time.Now().Unix()
+	expiresAt := now + int64(req.TTLDays)*86400
+	corr := &store.ThreadCorrelation{
+		Source:      req.Source,
+		ExternalKey: req.ExternalKey,
+		ChannelID:   req.ChannelID,
+		ThreadTS:    req.ThreadTS,
+		CreatedAt:   now,
+		ExpiresAt:   &expiresAt,
+		CreatedBy:   "api",
+	}
+
+	if err := s.store.UpsertCorrelation(corr); err != nil {
+		slog.Error("api: correlate failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("api: correlation created",
+		"source", req.Source,
+		"key", req.ExternalKey,
+		"channel", req.ChannelID,
+		"thread_ts", req.ThreadTS,
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "created"})
 }
 
 // handleTestInject accepts simulated Slack messages for e2e testing.
