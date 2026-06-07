@@ -811,10 +811,13 @@ func (r *Router) consumeEvents(ctx context.Context, sessionID string, events <-c
 				continue
 			}
 
-			// Handle session ready event (friendly name update).
+			// Handle session ready event (friendly name update). Use a friendly
+			// label (jcode animal, else compact model name) rather than the raw
+			// session id — otherwise the claude backend's bare UUID leaks into
+			// the Slack header.
 			if ev.Type == agent.EventSessionReady {
-				if ev.SessionID != "" {
-					coal.SetFriendlyName(ev.SessionID)
+				if label := sessionLabel(ev.SessionID, ev.Model); label != "" {
+					coal.SetFriendlyName(label)
 				}
 				continue
 			}
@@ -1735,6 +1738,37 @@ func extractFriendlyName(sessionID string) string {
 		return parts[1]
 	}
 	return ""
+}
+
+// sessionLabel returns a human-friendly label for a session header: the animal
+// name embedded in a jcode session id, otherwise a compact model name (the
+// claude backend uses a bare UUID, so its label comes from the model). Returns
+// "" when neither is available (caller leaves the existing label untouched).
+func sessionLabel(sessionID, model string) string {
+	if fn := extractFriendlyName(sessionID); fn != "" {
+		return fn
+	}
+	return cleanModelName(model)
+}
+
+// cleanModelName turns a model id into a compact label by dropping a trailing
+// date snapshot, e.g. "claude-sonnet-4-20250514" -> "claude-sonnet-4". Versioned
+// ids without a date (e.g. "claude-sonnet-4-6") are left unchanged.
+func cleanModelName(model string) string {
+	i := strings.LastIndex(model, "-")
+	if i <= 0 {
+		return model
+	}
+	suffix := model[i+1:]
+	if len(suffix) != 8 {
+		return model
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return model
+		}
+	}
+	return model[:i]
 }
 
 // ---------------------------------------------------------------------------

@@ -290,3 +290,34 @@ func TestValidateLLMThreadID(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanModelName(t *testing.T) {
+	cases := map[string]string{
+		"claude-sonnet-4-20250514":  "claude-sonnet-4",
+		"claude-3-5-haiku-20241022": "claude-3-5-haiku",
+		"claude-sonnet-4-6":         "claude-sonnet-4-6", // not a date snapshot
+		"claude-opus-4-8":           "claude-opus-4-8",
+		"claude-sonnet-4":           "claude-sonnet-4",
+		"":                          "",
+	}
+	for in, want := range cases {
+		if got := cleanModelName(in); got != want {
+			t.Errorf("cleanModelName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSessionLabel(t *testing.T) {
+	cases := []struct {
+		sessionID, model, want string
+	}{
+		{"session_snake_1777_abc", "claude-sonnet-4-20250514", "snake"},   // jcode animal wins
+		{"574853d1-1014-43b8-a8be-bb631a5fb7c1", "claude-sonnet-4-20250514", "claude-sonnet-4"}, // claude UUID → clean model
+		{"574853d1-1014-43b8-a8be-bb631a5fb7c1", "", ""},                   // no model → empty (caller skips)
+	}
+	for _, c := range cases {
+		if got := sessionLabel(c.sessionID, c.model); got != c.want {
+			t.Errorf("sessionLabel(%q,%q) = %q, want %q", c.sessionID, c.model, got, c.want)
+		}
+	}
+}
