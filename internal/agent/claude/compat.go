@@ -3,9 +3,25 @@ package claude
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 )
+
+// ProbeVersion runs `<binary> --version` and returns the trimmed version string
+// (e.g. "2.1.168 (Claude Code)").
+func ProbeVersion(binary string) (string, error) {
+	out, err := exec.Command(binary, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("claude: %q --version failed: %w", binary, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// CheckVersionRange is the exported wrapper over checkVersionRange.
+func CheckVersionRange(detected, minV, maxV string) (belowMin, aboveMax bool, err error) {
+	return checkVersionRange(detected, minV, maxV)
+}
 
 // version is a parsed semantic-ish CLI version (major, minor, patch).
 type version = [3]int
