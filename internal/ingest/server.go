@@ -323,6 +323,16 @@ func (s *Server) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fail closed: unlike the webhook handlers (which skip HMAC in dev mode
+	// when no secret is set), the correlate write can redirect routed webhook
+	// notifications, so it must never be reachable unauthenticated. Require a
+	// non-empty "api" source secret to be configured; otherwise reject.
+	if srcCfg, ok := s.cfg.Sources["api"]; !ok || srcCfg.Secret == "" {
+		slog.Warn("api: correlate rejected, no api source secret configured", "remote", r.RemoteAddr)
+		http.Error(w, "correlate endpoint disabled: no api secret configured", http.StatusUnauthorized)
+		return
+	}
+
 	// Authenticate the request using the same HMAC verification as /webhook/*.
 	// The correlation write is gated by the "api" ingest source secret.
 	if !s.verifySignature("api", r, body) {

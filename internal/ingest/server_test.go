@@ -218,6 +218,31 @@ func TestCorrelate_Unauthenticated(t *testing.T) {
 	}
 }
 
+func TestCorrelate_NoSecretConfiguredFailsClosed(t *testing.T) {
+	st := testStore(t)
+
+	// No "api" source secret configured. Unlike webhook handlers (which skip
+	// HMAC in dev mode), the correlate endpoint must fail closed.
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources:    map[string]config.SourceConfig{},
+	}
+
+	srv := NewServer(cfg, st)
+	handler := srv.srv.Handler
+
+	body := []byte(`{"source":"temporal","external_key":"wf-1","channel_id":"C1","thread_ts":"1.1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/correlate", bytes.NewReader(body))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d; body = %s", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
 func TestCorrelate_AuthenticatedSucceeds(t *testing.T) {
 	st := testStore(t)
 	secret := "correlate-secret-abcdef"
