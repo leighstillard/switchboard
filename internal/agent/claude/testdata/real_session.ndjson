@@ -1,0 +1,32 @@
+{"type": "system", "subtype": "init", "session_id": "00000000-0000-0000-0000-000000000000", "model": "claude-sonnet-4-20250514"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "user", "message": {"role": "user", "content": "[redacted prompt]"}, "isReplay": true}
+{"type": "assistant", "message": {"role": "assistant", "content": []}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "HELLO-ONE"}]}}
+{"type": "result", "subtype": "success", "is_error": false}
+{"type": "system", "subtype": "init", "session_id": "00000000-0000-0000-0000-000000000000", "model": "claude-sonnet-4-20250514"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "user", "message": {"role": "user", "content": "[redacted prompt]"}, "isReplay": true}
+{"type": "assistant", "message": {"role": "assistant", "content": []}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_test01", "name": "Bash", "input": {"command": "echo test", "description": "test command"}}]}}
+{"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_test01", "type": "tool_result", "is_error": false}]}}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "assistant", "message": {"role": "assistant", "content": []}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "[redacted assistant text]"}]}}
+{"type": "result", "subtype": "success", "is_error": false}
+{"type": "system", "subtype": "init", "session_id": "00000000-0000-0000-0000-000000000000", "model": "claude-sonnet-4-20250514"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "system", "subtype": "thinking_tokens"}
+{"type": "user", "message": {"role": "user", "content": "[redacted prompt]"}, "isReplay": true}
+{"type": "assistant", "message": {"role": "assistant", "content": []}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "[redacted assistant text]"}]}}
+{"type": "result", "subtype": "success", "is_error": false}
