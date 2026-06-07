@@ -41,6 +41,7 @@ type TurnQueueItem struct {
 	ID              int64
 	ChannelID       string
 	ThreadTS        string
+	MessageTS       string // TS of the original user message (for reaction updates)
 	EnqueuedAt      int64
 	UserID          string
 	Text            string
@@ -248,6 +249,11 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("v5: %w", err)
 		}
 	}
+	if version < 6 {
+		if err := migrateV6(db); err != nil {
+			return fmt.Errorf("v6: %w", err)
+		}
+	}
 
 	// Self-heal backstops. Branch worktrees that share one data_dir can advance
 	// user_version past a given migration via a different migration lineage,
@@ -258,6 +264,9 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureCronLastFiredTable(db); err != nil {
 		return fmt.Errorf("ensure cron_last_fired table: %w", err)
+	}
+	if err := ensureMessageTSColumn(db); err != nil {
+		return fmt.Errorf("ensure message_ts column: %w", err)
 	}
 
 	return nil
@@ -492,9 +501,30 @@ func migrateV5(db *sql.DB) error {
 	return err
 }
 
+// migrateV6 adds the turn_queue.message_ts column used to track the original
+// user message TS so its queued-reaction can be updated when actioned.
+func migrateV6(db *sql.DB) error {
+	if err := ensureMessageTSColumn(db); err != nil {
+		return err
+	}
+	_, err := db.Exec("PRAGMA user_version = 6")
+	return err
+}
+
 // isDuplicateColumnErr checks if a SQLite error is a "duplicate column name" error.
 func isDuplicateColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column name")
+}
+
+// ensureMessageTSColumn guarantees turn_queue.message_ts exists independent of
+// user_version. ALTER TABLE ADD COLUMN is idempotent here: a duplicate-column
+// error means it is already present, which we treat as success.
+func ensureMessageTSColumn(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE turn_queue ADD COLUMN message_ts TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !isDuplicateColumnErr(err) {
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -799,9 +829,9 @@ func (s *Store) EnqueueTurn(t *TurnQueueItem) error {
 	defer s.mu.Unlock()
 
 	res, err := s.db.Exec(`
-		INSERT INTO turn_queue (channel_id, thread_ts, enqueued_at, user_id, text, attachments_json)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		t.ChannelID, t.ThreadTS, t.EnqueuedAt, t.UserID, t.Text, t.AttachmentsJSON,
+		INSERT INTO turn_queue (channel_id, thread_ts, message_ts, enqueued_at, user_id, text, attachments_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.ChannelID, t.ThreadTS, t.MessageTS, t.EnqueuedAt, t.UserID, t.Text, t.AttachmentsJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("store: enqueue turn: %w", err)
@@ -838,7 +868,7 @@ func (s *Store) DrainTurns(channelID, threadTS string) ([]*TurnQueueItem, error)
 	defer tx.Rollback()
 
 	rows, err := tx.Query(`
-		SELECT id, channel_id, thread_ts, enqueued_at, user_id, text, attachments_json
+		SELECT id, channel_id, thread_ts, message_ts, enqueued_at, user_id, text, attachments_json
 		FROM turn_queue
 		WHERE channel_id = ? AND thread_ts = ?
 		ORDER BY enqueued_at ASC, id ASC`,
@@ -851,7 +881,7 @@ func (s *Store) DrainTurns(channelID, threadTS string) ([]*TurnQueueItem, error)
 	var items []*TurnQueueItem
 	for rows.Next() {
 		t := &TurnQueueItem{}
-		if err := rows.Scan(&t.ID, &t.ChannelID, &t.ThreadTS, &t.EnqueuedAt,
+		if err := rows.Scan(&t.ID, &t.ChannelID, &t.ThreadTS, &t.MessageTS, &t.EnqueuedAt,
 			&t.UserID, &t.Text, &t.AttachmentsJSON); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("store: drain turns scan: %w", err)

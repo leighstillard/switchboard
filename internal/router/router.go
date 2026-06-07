@@ -675,6 +675,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		item := &store.TurnQueueItem{
 			ChannelID:  msg.ChannelID,
 			ThreadTS:   threadTS,
+			MessageTS:  msg.MessageTS,
 			EnqueuedAt: time.Now().Unix(),
 			UserID:     msg.UserID,
 			Text:       msg.Text,
@@ -720,6 +721,9 @@ func (r *Router) handleCommand(ctx context.Context, msg *slack.InboundMessage) b
 			return false
 		}
 		turns, _ := r.store.DrainTurns(msg.ChannelID, threadTS)
+		// Clear the queued (📋) reaction on the drained messages; they are
+		// no longer queued.
+		r.swapQueuedReactions(turns, "")
 		r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "wastebasket")
 		if len(turns) > 0 {
 			r.outbound.Enqueue(&outbound.OutboundItem{
@@ -944,8 +948,26 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 		return
 	}
 
+	// Swap reactions on the queued messages: remove 📋, add 👀.
+	r.swapQueuedReactions(turns, "eyes")
+
 	r.store.UpdateSessionActivity(channelID, threadTS)
 	slog.Info("router: sent queued batch", "session_id", sessionID, "count", len(turns))
+}
+
+// swapQueuedReactions removes the queued (📋) reaction from each turn's
+// originating message and, when add is non-empty, adds that reaction. Used on
+// every dequeue path so drained messages never keep a stale 📋 reaction.
+func (r *Router) swapQueuedReactions(turns []*store.TurnQueueItem, add string) {
+	for _, t := range turns {
+		if t.MessageTS == "" {
+			continue
+		}
+		r.edge.RemoveReaction(t.ChannelID, t.MessageTS, "clipboard")
+		if add != "" {
+			r.edge.AddReaction(t.ChannelID, t.MessageTS, add)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
