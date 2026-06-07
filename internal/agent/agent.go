@@ -100,6 +100,11 @@ type Backend interface {
 	// Cancel aborts the current generation turn for the specified session.
 	Cancel(ctx context.Context, sessionID string) error
 
+	// CloseSession permanently tears down ONE session (process/connection +
+	// event channel, exactly once) without affecting other sessions. It does
+	// not touch the store — persistence is owned by the router/store layer.
+	CloseSession(ctx context.Context, sessionID string) error
+
 	// Close shuts down all sessions and releases resources.
 	Close() error
 }

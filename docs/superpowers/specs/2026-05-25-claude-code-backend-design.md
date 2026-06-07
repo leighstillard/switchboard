@@ -6,6 +6,18 @@
 
 ## Revision history
 
+- **2026-06-07 — Implementation correction: persistent mode emits full messages,
+  not deltas.** During PR 1 implementation the streaming-granularity smoke test
+  was run against the real CLI and proved that persistent interactive mode
+  (`--input-format stream-json`, no `--include-partial-messages`) emits **no**
+  `stream_event` / `content_block_delta` lines at all. Text and tool calls arrive
+  as **full `assistant` messages**; this is the root cause of the empty-response
+  bug (the merged translator parsed the never-occurring `stream_event` schema).
+  The translator, the §Normalized event vocabulary table, and §Invocation notes
+  are corrected accordingly: full-message parsing, no `ToolInputDelta` for claude,
+  `ToolExec` synthesized per `tool_use` block, `MessageEnd` per assistant message,
+  text never sourced from `result`. cc-connect parses full messages the same way.
+
 - **2026-06-07 — Auth, env, and agent-switching revision.** Seven changes:
   1. **`--bare` removed.** `claude --help` documents `--bare` as forcing Anthropic
      auth to be "strictly `ANTHROPIC_API_KEY` or apiKeyHelper via `--settings`
@@ -178,18 +190,25 @@ Notes on each flag:
 - **No `-p '' `.** Print mode forces a single-turn run that exits when stdin
   closes; we want a session-lifetime process that reads many turns from stdin.
 - **`--input-format stream-json` + `--output-format stream-json`.** Bidirectional
-  stream-json over stdio. Turns in, events out, all NDJSON. In this mode the
-  CLI emits `content_block_delta` events natively for text and tool input
-  streaming — no additional flag required.
+  stream-json over stdio. Turns in, events out, all NDJSON. **CORRECTION
+  (verified by capture, 2026-06-07):** in this persistent, interactive mode the
+  CLI does **not** emit `stream_event` / `content_block_delta` lines. Text and
+  tool calls arrive as **full `assistant` messages** (`message.content[]` with
+  `text` / `thinking` / `tool_use` blocks), tool results as `user`/`tool_result`,
+  and the turn terminates with `result`. The earlier assumption that base
+  stream-json yields native deltas in this mode was wrong — `content_block_delta`
+  is produced only under `--print` + `--include-partial-messages`. The translator
+  is built against the full-message schema (see §Normalized event vocabulary).
 - **`--verbose`.** Required when `--output-format stream-json` is combined with
   the interactive (non-`-p`) run; the CLI rejects the combination without it.
 - **No `--include-partial-messages`.** The CLI documents this flag as
-  *"only works with --print"*; we are not in print mode. We rely on the base
-  stream-json's `content_block_delta` granularity for live text and tool-input
-  streaming. The cc-connect reference also omits this flag, confirming the
-  base stream is sufficient. (A smoke test in the first implementation PR will
-  verify text/tool deltas actually arrive at expected cadence; if they don't,
-  fall back to the multi-message-per-turn pattern and accept coarser UX.)
+  *"only works with --print"*; we are not in print mode. The streaming-granularity
+  smoke test was **run against the real CLI and confirmed there are no deltas in
+  persistent mode** — so we take the documented fallback: the **full-message
+  per-turn pattern** (text appears per assistant message, not token-by-token).
+  For Slack's coalesced, periodically-flushed output this coarser cadence is
+  fine. The cc-connect reference also parses full `assistant` messages, not
+  deltas.
 - **`--permission-prompt-tool stdio`.** Permission requests come back as
   `control_request` lines on stdout; we respond with `control_response` lines
   on stdin. **Not** `--permission-mode bypassPermissions` — the bypass path
@@ -364,22 +383,30 @@ event streams into `agent.Event`.
 
 ## Normalized event vocabulary (`internal/agent/event.go`)
 
+claude sources reflect the **full-message** schema actually emitted in persistent
+mode (verified by capture — there are no `stream_event` lines; see §Invocation):
+
 | `agent.Event`                          | jcode source            | claude source                              |
 |----------------------------------------|-------------------------|--------------------------------------------|
-| `SessionReady{ID, Model}`              | `swarm_status`/`session`| `system/init`                              |
-| `TextDelta{Text}`                      | `text_delta`            | `stream_event` → `content_block_delta`/`text_delta` |
+| `SessionReady{ID, Model}`              | `swarm_status`/`session`| `system/init` (`session_id`, `model`)      |
+| `TextDelta{Text}`                      | `text_delta`            | `assistant` → content `text` block (one per block; appended) |
 | `TextReplace{Text}`                    | `text_replace`          | *(never emitted)*                          |
-| `ToolStart{ID, Name, Input}`           | `tool_start`            | `stream_event` → `content_block_start` (tool_use) |
-| `ToolInputDelta{ID, PartialJSON}`      | `tool_input`            | `stream_event` → `content_block_delta`/`input_json_delta` |
-| `ToolExec{ID}`                         | `tool_exec`             | synthesized at tool_use `content_block_stop` |
-| `ToolDone{ID, Name, IsError}`          | `tool_done`             | `user` → `tool_result` (`is_error`); Name threaded from the tool_use block |
-| `MessageEnd`                           | `message_end`           | `stream_event` → `message_stop`            |
+| `ToolStart{ID, Name, Input}`           | `tool_start`            | `assistant` → content `tool_use` block (full input) |
+| `ToolInputDelta{ID, PartialJSON}`      | `tool_input`            | *(never emitted — full input is on ToolStart)* |
+| `ToolExec{ID}`                         | `tool_exec`             | synthesized immediately after each `tool_use` block |
+| `ToolDone{ID, Name, IsError}`          | `tool_done`             | `user` → `tool_result` (`is_error`); Name threaded from the tool_use block then evicted |
+| `MessageEnd`                           | `message_end`           | synthesized at the end of each `assistant` message |
 | `TurnDone`                             | `done`                  | `result` (subtype `success`)               |
-| `TurnError{Message}`                   | `error`                 | `result` (subtype != `success`) / terminal `system/api_retry` |
+| `TurnError{Message}`                   | `error`                 | `result` (subtype != `success`)            |
 | `Interrupted`                          | `interrupted`           | synthesized on cancel/kill/crash           |
 | `ImageGenerated{Path, Caption}`        | `generated_image`       | *(n/a — degrade)*                          |
 | `Notification{Kind, From, Message}`    | `notification`          | *(n/a — degrade)*                          |
 | `Provider{Name}`                       | `upstream_provider`     | *(n/a — degrade; model carried on `SessionReady`)* |
+
+Because claude does not stream `ToolInputDelta`, the coalescer sources tool input
+from the `ToolStart` entry when no delta buffer exists (so ScheduleWakeup's
+countdown still starts). The result's `result` text is **not** emitted — it
+repeats the last assistant text and would duplicate output.
 
 "Full parity" means every event a backend **can** express is mapped; the rest
 degrade silently. `coalesce` already tolerates the absence of images,
@@ -390,10 +417,8 @@ that would conflate "provider" with "model", and the model is already carried on
 
 ### Notes on the claude translation
 
-- **Thinking blocks are silently dropped.** `content_block_start` of type
-  `thinking` and its `thinking_delta` / `signature_delta` updates produce no
-  `agent.Event`. Already the case in the merged translator (`translate.go:175`,
-  `:227`).
+- **Thinking blocks are silently dropped.** A `thinking` block inside an
+  `assistant` message produces no `agent.Event` (`translate.go` `handleAssistant`).
 
 - **`control_request` lines are handled by the process layer, not the
   translator.** They do not flow into `agent.Event`. The process layer auto-
@@ -401,47 +426,42 @@ that would conflate "provider" with "model", and the model is already carried on
   policy needs UI surfacing (e.g. `prompt_in_slack`), introduce a new
   `agent.EventPermissionRequest` then — not now.
 
-- **ToolStart / ToolInputDelta / ToolExec** are reconstructed from the partial
-  stream: `content_block_start` for a `tool_use` block → `ToolStart` (id, name,
-  initial input); successive `input_json_delta` → `ToolInputDelta`; the block's
-  `content_block_stop` → `ToolExec`. This matches jcode's
-  start→input→exec→done lifecycle that the inline-tool-summary feature relies on.
+- **ToolStart / ToolExec from full messages.** A `tool_use` block in an
+  `assistant` message carries its **complete** input, so the translator emits
+  `ToolStart{id, name, input}` immediately followed by `ToolExec{id}` — there are
+  no `input_json_delta` lines and therefore **no `ToolInputDelta`** for claude.
+  This still drives jcode's start→exec→done lifecycle the inline-tool-summary
+  feature relies on. Because the full input rides on `ToolStart`, `coalesce`
+  sources tool input from the `ToolStart` entry when no delta buffer exists (so
+  ScheduleWakeup's countdown fires) — see the coalesce `ToolExec` handler.
 
-- **LOAD-BEARING ORDERING INVARIANT** (`coalesce.go` `EventToolInput` handler):
-  `coalesce` routes tool-input deltas to *"the most recently started non-exec
-  tool"* — it does **not** use the tool ID for routing. Therefore the claude
-  translator MUST NOT emit `ToolStart` for block N+1 before emitting `ToolExec`
-  (= `content_block_stop`) for block N. Anthropic's SSE emits tool_use blocks
-  strictly sequentially (start→delta→stop per block index, one at a time), so this
-  invariant holds naturally — but it is load-bearing and must be **explicitly
-  tested** in the claude translator (a test that asserts no overlapping open
-  tool blocks). See "ToolInputDelta routing" under the jcode adapter for why the
-  normalized event carries an ID even though jcode's coalesce path ignores it.
+- **LOAD-BEARING ORDERING INVARIANT** (`coalesce.go` routes tool-input deltas to
+  *"the most recently started non-exec tool"*): the claude translator emits
+  `ToolStart` immediately followed by its `ToolExec`, so two tool blocks are never
+  open at once even within one assistant message. Explicitly tested
+  (`TestToolBlockOrderingInvariant`). The empty-ID jcode delta path is unchanged.
 
 - **ToolDone** comes from the subsequent `user`/`tool_result` event, matched by
   `tool_use_id`. claude's `tool_result` does **not** carry the tool name; the
-  translator threads `Name` through from the earlier `tool_use` block. (coalesce
-  resolves the display description by ID regardless, so an empty Name is
-  tolerated — but threading it keeps the two backends symmetric.)
+  translator threads `Name` from the earlier `tool_use` block, then **evicts** the
+  mapping to bound `toolNames` growth in a long-running session.
 
 - **TurnError** distinguishes a failed turn via `result.subtype != "success"` —
-  implemented as an **inequality, not an enumerated allow-list**, so a future
-  error subtype (`error_max_budget_usd`, etc.) is never silently treated as
-  success. A terminal `api_retry` that exhausts retries also maps here.
+  an **inequality, not an enumerated allow-list**, so a future error subtype
+  (`error_max_budget_usd`, etc.) is never silently treated as success.
 
 - **MessageEnd is non-finalizing.** In `coalesce`, `MessageEnd` triggers
-  `flushLocked(false)` — a progress flush with **no** reset. Only `TurnDone` /
-  `TurnError` / `Interrupted` call `flushLocked(true)` + `resetForNextTurn()`.
-  This matters because a single claude *turn* can contain multiple assistant
-  messages (assistant → tool_result → assistant, all inside one `result`), each
-  bracketed by `message_start` / `message_stop`. Mapping every `message_stop` →
-  `MessageEnd` is therefore **safe and correct**: it produces multiple mid-turn
-  progress flushes (good UX), and the turn only finalizes/resets on the terminal
-  `result` → `TurnDone`. The translator must emit `TurnDone` **only** from
-  `result`, never from `message_stop`.
+  `flushLocked(false)` — a progress flush with **no** reset (and a no-op when not
+  dirty). Only `TurnDone` / `TurnError` / `Interrupted` finalize + reset. A single
+  claude *turn* can contain multiple `assistant` messages (assistant → tool_result
+  → assistant, all inside one `result`); the translator emits one `MessageEnd` per
+  assistant message (good mid-turn progress) and emits `TurnDone` **only** from
+  `result`, never per message.
 
-- The full-message `assistant` and `user` events are used as authoritative
-  fallbacks/reconciliation if a partial stream is incomplete.
+- **Text is emitted once, never from `result`.** Each `assistant` text block →
+  one `TextDelta` (the coalescer appends, so multiple messages in a turn
+  concatenate). The terminal `result.result` repeats the last assistant text and
+  is deliberately **not** emitted, avoiding duplicated output.
 
 ## Backend interface (`internal/agent/backend.go`)
 
@@ -665,18 +685,15 @@ surface, both of which can change across releases. Two guards:
    is selected, **warn** otherwise. A version above a configured ceiling logs a
    warning ("untested CLI version") but proceeds, so a routine CLI upgrade is not
    a hard outage — the smoke tests are the real compatibility gate.
-2. **Protocol probe, in two stages** (codex P2 — `system/init` alone cannot
-   prove the later stream-event envelope, so don't claim it does):
-   - *Stage 2a — init shape.* Validate the first `system/init` for the fields the
-     backend reads from it directly (`session_id`, model). If it is absent or
-     malformed, emit `TurnError` "incompatible claude CLI protocol (init)".
-   - *Stage 2b — first stream event.* On the **first real turn**, validate the
-     first `stream_event` envelope the translator depends on (the
-     `content_block_delta` shape) **within a timeout**. If no well-formed stream
-     event arrives before the timeout, emit `TurnError` "incompatible claude CLI
-     protocol (stream)". This catches an envelope change that `system/init`
-     cannot reveal, and replaces the silent-empty-turn failure mode that
-     motivated this revision with an explicit, actionable error.
+2. **Protocol probe.** *Stage 2a — init shape.* Validate the first `system/init`
+   for the fields the backend reads from it directly (`session_id`, model). If it
+   is absent or malformed, emit `TurnError` "incompatible claude CLI protocol
+   (init)". *(The earlier "Stage 2b — first stream_event envelope" probe is moot:
+   persistent mode emits no `stream_event` lines. The real compatibility gate for
+   the message schema is the build-tag **subscription smoke test**, which asserts
+   a non-empty assistant `text` response on a real multi-turn session — a schema
+   change that broke full-message parsing would fail it loudly rather than
+   silently empty the turn.)*
 
 Pinning the exact CLI version in the deployment (e.g. the install step records a
 known-good version) is recommended operationally; the config range is the
@@ -957,15 +974,16 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
     `Close` must terminate both. Skipped on non-Unix.
 - **`internal/agent/claude/streaming_smoke_test.go`** (new, build-tag-gated;
   not part of the default test pass) — spawns a real `claude` with our flag set
-  (`--setting-sources project,local`, minus `--include-partial-messages`). Two
-  assertions, both before the terminal `result`:
-  1. A short text-only prompt produces at least one `content_block_delta`
-     with `text_delta`.
-  2. A prompt that provokes a tool call (e.g. "list files in `/tmp`")
-     produces at least one `content_block_delta` with `input_json_delta`.
-  Together these validate that base stream-json gives us live deltas for
-  **both** text and tool input without `--include-partial-messages`. Gated
-  behind a build tag because it needs a real binary and a real model.
+  (`--setting-sources project,local`, minus `--include-partial-messages`) and
+  records the raw stream. It **characterises** the persistent-mode schema:
+  1. A short text-only prompt produces a full `assistant` message with a
+     non-empty `text` block (and the turn ends with `result`).
+  2. A prompt that provokes a tool call produces an `assistant` `tool_use` block
+     and a following `user`/`tool_result`.
+  It also asserts **no `stream_event` lines appear** — the documented reality
+  that motivated the full-message translator (if a future CLI *does* start
+  streaming deltas, this test flips and we revisit). Gated behind a build tag
+  because it needs a real binary and a real model.
 - **`internal/agent/claude/subscription_smoke_test.go`** (new, build-tag-gated)
   — the load-bearing end-to-end guard for this revision. It must run against the
   operator's **Claude subscription**, so the test:

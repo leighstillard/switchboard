@@ -67,9 +67,10 @@ type segment struct {
 type ToolProgress struct {
 	ID          string
 	Name        string
-	Description string // human-friendly, e.g. "Reading `auth.go`"
-	Output      string // only populated on done
-	Error       string // only populated on done with error
+	Description string         // human-friendly, e.g. "Reading `auth.go`"
+	Input       map[string]any // full input from ToolStart (claude); nil when only streamed via deltas
+	Output      string         // only populated on done
+	Error       string         // only populated on done with error
 	Done        bool
 	Exec        bool // true after tool_exec (actively running)
 }
@@ -337,6 +338,7 @@ func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 			ID:          ev.ToolID,
 			Name:        ev.ToolName,
 			Description: desc,
+			Input:       ev.ToolInput,
 		})
 		sc.dirty = true
 
@@ -368,24 +370,33 @@ func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 		for i := range sc.pendingTools {
 			if sc.pendingTools[i].ID == ev.ToolID {
 				sc.pendingTools[i].Exec = true
-				// Parse accumulated tool input and update description.
+				// Determine the tool input: streamed deltas (jcode) take
+				// precedence; otherwise fall back to the complete input
+				// captured on ToolStart (claude's full-message mode emits no
+				// input deltas). Either way the description is refreshed and
+				// ScheduleWakeup starts its countdown.
+				var input map[string]any
 				if buf, ok := sc.toolInputBufs[ev.ToolID]; ok && buf.Len() > 0 {
 					rawInput := buf.String()
-					var input map[string]any
-					if err := json.Unmarshal([]byte(rawInput), &input); err == nil {
-						desc := render.Describe(ev.ToolName, input)
-						sc.driftMonitor.Record(desc)
-						sc.pendingTools[i].Description = desc
-
-						// Detect ScheduleWakeup and start countdown timer.
-						if ev.ToolName == "ScheduleWakeup" {
-							sc.startCountdown(input)
-						}
-					} else {
+					if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
 						slog.Debug("coalescer: failed to parse tool input",
 							"tool", ev.ToolName, "err", err, "raw_len", len(rawInput))
+						input = nil
 					}
 					delete(sc.toolInputBufs, ev.ToolID)
+				} else {
+					input = sc.pendingTools[i].Input
+				}
+
+				if input != nil {
+					desc := render.Describe(ev.ToolName, input)
+					sc.driftMonitor.Record(desc)
+					sc.pendingTools[i].Description = desc
+
+					// Detect ScheduleWakeup and start countdown timer.
+					if ev.ToolName == "ScheduleWakeup" {
+						sc.startCountdown(input)
+					}
 				}
 				break
 			}

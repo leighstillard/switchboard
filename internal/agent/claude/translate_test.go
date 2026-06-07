@@ -1,6 +1,8 @@
 package claude
 
 import (
+	"bufio"
+	"os"
 	"testing"
 
 	"github.com/format5/switchboard/internal/agent"
@@ -35,16 +37,17 @@ func requireEventTypes(t *testing.T, events []agent.Event, want []agent.EventTyp
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Real persistent-mode schema (no --include-partial-messages):
+// text and tools arrive as FULL `assistant` messages, NOT stream_event deltas.
+// Verified by capture against the real CLI (testdata/real_session.ndjson).
 // ---------------------------------------------------------------------------
 
 func TestSessionReady(t *testing.T) {
 	lines := []string{
-		`{"type":"system","subtype":"init","session_id":"c5714ea1-f992-45a8-96d0-9abcc2b845a1","model":"claude-sonnet-4-20250514","cwd":"/home/user","tools":[]}`,
+		`{"type":"system","subtype":"init","session_id":"c5714ea1-f992-45a8-96d0-9abcc2b845a1","model":"claude-sonnet-4-20250514","cwd":"/home/user","permissionMode":"default","apiKeySource":"none"}`,
 	}
 	events := collectEvents(t, lines)
 	requireEventTypes(t, events, []agent.EventType{agent.EventSessionReady})
-
 	if events[0].SessionID != "c5714ea1-f992-45a8-96d0-9abcc2b845a1" {
 		t.Errorf("SessionID = %q", events[0].SessionID)
 	}
@@ -53,153 +56,124 @@ func TestSessionReady(t *testing.T) {
 	}
 }
 
-func TestTextStreaming(t *testing.T) {
+func TestAssistantText(t *testing.T) {
 	lines := []string{
-		`{"type":"stream_event","event":"message_start","message":{"id":"msg_1","type":"message"}}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"HELLO-ONE"}]},"session_id":"s1"}`,
 	}
 	events := collectEvents(t, lines)
 	requireEventTypes(t, events, []agent.EventType{
-		agent.EventTextDelta,
 		agent.EventTextDelta,
 		agent.EventMessageEnd,
 	})
-
-	if events[0].Text != "Hello" {
-		t.Errorf("events[0].Text = %q", events[0].Text)
-	}
-	if events[1].Text != " world" {
-		t.Errorf("events[1].Text = %q", events[1].Text)
+	if events[0].Text != "HELLO-ONE" {
+		t.Errorf("Text = %q, want HELLO-ONE", events[0].Text)
 	}
 }
 
-func TestToolUseLifecycle(t *testing.T) {
+func TestAssistantThinkingDropped(t *testing.T) {
 	lines := []string{
-		// Tool use block starts
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01ABC","name":"Bash"}}`,
-		// Tool input streaming
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}`,
-		// Tool block stops -> ToolExec
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		// User message with tool_result -> ToolDone
-		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01ABC","content":"file1.txt\nfile2.txt","is_error":false}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]},"session_id":"s1"}`,
 	}
 	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventToolStart,
-		agent.EventToolInputDelta,
-		agent.EventToolInputDelta,
-		agent.EventToolExec,
-		agent.EventToolDone,
-	})
-
-	// ToolStart
-	if events[0].ToolID != "toolu_01ABC" || events[0].ToolName != "Bash" {
-		t.Errorf("ToolStart: id=%q name=%q", events[0].ToolID, events[0].ToolName)
-	}
-
-	// ToolInputDelta carries the tool ID
-	if events[1].ToolID != "toolu_01ABC" {
-		t.Errorf("ToolInputDelta[0].ToolID = %q", events[1].ToolID)
-	}
-	if events[1].PartialJSON != `{"cmd":` {
-		t.Errorf("ToolInputDelta[0].PartialJSON = %q", events[1].PartialJSON)
-	}
-
-	// ToolExec
-	if events[3].ToolID != "toolu_01ABC" || events[3].ToolName != "Bash" {
-		t.Errorf("ToolExec: id=%q name=%q", events[3].ToolID, events[3].ToolName)
-	}
-
-	// ToolDone - name threaded from ToolStart
-	if events[4].ToolID != "toolu_01ABC" || events[4].ToolName != "Bash" {
-		t.Errorf("ToolDone: id=%q name=%q", events[4].ToolID, events[4].ToolName)
-	}
-	if events[4].IsError {
-		t.Error("ToolDone.IsError should be false")
-	}
+	// Thinking produces no text; the message still ends with MessageEnd.
+	requireEventTypes(t, events, []agent.EventType{agent.EventMessageEnd})
 }
 
-func TestToolDoneWithError(t *testing.T) {
+func TestAssistantEmptyTextDropped(t *testing.T) {
 	lines := []string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_err","name":"Write"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_err","content":"permission denied","is_error":true}]}}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventToolStart,
-		agent.EventToolExec,
-		agent.EventToolDone,
-	})
-	if !events[2].IsError {
-		t.Error("ToolDone.IsError should be true")
-	}
-}
-
-func TestThinkingBlocksSkipped(t *testing.T) {
-	lines := []string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc123"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Result"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":1}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventTextDelta,
-	})
-	if events[0].Text != "Result" {
-		t.Errorf("expected text 'Result', got %q", events[0].Text)
-	}
-}
-
-func TestHookEventsSkipped(t *testing.T) {
-	lines := []string{
-		`{"type":"system","subtype":"hook_started","hook_id":"h1"}`,
-		`{"type":"system","subtype":"hook_response","hook_id":"h1"}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"after hooks"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventTextDelta,
-	})
-}
-
-func TestAssistantEventsSkipped(t *testing.T) {
-	lines := []string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"full message"}]}}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"streamed"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{agent.EventTextDelta})
-}
-
-func TestMessageEnd(t *testing.T) {
-	lines := []string{
-		`{"type":"stream_event","event":"message_stop"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":""}]},"session_id":"s1"}`,
 	}
 	events := collectEvents(t, lines)
 	requireEventTypes(t, events, []agent.EventType{agent.EventMessageEnd})
 }
 
-func TestTurnDone(t *testing.T) {
+func TestAssistantToolUse(t *testing.T) {
 	lines := []string{
-		`{"type":"result","subtype":"success","cost_usd":0.001,"duration_ms":1234}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01KZ","name":"Bash","input":{"command":"echo hello-from-bash","description":"echo"}}]},"session_id":"s1"}`,
 	}
 	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{agent.EventTurnDone})
+	requireEventTypes(t, events, []agent.EventType{
+		agent.EventToolStart,
+		agent.EventToolExec,
+		agent.EventMessageEnd,
+	})
+	if events[0].ToolID != "toolu_01KZ" || events[0].ToolName != "Bash" {
+		t.Errorf("ToolStart id=%q name=%q", events[0].ToolID, events[0].ToolName)
+	}
+	if events[0].ToolInput["command"] != "echo hello-from-bash" {
+		t.Errorf("ToolStart.ToolInput[command] = %v", events[0].ToolInput["command"])
+	}
+	if events[1].ToolID != "toolu_01KZ" || events[1].ToolName != "Bash" {
+		t.Errorf("ToolExec id=%q name=%q", events[1].ToolID, events[1].ToolName)
+	}
+}
+
+func TestToolResult(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01KZ","name":"Bash","input":{"command":"echo hi"}}]}}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01KZ","type":"tool_result","content":"hi","is_error":false}]},"session_id":"s1"}`,
+	}
+	events := collectEvents(t, lines)
+	requireEventTypes(t, events, []agent.EventType{
+		agent.EventToolStart,
+		agent.EventToolExec,
+		agent.EventMessageEnd,
+		agent.EventToolDone,
+	})
+	done := events[3]
+	if done.ToolID != "toolu_01KZ" || done.ToolName != "Bash" {
+		t.Errorf("ToolDone id=%q name=%q (name must be threaded from tool_use)", done.ToolID, done.ToolName)
+	}
+	if done.IsError {
+		t.Error("ToolDone.IsError should be false")
+	}
+}
+
+func TestToolResultError(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_err","name":"Write","input":{}}]}}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_err","type":"tool_result","content":"permission denied","is_error":true}]}}`,
+	}
+	events := collectEvents(t, lines)
+	last := events[len(events)-1]
+	if last.Type != agent.EventToolDone || !last.IsError {
+		t.Errorf("expected ToolDone with IsError=true, got %+v", last)
+	}
+}
+
+func TestReplayedUserSkipped(t *testing.T) {
+	lines := []string{
+		`{"type":"user","message":{"role":"user","content":"Reply with exactly: HELLO-ONE"},"isReplay":true,"session_id":"s1"}`,
+	}
+	events := collectEvents(t, lines)
+	if len(events) != 0 {
+		t.Errorf("replayed user string message should produce no events, got %d: %+v", len(events), events)
+	}
+}
+
+func TestTurnDoneNoDuplicateText(t *testing.T) {
+	// The `result` line carries result:"HELLO-ONE" which repeats the last
+	// assistant text. The translator MUST NOT emit it as text (duplicate-text bug).
+	lines := []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"HELLO-ONE"}]}}`,
+		`{"type":"result","subtype":"success","result":"HELLO-ONE","session_id":"s1","usage":{"input_tokens":10,"output_tokens":7}}`,
+	}
+	events := collectEvents(t, lines)
+	requireEventTypes(t, events, []agent.EventType{
+		agent.EventTextDelta,
+		agent.EventMessageEnd,
+		agent.EventTurnDone,
+	})
+	// Exactly one text event, carrying the text once.
+	textCount := 0
+	for _, e := range events {
+		if e.Type == agent.EventTextDelta {
+			textCount++
+		}
+	}
+	if textCount != 1 {
+		t.Errorf("expected exactly 1 text event (no duplicate from result), got %d", textCount)
+	}
 }
 
 func TestTurnError(t *testing.T) {
@@ -213,9 +187,10 @@ func TestTurnError(t *testing.T) {
 	}
 }
 
-func TestTurnErrorFallbackMessage(t *testing.T) {
+func TestTurnErrorInequalityNotAllowList(t *testing.T) {
+	// Any non-"success" subtype must map to TurnError (inequality, not enum).
 	lines := []string{
-		`{"type":"result","subtype":"timeout"}`,
+		`{"type":"result","subtype":"error_max_budget_usd"}`,
 	}
 	events := collectEvents(t, lines)
 	requireEventTypes(t, events, []agent.EventType{agent.EventTurnError})
@@ -224,134 +199,157 @@ func TestTurnErrorFallbackMessage(t *testing.T) {
 	}
 }
 
-func TestRateLimitEventSkipped(t *testing.T) {
+func TestToolBlockOrderingInvariant(t *testing.T) {
+	// Two tool_use blocks in one assistant message: each ToolStart must be
+	// immediately followed by its ToolExec — never two open tool blocks.
 	lines := []string{
-		`{"type":"rate_limit_event","remaining":100}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"Read","input":{}},{"type":"tool_use","id":"toolu_B","name":"Bash","input":{}}]}}`,
 	}
 	events := collectEvents(t, lines)
+	requireEventTypes(t, events, []agent.EventType{
+		agent.EventToolStart, // A
+		agent.EventToolExec,  // A
+		agent.EventToolStart, // B
+		agent.EventToolExec,  // B
+		agent.EventMessageEnd,
+	})
+	if events[0].ToolID != "toolu_A" || events[1].ToolID != "toolu_A" {
+		t.Errorf("block A not Start->Exec contiguous: %+v", events[:2])
+	}
+	if events[2].ToolID != "toolu_B" || events[3].ToolID != "toolu_B" {
+		t.Errorf("block B not Start->Exec contiguous: %+v", events[2:4])
+	}
+}
+
+func TestMultipleToolResultsThreaded(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"Read","input":{}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_B","name":"Bash","input":{}}]}}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_A","type":"tool_result","content":"data","is_error":false},{"tool_use_id":"toolu_B","type":"tool_result","content":"out","is_error":false}]}}`,
+	}
+	events := collectEvents(t, lines)
+	var dones []agent.Event
+	for _, e := range events {
+		if e.Type == agent.EventToolDone {
+			dones = append(dones, e)
+		}
+	}
+	if len(dones) != 2 {
+		t.Fatalf("expected 2 ToolDone, got %d", len(dones))
+	}
+	if dones[0].ToolName != "Read" {
+		t.Errorf("ToolDone[0].ToolName = %q, want Read", dones[0].ToolName)
+	}
+	if dones[1].ToolName != "Bash" {
+		t.Errorf("ToolDone[1].ToolName = %q, want Bash", dones[1].ToolName)
+	}
+}
+
+func TestToolNamesEvictedAfterDone(t *testing.T) {
+	// In a long-running persistent session the toolNames map must not grow
+	// unbounded — each entry is dropped once its ToolDone is emitted.
+	tr := newTranslator()
+	tr.translateLine([]byte(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}`))
+	if _, ok := tr.toolNames["toolu_1"]; !ok {
+		t.Fatal("toolNames should contain toolu_1 after tool_use")
+	}
+	tr.translateLine([]byte(`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"ok","is_error":false}]}}`))
+	if _, ok := tr.toolNames["toolu_1"]; ok {
+		t.Error("toolNames[toolu_1] should be evicted after ToolDone")
+	}
+}
+
+func TestSystemNonInitSkipped(t *testing.T) {
+	lines := []string{
+		`{"type":"system","subtype":"thinking_tokens","count":100}`,
+		`{"type":"system","subtype":"hook_started","hook_id":"h1"}`,
+	}
+	events := collectEvents(t, lines)
+	if len(events) != 0 {
+		t.Errorf("non-init system events should be skipped, got %d", len(events))
+	}
+}
+
+func TestRateLimitEventSkipped(t *testing.T) {
+	events := collectEvents(t, []string{`{"type":"rate_limit_event","remaining":100}`})
 	if len(events) != 0 {
 		t.Errorf("expected 0 events, got %d", len(events))
 	}
 }
 
-func TestToolBlockOrderingInvariant(t *testing.T) {
-	// This tests that the translator tracks open tool blocks and asserts
-	// the invariant. In practice, Anthropic's SSE is sequential so this
-	// shouldn't happen, but we test the tracking is correct.
-	tr := newTranslator()
-
-	// Start first tool block
-	evs := tr.translateLine([]byte(`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read"}}`))
-	if len(evs) != 1 || evs[0].Type != agent.EventToolStart {
-		t.Fatalf("expected ToolStart, got %+v", evs)
-	}
-
-	if !tr.hasOpenToolBlock {
-		t.Error("expected hasOpenToolBlock = true after tool start")
-	}
-
-	// Stop first tool block (ToolExec)
-	evs = tr.translateLine([]byte(`{"type":"stream_event","event":"content_block_stop","index":0}`))
-	if len(evs) != 1 || evs[0].Type != agent.EventToolExec {
-		t.Fatalf("expected ToolExec, got %+v", evs)
-	}
-
-	if tr.hasOpenToolBlock {
-		t.Error("expected hasOpenToolBlock = false after tool stop")
-	}
-
-	// Start second tool block - should be fine
-	evs = tr.translateLine([]byte(`{"type":"stream_event","event":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"Write"}}`))
-	if len(evs) != 1 || evs[0].Type != agent.EventToolStart {
-		t.Fatalf("expected ToolStart for second tool, got %+v", evs)
-	}
-}
-
-func TestMultipleToolResults(t *testing.T) {
-	lines := []string{
-		// Two tool use blocks
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_A","name":"Read"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_B","name":"Bash"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":1}`,
-		// User message with both results
-		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"data","is_error":false},{"type":"tool_result","tool_use_id":"toolu_B","content":"output","is_error":false}]}}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventToolStart,  // toolu_A
-		agent.EventToolExec,   // toolu_A
-		agent.EventToolStart,  // toolu_B
-		agent.EventToolExec,   // toolu_B
-		agent.EventToolDone,   // toolu_A
-		agent.EventToolDone,   // toolu_B
-	})
-
-	// Verify tool names are threaded correctly
-	if events[4].ToolName != "Read" {
-		t.Errorf("ToolDone[0].ToolName = %q, want Read", events[4].ToolName)
-	}
-	if events[5].ToolName != "Bash" {
-		t.Errorf("ToolDone[1].ToolName = %q, want Bash", events[5].ToolName)
-	}
-}
-
-func TestFullTurnSequence(t *testing.T) {
-	lines := []string{
-		`{"type":"system","subtype":"init","session_id":"sess-1","model":"claude-sonnet-4-20250514"}`,
-		`{"type":"stream_event","event":"message_start","message":{"id":"msg_1","type":"message"}}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I'll check."}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":1}`,
-		`{"type":"stream_event","event":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_X","name":"Bash"}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":2}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll check."}]}}`,
-		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_X","content":"file.go","is_error":false}]}}`,
-		`{"type":"stream_event","event":"message_start","message":{"id":"msg_2","type":"message"}}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Found file.go"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success","cost_usd":0.01}`,
-	}
-	events := collectEvents(t, lines)
-	requireEventTypes(t, events, []agent.EventType{
-		agent.EventSessionReady,   // system/init
-		agent.EventTextDelta,       // "I'll check."
-		agent.EventToolStart,       // Bash
-		agent.EventToolInputDelta,  // input streaming
-		agent.EventToolExec,        // block stop
-		agent.EventMessageEnd,      // message_stop
-		agent.EventToolDone,        // tool_result
-		agent.EventTextDelta,       // "Found file.go"
-		agent.EventMessageEnd,      // message_stop
-		agent.EventTurnDone,        // result/success
-	})
-}
-
 func TestEmptyLines(t *testing.T) {
 	tr := newTranslator()
-	events := tr.translateLine([]byte(""))
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for empty line, got %d", len(events))
+	if evs := tr.translateLine([]byte("")); len(evs) != 0 {
+		t.Errorf("empty line: got %d events", len(evs))
 	}
-	events = tr.translateLine(nil)
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for nil line, got %d", len(events))
+	if evs := tr.translateLine(nil); len(evs) != 0 {
+		t.Errorf("nil line: got %d events", len(evs))
 	}
 }
 
 func TestUnknownEventTypes(t *testing.T) {
-	lines := []string{
-		`{"type":"unknown_future_event","data":"something"}`,
-	}
-	events := collectEvents(t, lines)
+	events := collectEvents(t, []string{`{"type":"unknown_future_event","data":"x"}`})
 	if len(events) != 0 {
 		t.Errorf("expected 0 events for unknown type, got %d", len(events))
+	}
+}
+
+// TestRealSessionReplay replays the captured real CLI session and asserts the
+// authoritative properties: a SessionReady, real assistant text (the empty-text
+// bug is gone), tool lifecycle present, exactly 3 TurnDone (3 turns), and no
+// TurnError.
+func TestRealSessionReplay(t *testing.T) {
+	f, err := os.Open("testdata/real_session.ndjson")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	tr := newTranslator()
+	var events []agent.Event
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		events = append(events, tr.translateLine(sc.Bytes())...)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	var sessionReady, turnDone, turnErr, textDeltas, toolStart, toolDone int
+	var sawText bool
+	for _, e := range events {
+		switch e.Type {
+		case agent.EventSessionReady:
+			sessionReady++
+		case agent.EventTurnDone:
+			turnDone++
+		case agent.EventTurnError:
+			turnErr++
+		case agent.EventTextDelta:
+			textDeltas++
+			if e.Text != "" {
+				sawText = true
+			}
+		case agent.EventToolStart:
+			toolStart++
+		case agent.EventToolDone:
+			toolDone++
+		}
+	}
+	if sessionReady < 1 {
+		t.Error("expected at least one SessionReady")
+	}
+	if !sawText {
+		t.Error("expected non-empty assistant text (empty-response bug regression)")
+	}
+	if turnDone != 3 {
+		t.Errorf("expected 3 TurnDone (3 turns), got %d", turnDone)
+	}
+	if turnErr != 0 {
+		t.Errorf("expected 0 TurnError, got %d", turnErr)
+	}
+	if toolStart < 1 || toolDone < 1 {
+		t.Errorf("expected tool lifecycle (start=%d done=%d)", toolStart, toolDone)
 	}
 }

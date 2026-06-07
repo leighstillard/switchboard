@@ -316,6 +316,25 @@ func (c *Client) Close() error {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// CloseSession closes one session's connection and drops it, leaving other
+// sessions and the client itself running. Unknown sessions are a no-op.
+func (c *Client) CloseSession(sessionID string) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	sc, ok := c.sessions[sessionID]
+	if ok {
+		delete(c.sessions, sessionID)
+	}
+	c.mu.Unlock()
+	if ok {
+		sc.close()
+	}
+	return nil
+}
+
 func (c *Client) getSession(sessionID string) (*sessionConn, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

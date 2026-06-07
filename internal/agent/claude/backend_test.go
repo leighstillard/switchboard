@@ -13,455 +13,731 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Mock commander for testing
+// Fake exec seam
 // ---------------------------------------------------------------------------
 
-// mockCommander provides canned stdout output for testing.
-type mockCommander struct {
+type syncBuffer struct {
 	mu      sync.Mutex
-	outputs []string // one per Start call, in order
-	calls   int
-	started chan struct{} // closed on first Start
+	buf     bytes.Buffer
+	closed  bool
+	onClose func()
 }
 
-func newMockCommander(outputs ...string) *mockCommander {
-	return &mockCommander{
-		outputs: outputs,
-		started: make(chan struct{}),
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.ErrClosedPipe
 	}
+	return b.buf.Write(p)
 }
 
-func (m *mockCommander) Start(ctx context.Context, args []string, workdir string) (io.ReadCloser, func(), int, error) {
-	m.mu.Lock()
-	idx := m.calls
-	m.calls++
-	if idx == 0 {
-		close(m.started)
+func (b *syncBuffer) Close() error {
+	b.mu.Lock()
+	already := b.closed
+	b.closed = true
+	onClose := b.onClose
+	b.mu.Unlock()
+	if !already && onClose != nil {
+		onClose()
 	}
-	m.mu.Unlock()
-
-	var output string
-	if idx < len(m.outputs) {
-		output = m.outputs[idx]
-	}
-
-	reader := io.NopCloser(bytes.NewReader([]byte(output)))
-	cancel := func() {} // no-op for tests
-
-	return reader, cancel, 12345, nil
+	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-func TestSubscribe(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-
-	sessionID, events, err := b.Subscribe(context.Background(), "/tmp/test")
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
-	if sessionID == "" {
-		t.Fatal("empty session ID")
-	}
-	if events == nil {
-		t.Fatal("nil events channel")
-	}
-
-	// Session ID should be a UUID.
-	if len(sessionID) != 36 {
-		t.Errorf("session ID doesn't look like UUID: %q", sessionID)
-	}
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
-func TestSendMessage_FirstTurn(t *testing.T) {
-	output := strings.Join([]string{
-		`{"type":"system","subtype":"init","session_id":"test-id","model":"claude-sonnet-4-20250514"}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello!"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success","cost_usd":0.001}`,
-	}, "\n")
+type fakeProc struct {
+	stdoutR  *io.PipeReader
+	stdoutW  *io.PipeWriter
+	stdin    *syncBuffer
+	waitCh   chan struct{}
+	exitOnce sync.Once
+	stderr   string
+	exitErr  error
 
-	cmd := newMockCommander(output)
-	b := newForTest(DefaultConfig(), cmd)
+	mu        sync.Mutex
+	termCalls int
+	killCalls int
+}
 
-	sessionID, events, err := b.Subscribe(context.Background(), "/tmp/test")
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+func newFakeProc() *fakeProc {
+	r, w := io.Pipe()
+	p := &fakeProc{stdoutR: r, stdoutW: w, stdin: &syncBuffer{}, waitCh: make(chan struct{})}
+	p.stdin.onClose = p.exit // closing stdin (clean teardown) exits the process, like claude on EOF
+	return p
+}
 
-	err = b.SendMessage(context.Background(), sessionID, "Hi", nil)
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
+func (p *fakeProc) Stdin() io.WriteCloser { return p.stdin }
+func (p *fakeProc) Stdout() io.Reader     { return p.stdoutR }
+func (p *fakeProc) Wait() (string, error) { <-p.waitCh; return p.stderr, p.exitErr }
+func (p *fakeProc) Pid() int              { return 4242 }
 
-	// Collect events with timeout.
-	var collected []agent.Event
-	timeout := time.After(2 * time.Second)
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				t.Fatal("events channel closed unexpectedly")
-			}
-			collected = append(collected, ev)
-			if ev.Type == agent.EventTurnDone || ev.Type == agent.EventTurnError {
-				goto done
-			}
-		case <-timeout:
-			t.Fatalf("timeout waiting for events; got %d so far: %+v", len(collected), collected)
-		}
-	}
+func (p *fakeProc) Terminate() error {
+	p.mu.Lock()
+	p.termCalls++
+	p.mu.Unlock()
+	p.exit()
+	return nil
+}
 
-done:
-	// Verify event sequence.
-	expected := []agent.EventType{
-		agent.EventSessionReady,
-		agent.EventTextDelta,
-		agent.EventMessageEnd,
-		agent.EventTurnDone,
-	}
+func (p *fakeProc) Kill() error {
+	p.mu.Lock()
+	p.killCalls++
+	p.mu.Unlock()
+	p.exit()
+	return nil
+}
 
-	if len(collected) != len(expected) {
-		t.Fatalf("got %d events, want %d\nevents: %+v", len(collected), len(expected), collected)
-	}
-	for i, want := range expected {
-		if collected[i].Type != want {
-			t.Errorf("events[%d].Type = %v, want %v", i, collected[i].Type, want)
-		}
-	}
+func (p *fakeProc) terms() int { p.mu.Lock(); defer p.mu.Unlock(); return p.termCalls }
 
-	if collected[1].Text != "Hello!" {
-		t.Errorf("text event = %q, want Hello!", collected[1].Text)
+func (p *fakeProc) feed(lines ...string) {
+	for _, l := range lines {
+		_, _ = io.WriteString(p.stdoutW, l+"\n")
 	}
 }
 
-func TestSendMessage_ResumeTurn(t *testing.T) {
-	// First turn
-	firstOutput := strings.Join([]string{
-		`{"type":"system","subtype":"init","session_id":"test-id","model":"claude-sonnet-4-20250514"}`,
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"First"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success"}`,
-	}, "\n")
+func (p *fakeProc) exitWith(stderr string, err error) {
+	p.stderr = stderr
+	p.exitErr = err
+	p.exit()
+}
 
-	// Second turn (resume)
-	secondOutput := strings.Join([]string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Second"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success"}`,
-	}, "\n")
+func (p *fakeProc) exit() {
+	p.exitOnce.Do(func() {
+		_ = p.stdoutW.Close()
+		close(p.waitCh)
+	})
+}
 
-	cmd := newMockCommander(firstOutput, secondOutput)
-	b := newForTest(DefaultConfig(), cmd)
+type startCall struct {
+	args    []string
+	workdir string
+	env     []string
+}
 
-	sessionID, events, err := b.Subscribe(context.Background(), "/tmp/test")
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+type fakeCommander struct {
+	mu      sync.Mutex
+	calls   []startCall
+	newProc chan *fakeProc
+}
 
-	// First turn
-	if err := b.SendMessage(context.Background(), sessionID, "First", nil); err != nil {
-		t.Fatalf("SendMessage 1: %v", err)
-	}
-	waitForTurnDone(t, events)
+func newFakeCommander() *fakeCommander {
+	return &fakeCommander{newProc: make(chan *fakeProc, 16)}
+}
 
-	// Second turn
-	if err := b.SendMessage(context.Background(), sessionID, "Second", nil); err != nil {
-		t.Fatalf("SendMessage 2: %v", err)
-	}
-	waitForTurnDone(t, events)
+func (c *fakeCommander) Start(_ context.Context, args []string, workdir string, env []string) (proc, error) {
+	p := newFakeProc()
+	c.mu.Lock()
+	c.calls = append(c.calls, startCall{args: args, workdir: workdir, env: env})
+	c.mu.Unlock()
+	c.newProc <- p
+	return p, nil
+}
 
-	// Verify two Start calls were made.
-	cmd.mu.Lock()
-	calls := cmd.calls
-	cmd.mu.Unlock()
-	if calls != 2 {
-		t.Errorf("expected 2 Start calls, got %d", calls)
+func (c *fakeCommander) waitProc(t *testing.T) *fakeProc {
+	t.Helper()
+	select {
+	case p := <-c.newProc:
+		return p
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a spawned process")
+		return nil
 	}
 }
 
-func TestSendMessage_NotFound(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-
-	err := b.SendMessage(context.Background(), "nonexistent", "test", nil)
-	if err == nil {
-		t.Fatal("expected error for nonexistent session")
-	}
+func (c *fakeCommander) callCount() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.calls) }
+func (c *fakeCommander) lastArgs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls[len(c.calls)-1].args
 }
-
-func TestCancel(t *testing.T) {
-	// Provide output that takes time to process.
-	// The cancel should emit EventInterrupted.
-	output := strings.Join([]string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Thinking..."}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success"}`,
-	}, "\n")
-
-	cmd := newMockCommander(output)
-	b := newForTest(DefaultConfig(), cmd)
-
-	sessionID, events, err := b.Subscribe(context.Background(), "/tmp/test")
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
-
-	if err := b.SendMessage(context.Background(), sessionID, "test", nil); err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-
-	// Wait a bit then cancel.
-	time.Sleep(50 * time.Millisecond)
-	if err := b.Cancel(context.Background(), sessionID); err != nil {
-		t.Fatalf("Cancel: %v", err)
-	}
-
-	// Should see EventInterrupted in the events.
-	timeout := time.After(2 * time.Second)
-	sawInterrupted := false
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				goto check
-			}
-			if ev.Type == agent.EventInterrupted {
-				sawInterrupted = true
-				goto check
-			}
-			if ev.Type == agent.EventTurnDone || ev.Type == agent.EventTurnError {
-				// Process may finish before cancel reaches it.
-				goto check
-			}
-		case <-timeout:
-			goto check
-		}
-	}
-check:
-	// The cancel may arrive before or after the process finishes in tests.
-	// We just verify it doesn't error.
-	_ = sawInterrupted
-}
-
-func TestCancel_NotFound(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-	err := b.Cancel(context.Background(), "nonexistent")
-	if err == nil {
-		t.Fatal("expected error for nonexistent session")
-	}
-}
-
-func TestSubscribeExisting(t *testing.T) {
-	output := strings.Join([]string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Resumed"}}`,
-		`{"type":"stream_event","event":"content_block_stop","index":0}`,
-		`{"type":"stream_event","event":"message_stop"}`,
-		`{"type":"result","subtype":"success"}`,
-	}, "\n")
-
-	cmd := newMockCommander(output)
-	b := newForTest(DefaultConfig(), cmd)
-
-	// Subscribe to an existing session (like after restart).
-	existingID := "c5714ea1-f992-45a8-96d0-9abcc2b845a1"
-	events, err := b.SubscribeExisting(context.Background(), existingID, "/tmp/test")
-	if err != nil {
-		t.Fatalf("SubscribeExisting: %v", err)
-	}
-
-	// Send a message (should use --resume).
-	if err := b.SendMessage(context.Background(), existingID, "continue", nil); err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-
-	// Collect events.
-	collected := waitForTurnDone(t, events)
-
-	// Should have TextDelta and TurnDone at minimum.
-	hasText := false
-	hasDone := false
-	for _, ev := range collected {
-		if ev.Type == agent.EventTextDelta && ev.Text == "Resumed" {
-			hasText = true
-		}
-		if ev.Type == agent.EventTurnDone {
-			hasDone = true
-		}
-	}
-	if !hasText {
-		t.Error("expected TextDelta with 'Resumed'")
-	}
-	if !hasDone {
-		t.Error("expected TurnDone")
-	}
-}
-
-func TestSubscribeExisting_Idempotent(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-
-	sessionID := "test-session-id"
-	events1, err := b.SubscribeExisting(context.Background(), sessionID, "/tmp")
-	if err != nil {
-		t.Fatalf("first SubscribeExisting: %v", err)
-	}
-
-	events2, err := b.SubscribeExisting(context.Background(), sessionID, "/tmp")
-	if err != nil {
-		t.Fatalf("second SubscribeExisting: %v", err)
-	}
-
-	// Should return the same channel.
-	if events1 != events2 {
-		t.Error("expected same events channel for idempotent SubscribeExisting")
-	}
-}
-
-func TestClose(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-
-	_, events, _ := b.Subscribe(context.Background(), "/tmp/test")
-
-	if err := b.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Events channel should be closed.
-	_, ok := <-events
-	if ok {
-		t.Error("expected events channel to be closed after Close")
-	}
-}
-
-func TestBuildArgs_FirstTurn(t *testing.T) {
-	b := newForTest(Config{
-		Binary:             "claude",
-		PermissionMode:     "bypassPermissions",
-		Model:              "claude-sonnet-4-20250514",
-		AppendSystemPrompt: "Be helpful",
-		ExtraArgs:          []string{"--max-turns", "10"},
-	}, newMockCommander())
-
-	args := b.buildArgs("session-123", "Hello", true)
-
-	assertContains(t, args, "-p", "Hello")
-	assertContains(t, args, "--output-format", "stream-json")
-	assertContains(t, args, "--verbose")
-	assertContains(t, args, "--include-partial-messages")
-	assertContains(t, args, "--model", "claude-sonnet-4-20250514")
-	assertContains(t, args, "--permission-mode", "bypassPermissions")
-	assertContains(t, args, "--session-id", "session-123")
-	assertContains(t, args, "--append-system-prompt", "Be helpful")
-	assertContains(t, args, "--max-turns", "10")
-
-	// Should NOT have --resume on first turn.
-	for _, a := range args {
-		if a == "--resume" {
-			t.Error("first turn should not have --resume")
-		}
-	}
-}
-
-func TestBuildArgs_ResumeTurn(t *testing.T) {
-	b := newForTest(DefaultConfig(), newMockCommander())
-
-	args := b.buildArgs("session-123", "Continue", false)
-
-	assertContains(t, args, "--resume", "session-123")
-
-	// Should NOT have --session-id on resume.
-	for _, a := range args {
-		if a == "--session-id" {
-			t.Error("resume turn should not have --session-id")
-		}
-	}
-}
-
-func TestProcessExitWithoutResult(t *testing.T) {
-	// Process exits without emitting a result event.
-	output := strings.Join([]string{
-		`{"type":"stream_event","event":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
-		`{"type":"stream_event","event":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
-		// No result event - process just exits.
-	}, "\n")
-
-	cmd := newMockCommander(output)
-	b := newForTest(DefaultConfig(), cmd)
-
-	sessionID, events, _ := b.Subscribe(context.Background(), "/tmp/test")
-	b.SendMessage(context.Background(), sessionID, "test", nil)
-
-	// Should get TurnError since no result event was seen.
-	collected := waitForTurnEnd(t, events)
-
-	lastEvent := collected[len(collected)-1]
-	if lastEvent.Type != agent.EventTurnError {
-		t.Errorf("expected TurnError for process exit without result, got %v", lastEvent.Type)
-	}
-	if lastEvent.ErrorMessage == "" {
-		t.Error("expected non-empty error message")
-	}
+func (c *fakeCommander) lastEnv() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls[len(c.calls)-1].env
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// waitForTurnDone reads events until TurnDone or TurnError, with timeout.
-func waitForTurnDone(t *testing.T, events <-chan agent.Event) []agent.Event {
-	t.Helper()
-	return waitForTurnEnd(t, events)
+const model = "claude-sonnet-4-20250514"
+
+func initLine(id string) string {
+	return `{"type":"system","subtype":"init","session_id":"` + id + `","model":"` + model + `"}`
 }
 
-func waitForTurnEnd(t *testing.T, events <-chan agent.Event) []agent.Event {
+func testBackend(t *testing.T) (*Backend, *fakeCommander, *fakeClock) {
 	t.Helper()
-	var collected []agent.Event
+	fc := newFakeCommander()
+	clk := newFakeClock()
+	return newForTest(DefaultConfig(), fc, clk), fc, clk
+}
+
+// subscribe registers a session (no process spawned yet — claude is lazy).
+func subscribe(t *testing.T, b *Backend) (string, <-chan agent.Event) {
+	t.Helper()
+	id, ev, err := b.Subscribe(context.Background(), "/wd")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	return id, ev
+}
+
+// firstTurn sends the first message (triggering the lazy spawn) and returns the
+// spawned process.
+func firstTurn(t *testing.T, b *Backend, fc *fakeCommander, id, content string) *fakeProc {
+	t.Helper()
+	if err := b.SendMessage(context.Background(), id, content, nil); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	return fc.waitProc(t)
+}
+
+func waitFor(t *testing.T, events <-chan agent.Event, typ agent.EventType) agent.Event {
+	t.Helper()
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				return collected
+				t.Fatalf("channel closed before %v", typ)
 			}
-			collected = append(collected, ev)
-			if ev.Type == agent.EventTurnDone || ev.Type == agent.EventTurnError || ev.Type == agent.EventInterrupted {
-				return collected
+			if ev.Type == typ {
+				return ev
 			}
 		case <-timeout:
-			t.Fatalf("timeout waiting for turn end; got %d events: %+v", len(collected), collected)
-			return collected
+			t.Fatalf("timed out waiting for %v", typ)
 		}
 	}
 }
 
-// assertContains checks that args contains the key (and optionally value).
-func assertContains(t *testing.T, args []string, parts ...string) {
+func expectClosed(t *testing.T, events <-chan agent.Event) {
 	t.Helper()
-	if len(parts) == 1 {
-		for _, a := range args {
-			if a == parts[0] {
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
 				return
 			}
+		case <-deadline:
+			t.Fatal("channel not closed")
 		}
-		t.Errorf("args missing %q: %v", parts[0], args)
-		return
 	}
+}
 
-	key, val := parts[0], parts[1]
-	for i, a := range args {
-		if a == key && i+1 < len(args) && args[i+1] == val {
+func waitForStdin(t *testing.T, p *fakeProc, substr string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if strings.Contains(p.stdin.String(), substr) {
 			return
 		}
+		select {
+		case <-deadline:
+			t.Fatalf("stdin never contained %q; got: %s", substr, p.stdin.String())
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
-	t.Errorf("args missing %q %q: %v", key, val, args)
+}
+
+func argHasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func argValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+func TestSubscribeIsLazyNoSpawn(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, _ := subscribe(t, b)
+	if fc.callCount() != 0 {
+		t.Errorf("Subscribe must not spawn a process; got %d", fc.callCount())
+	}
+	if len(id) != 36 {
+		t.Errorf("expected a generated uuid session id, got %q", id)
+	}
+	_ = b.Close()
+}
+
+func TestFreshSpawnArgs(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+	args := fc.lastArgs()
+
+	if v, _ := argValue(args, "--setting-sources"); v != "project,local" {
+		t.Errorf("--setting-sources = %q, want project,local", v)
+	}
+	if v, _ := argValue(args, "--session-id"); v != id {
+		t.Errorf("fresh spawn --session-id = %q, want %q", v, id)
+	}
+	if argHasFlag(args, "--resume") {
+		t.Error("fresh spawn must not have --resume")
+	}
+	for _, f := range []string{"--permission-prompt-tool", "--input-format", "--replay-user-messages", "--verbose"} {
+		if !argHasFlag(args, f) {
+			t.Errorf("missing %q", f)
+		}
+	}
+	for _, forbidden := range []string{"--bare", "--include-partial-messages", "--permission-mode", "-p", "--print"} {
+		if argHasFlag(args, forbidden) {
+			t.Errorf("argv must not contain %q: %v", forbidden, args)
+		}
+	}
+	_ = b.Close()
+}
+
+func TestEnvStripsCLAUDECODEKeepsRest(t *testing.T) {
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("SWITCHBOARD_SENTINEL", "keepme")
+	b := newForTest(DefaultConfig(), newFakeCommander(), newFakeClock())
+	fc := b.cmd.(*fakeCommander)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+
+	var sawSentinel, sawClaudeCode bool
+	for _, e := range fc.lastEnv() {
+		if e == "SWITCHBOARD_SENTINEL=keepme" {
+			sawSentinel = true
+		}
+		if strings.HasPrefix(e, "CLAUDECODE=") {
+			sawClaudeCode = true
+		}
+	}
+	if !sawSentinel {
+		t.Error("sentinel env var should pass through")
+	}
+	if sawClaudeCode {
+		t.Error("CLAUDECODE must be stripped")
+	}
+	_ = b.Close()
+}
+
+func TestExtraEnvOverrides(t *testing.T) {
+	t.Setenv("OVERRIDE_ME", "old")
+	cfg := DefaultConfig()
+	cfg.ExtraEnv = map[string]string{"OVERRIDE_ME": "new"}
+	b := newForTest(cfg, newFakeCommander(), newFakeClock())
+	fc := b.cmd.(*fakeCommander)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+
+	count := 0
+	for _, e := range fc.lastEnv() {
+		if strings.HasPrefix(e, "OVERRIDE_ME=") {
+			count++
+			if e != "OVERRIDE_ME=new" {
+				t.Errorf("override = %q, want new", e)
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("OVERRIDE_ME appears %d times, want 1 (deduped)", count)
+	}
+	_ = b.Close()
+}
+
+func TestSendMessageWritesUserLineAndText(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hello there")
+	waitForStdin(t, p, `"type":"user"`)
+	waitForStdin(t, p, "hello there")
+
+	p.feed(
+		initLine(id),
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}]}}`,
+		`{"type":"result","subtype":"success"}`,
+	)
+	ready := waitFor(t, events, agent.EventSessionReady)
+	if ready.SessionID != id {
+		t.Errorf("SessionReady id = %q, want %q", ready.SessionID, id)
+	}
+	if txt := waitFor(t, events, agent.EventTextDelta); txt.Text != "hi back" {
+		t.Errorf("text = %q", txt.Text)
+	}
+	waitFor(t, events, agent.EventTurnDone)
+	_ = b.Close()
+}
+
+func TestControlRequestAllowAll(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, _ := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "do it")
+	p.feed(`{"type":"control_request","request_id":"req_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}`)
+	waitForStdin(t, p, `"type":"control_response"`)
+	s := p.stdin.String()
+	if !strings.Contains(s, `"request_id":"req_1"`) || !strings.Contains(s, `"behavior":"allow"`) {
+		t.Errorf("control_response missing allow/request_id: %s", s)
+	}
+	if !strings.Contains(s, `"updatedInput"`) {
+		t.Errorf("allow response must carry updatedInput: %s", s)
+	}
+	_ = b.Close()
+}
+
+func TestControlRequestDenyAll(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PermissionPolicy = "deny_all"
+	b := newForTest(cfg, newFakeCommander(), newFakeClock())
+	fc := b.cmd.(*fakeCommander)
+	id, _ := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "do it")
+	p.feed(`{"type":"control_request","request_id":"req_2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}`)
+	waitForStdin(t, p, `"type":"control_response"`)
+	s := p.stdin.String()
+	if !strings.Contains(s, `"behavior":"deny"`) || !strings.Contains(s, `"message"`) {
+		t.Errorf("deny response must carry a message: %s", s)
+	}
+	_ = b.Close()
+}
+
+func TestCrashMidTurnEmitsInterruptedThenResumes(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "long task")
+	waitForStdin(t, p1, "long task")
+	p1.feed(
+		initLine(id), // healthy
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}`,
+	)
+	waitFor(t, events, agent.EventTextDelta)
+	p1.exitWith("boom", nil) // crash, no result
+
+	waitFor(t, events, agent.EventInterrupted)
+
+	// Channel stays open; next turn respawns with --resume.
+	if err := b.SendMessage(context.Background(), id, "retry", nil); err != nil {
+		t.Fatalf("SendMessage after crash: %v", err)
+	}
+	fc.waitProc(t)
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != id {
+		t.Errorf("respawn must --resume %q, got %q (args %v)", id, v, fc.lastArgs())
+	}
+	_ = b.Close()
+}
+
+func TestResumeFailureSurfacesTurnErrorAndClosesChannel(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	events, err := b.SubscribeExisting(context.Background(), "old-sess", "/wd")
+	if err != nil {
+		t.Fatalf("SubscribeExisting: %v", err)
+	}
+	if fc.callCount() != 0 {
+		t.Errorf("SubscribeExisting must be lazy; got %d spawns", fc.callCount())
+	}
+
+	if err := b.SendMessage(context.Background(), "old-sess", "continue", nil); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	p := fc.waitProc(t)
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != "old-sess" {
+		t.Errorf("lazy resume must --resume old-sess, got %q", v)
+	}
+	p.exitWith("No conversation found with session ID old-sess", nil) // exits before init
+
+	if te := waitFor(t, events, agent.EventTurnError); te.ErrorMessage == "" {
+		t.Error("TurnError must carry a message")
+	}
+	expectClosed(t, events)
+}
+
+func TestCancelTerminatesAndInterrupts(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "task")
+	waitForStdin(t, p, "task")
+
+	if err := b.Cancel(context.Background(), id); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	waitFor(t, events, agent.EventInterrupted)
+	if p.terms() == 0 {
+		t.Error("Cancel must terminate the process group")
+	}
+	_ = b.Close()
+}
+
+func TestCloseClosesStdinFirstNoSignalOnCleanExit(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "task")
+	waitForStdin(t, p, "task")
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if p.terms() != 0 {
+		t.Errorf("clean exit (stdin close) must not require SIGTERM; terms=%d", p.terms())
+	}
+	expectClosed(t, events)
+}
+
+func TestCloseSessionIsolatesOneSession(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	idA, evA := subscribe(t, b)
+	firstTurn(t, b, fc, idA, "a")
+	idB, evB := subscribe(t, b)
+	pB := firstTurn(t, b, fc, idB, "b")
+
+	if err := b.CloseSession(context.Background(), idA); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	expectClosed(t, evA)
+
+	// Session B still works and its channel stays open.
+	if err := b.SendMessage(context.Background(), idB, "still here", nil); err != nil {
+		t.Fatalf("session B SendMessage: %v", err)
+	}
+	waitForStdin(t, pB, "still here")
+	select {
+	case ev, ok := <-evB:
+		if !ok {
+			t.Error("session B channel must stay open")
+		}
+		_ = ev
+	default:
+	}
+	_ = b.Close()
+}
+
+func TestIdleEvictionTearsDownProcessKeepsSession(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IdleEvictionTimeout = 10 * time.Minute
+	clk := newFakeClock()
+	b := newForTest(cfg, newFakeCommander(), clk)
+	fc := b.cmd.(*fakeCommander)
+
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "task")
+	p1.feed(initLine(id), `{"type":"result","subtype":"success"}`)
+	waitFor(t, events, agent.EventTurnDone) // terminal → idle timer armed
+
+	time.Sleep(20 * time.Millisecond)
+	clk.Advance(11 * time.Minute)
+
+	deadline := time.After(2 * time.Second)
+	for p1.terms() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("idle eviction did not terminate the process")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Error("idle eviction must NOT close the channel")
+		}
+	default:
+	}
+
+	if err := b.SendMessage(context.Background(), id, "again", nil); err != nil {
+		t.Fatalf("SendMessage post-eviction: %v", err)
+	}
+	fc.waitProc(t)
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != id {
+		t.Errorf("post-eviction respawn must --resume %q, got %q", id, v)
+	}
+	_ = b.Close()
+}
+
+func TestIdleEvictionNeverKillsInFlight(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IdleEvictionTimeout = 10 * time.Minute
+	clk := newFakeClock()
+	b := newForTest(cfg, newFakeCommander(), clk)
+	fc := b.cmd.(*fakeCommander)
+
+	id, _ := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "long build")
+	waitForStdin(t, p1, "long build") // in-flight, no terminal event
+
+	clk.Advance(30 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+
+	if p1.terms() != 0 {
+		t.Errorf("in-flight turn must never be evicted; terms=%d", p1.terms())
+	}
+	_ = b.Close()
+}
+
+func TestSubscribeExistingIdempotent(t *testing.T) {
+	b, _, _ := testBackend(t)
+	ev1, err := b.SubscribeExisting(context.Background(), "s", "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev2, err := b.SubscribeExisting(context.Background(), "s", "/wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev1 != ev2 {
+		t.Error("SubscribeExisting must be idempotent (same channel)")
+	}
+	_ = b.Close()
+}
+
+func TestSendMessageUnknownSession(t *testing.T) {
+	b, _, _ := testBackend(t)
+	if err := b.SendMessage(context.Background(), "nope", "hi", nil); err == nil {
+		t.Error("expected error for unknown session")
+	}
+}
+
+// TestMalformedInitSurfacesProtocolError verifies the stage-2a compatibility
+// probe is wired: a first system line that is not a well-formed init yields an
+// explicit "(init)" TurnError and closes the channel (not a silent empty turn).
+func TestMalformedInitSurfacesProtocolError(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"system","subtype":"init","model":"m"}`) // missing session_id
+	te := waitFor(t, events, agent.EventTurnError)
+	if !strings.Contains(te.ErrorMessage, "init") {
+		t.Errorf("want init protocol error, got %q", te.ErrorMessage)
+	}
+	expectClosed(t, events)
+}
+
+// TestPreInitNoiseThenInit verifies benign events before system/init don't skip
+// the init gate: rate_limit_event + control_request are handled/skipped, then a
+// valid init unblocks normal turn output.
+func TestPreInitNoiseThenInit(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(
+		`{"type":"rate_limit_event","remaining":100}`,
+		`{"type":"control_request","request_id":"pre","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}`,
+		initLine(id),
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"after noise"}]}}`,
+		`{"type":"result","subtype":"success"}`,
+	)
+	// The pre-init control_request was still answered.
+	waitForStdin(t, p, `"request_id":"pre"`)
+	if ready := waitFor(t, events, agent.EventSessionReady); ready.SessionID != id {
+		t.Errorf("SessionReady id = %q", ready.SessionID)
+	}
+	if txt := waitFor(t, events, agent.EventTextDelta); txt.Text != "after noise" {
+		t.Errorf("text = %q", txt.Text)
+	}
+	waitFor(t, events, agent.EventTurnDone)
+	_ = b.Close()
+}
+
+// TestOutputBeforeInitRejected: assistant/result before any init is a protocol
+// violation → explicit TurnError + channel close.
+func TestOutputBeforeInitRejected(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"premature"}]}}`)
+	te := waitFor(t, events, agent.EventTurnError)
+	if !strings.Contains(te.ErrorMessage, "init") {
+		t.Errorf("want init protocol error, got %q", te.ErrorMessage)
+	}
+	expectClosed(t, events)
+}
+
+// TestMissingInitRejected: a process that produces only pre-init noise and then
+// exits without ever emitting init surfaces a TurnError (not a silent success).
+func TestMissingInitRejected(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"rate_limit_event","remaining":100}`)
+	p.exitWith("exited before init", nil)
+	te := waitFor(t, events, agent.EventTurnError)
+	if te.ErrorMessage == "" {
+		t.Error("missing init must surface a non-empty TurnError")
+	}
+	expectClosed(t, events)
+}
+
+// TestTerminalEventNeverDropped fills the event buffer, then emits a terminal
+// event from another goroutine; once the consumer drains, the terminal event
+// must still arrive (terminal events are never dropped).
+func TestTerminalEventNeverDropped(t *testing.T) {
+	b, _, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	b.mu.Lock()
+	s := b.sessions[id]
+	b.mu.Unlock()
+
+	// Saturate the buffer with non-terminal events (none drained yet).
+	for i := 0; i < cap(s.events)+5; i++ {
+		s.emit(agent.Event{Type: agent.EventTextDelta, Text: "x"})
+	}
+
+	emitted := make(chan struct{})
+	go func() {
+		s.emit(agent.Event{Type: agent.EventTurnDone}) // must block, not drop
+		close(emitted)
+	}()
+
+	// Drain until the terminal event appears.
+	sawDone := false
+	deadline := time.After(2 * time.Second)
+	for !sawDone {
+		select {
+		case ev := <-events:
+			if ev.Type == agent.EventTurnDone {
+				sawDone = true
+			}
+		case <-deadline:
+			t.Fatal("TurnDone was dropped on a full channel")
+		}
+	}
+	<-emitted
+	_ = b.Close()
+}
+
+// TestNextTurnAfterTerminalNotEvicted guards the ordering fix: terminal idle
+// bookkeeping runs BEFORE the terminal event is published, so a turn dispatched
+// immediately after TurnDone is not clobbered and evicted.
+func TestNextTurnAfterTerminalNotEvicted(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IdleEvictionTimeout = 10 * time.Minute
+	clk := newFakeClock()
+	b := newForTest(cfg, newFakeCommander(), clk)
+	fc := b.cmd.(*fakeCommander)
+
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "t1")
+	p1.feed(initLine(id), `{"type":"result","subtype":"success"}`)
+	waitFor(t, events, agent.EventTurnDone)
+
+	// Dispatch the next turn immediately (as the router would on TurnDone).
+	if err := b.SendMessage(context.Background(), id, "t2", nil); err != nil {
+		t.Fatalf("SendMessage t2: %v", err)
+	}
+	// The new turn is in-flight; advancing past the idle timeout must NOT evict.
+	clk.Advance(11 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+	if p1.terms() != 0 {
+		t.Error("next in-flight turn was evicted (terminal bookkeeping raced the consumer)")
+	}
+	_ = b.Close()
 }

@@ -72,6 +72,11 @@ func (a *Adapter) Cancel(ctx context.Context, sessionID string) error {
 	return a.client.Cancel(ctx, sessionID)
 }
 
+// CloseSession closes one jcode session's connection without affecting others.
+func (a *Adapter) CloseSession(ctx context.Context, sessionID string) error {
+	return a.client.CloseSession(sessionID)
+}
+
 func (a *Adapter) Close() error {
 	return a.client.Close()
 }

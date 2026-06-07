@@ -150,7 +150,18 @@ func open(dataDir string, cli bool) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "switchboard.db")
-	db, err := sql.Open("sqlite", dbPath)
+
+	// foreign_keys and busy_timeout are CONNECTION-local pragmas — setting them
+	// via a one-off Exec only configures a single pooled connection. Put them in
+	// the DSN so EVERY connection in the pool enforces them; otherwise ON DELETE
+	// CASCADE / FK constraints fire only intermittently (codex P1 r2).
+	// CLI uses a longer busy timeout (30s) since the daemon may hold write locks.
+	busyTimeout := 5000
+	if cli {
+		busyTimeout = 30000
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)", dbPath, busyTimeout)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
@@ -166,21 +177,10 @@ func open(dataDir string, cli bool) (*Store, error) {
 	}
 	db.SetConnMaxLifetime(0) // never expire
 
-	// Enable WAL mode and set busy timeout.
-	// CLI uses a longer timeout (30s) since the daemon may hold brief write locks.
-	busyTimeout := 5000
-	if cli {
-		busyTimeout = 30000
-	}
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeout),
-		"PRAGMA foreign_keys=ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("store: %s: %w", pragma, err)
-		}
+	// WAL is a database-level pragma (persists), so a one-off Exec is fine.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: PRAGMA journal_mode=WAL: %w", err)
 	}
 
 	if !cli {

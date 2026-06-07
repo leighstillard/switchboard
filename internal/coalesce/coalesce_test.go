@@ -824,6 +824,44 @@ func TestStartCountdownSetsTarget(t *testing.T) {
 	}
 }
 
+// TestCountdownFromFullToolStartInput is the regression guard for the claude
+// backend: it delivers a ScheduleWakeup tool with its COMPLETE input on
+// ToolStart and NO ToolInputDelta (claude's full-message mode), then ToolExec.
+// The countdown must still start — the coalescer must source the input from the
+// ToolStart entry when no delta buffer exists.
+func TestCountdownFromFullToolStartInput(t *testing.T) {
+	out := &mockOutbound{}
+	coal := NewSessionCoalescer("sess-cd2", "timer", "C998", "ts8", "/workspace/countdown",
+		Identity{DisplayName: "Test"}, out, nil)
+	defer coal.Close()
+
+	coal.HandleEvent(agent.Event{
+		Type:     agent.EventToolStart,
+		ToolID:   "toolu_sw",
+		ToolName: "ScheduleWakeup",
+		ToolInput: map[string]any{
+			"delaySeconds": float64(120),
+			"reason":       "waiting for build",
+		},
+	})
+	// No ToolInputDelta — claude sends full input on ToolStart.
+	coal.HandleEvent(agent.Event{
+		Type:     agent.EventToolExec,
+		ToolID:   "toolu_sw",
+		ToolName: "ScheduleWakeup",
+	})
+
+	coal.mu.Lock()
+	defer coal.mu.Unlock()
+	if coal.countdownTarget == nil {
+		t.Fatal("expected countdownTarget to be set from full ToolStart input (ScheduleWakeup regression)")
+	}
+	remaining := time.Until(*coal.countdownTarget)
+	if remaining < 115*time.Second || remaining > 125*time.Second {
+		t.Errorf("expected ~120s remaining, got %v", remaining)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ToolInputDelta routing: empty ID (jcode) vs non-empty ID (claude)
 // ---------------------------------------------------------------------------

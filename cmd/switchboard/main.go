@@ -111,15 +111,61 @@ func main() {
 	// 2b. Claude backend (optional, constructed if configured)
 	var claudeBackend agent.Backend
 	if claudeNeeded(cfg) {
+		binary := cfg.Claude.Binary
+		if binary == "" {
+			binary = "claude"
+		}
+
+		// Backwards-compat translation of legacy permission_mode.
+		policy, warn, perr := cfg.Claude.ResolvePermissionPolicy()
+		if perr != nil {
+			slog.Error("claude config", "error", perr)
+			os.Exit(1)
+		}
+		if warn != "" {
+			slog.Warn("claude config: " + warn)
+		}
+
+		// Startup validation: claude is selected, so the binary must exist and
+		// meet the minimum CLI version (fail fast otherwise).
+		minV := cfg.Claude.MinVersion
+		if minV == "" {
+			minV = "2.1.0"
+		}
+		ver, verr := claude.ProbeVersion(binary)
+		if verr != nil {
+			slog.Error("claude backend selected but binary is unavailable", "binary", binary, "error", verr)
+			os.Exit(1)
+		}
+		belowMin, aboveMax, rerr := claude.CheckVersionRange(ver, minV, cfg.Claude.MaxVersion)
+		if rerr != nil {
+			slog.Error("claude version check", "error", rerr)
+			os.Exit(1)
+		}
+		if belowMin {
+			slog.Error("claude CLI below required min_version", "version", ver, "min_version", minV)
+			os.Exit(1)
+		}
+		if aboveMax {
+			slog.Warn("claude CLI above configured max_version (untested)", "version", ver, "max_version", cfg.Claude.MaxVersion)
+		}
+
 		claudeCfg := claude.Config{
-			Binary:             cfg.Claude.Binary,
-			PermissionMode:     cfg.Claude.PermissionMode,
-			Model:              cfg.Claude.Model,
-			AppendSystemPrompt: cfg.Claude.AppendSystemPrompt,
-			ExtraArgs:          cfg.Claude.ExtraArgs,
+			Binary:              binary,
+			Model:               cfg.Claude.Model,
+			SettingSources:      cfg.Claude.SettingSources,
+			PermissionPolicy:    policy,
+			AppendSystemPrompt:  cfg.Claude.AppendSystemPrompt,
+			GracefulStopTimeout: parseDurationOr(cfg.Claude.GracefulStopTimeout, 30*time.Second),
+			IdleEvictionTimeout: parseDurationOr(cfg.Claude.IdleEvictionTimeout, 30*time.Minute),
+			ExtraEnv:            cfg.Claude.ExtraEnv,
+			ExtraArgs:           cfg.Claude.ExtraArgs,
 		}
 		claudeBackend = claude.New(claudeCfg)
-		slog.Info("claude backend initialized", "model", claudeCfg.Model)
+		// Close on shutdown so the long-running claude processes (and their MCP
+		// grandchildren) are terminated rather than orphaned.
+		defer claudeBackend.Close()
+		slog.Info("claude backend initialized", "model", claudeCfg.Model, "cli_version", ver, "permission_policy", policy)
 	}
 
 	// 3. Slack edge
@@ -276,6 +322,20 @@ func claudeNeeded(cfg *config.Config) bool {
 		}
 	}
 	return false
+}
+
+// parseDurationOr parses a duration string, falling back to def on empty/invalid.
+// "0" is valid and means zero (e.g. idle eviction disabled).
+func parseDurationOr(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		slog.Warn("invalid duration in config, using default", "value", s, "default", def)
+		return def
+	}
+	return d
 }
 
 func parseLogLevel(s string) slog.Level {

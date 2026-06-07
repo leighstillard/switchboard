@@ -136,11 +136,54 @@ type JcodeConfig struct {
 
 // ClaudeConfig holds Claude Code CLI settings.
 type ClaudeConfig struct {
-	Binary             string   `toml:"binary"`               // default "claude"
-	PermissionMode     string   `toml:"permission_mode"`      // default "bypassPermissions"
-	Model              string   `toml:"model"`                // default "claude-sonnet-4-20250514"
-	AppendSystemPrompt string   `toml:"append_system_prompt"` // appended to system prompt
-	ExtraArgs          []string `toml:"extra_args"`           // additional CLI arguments
+	Binary              string            `toml:"binary"`                // default "claude"
+	Model               string            `toml:"model"`                 // default "claude-sonnet-4-20250514"
+	PermissionPolicy    string            `toml:"permission_policy"`     // allow_all | deny_all | accept_edits_only
+	SettingSources      string            `toml:"setting_sources"`       // default "project,local" (excludes user-layer hooks)
+	AppendSystemPrompt  string            `toml:"append_system_prompt"`  // appended to system prompt
+	GracefulStopTimeout string            `toml:"graceful_stop_timeout"` // e.g. "30s"
+	IdleEvictionTimeout string            `toml:"idle_eviction_timeout"` // e.g. "30m"; "0" = never
+	MinVersion          string            `toml:"min_version"`           // default "2.1.0"
+	MaxVersion          string            `toml:"max_version"`           // optional ceiling
+	ExtraEnv            map[string]string `toml:"extra_env"`             // applied last, overrides inherited env
+	ExtraArgs           []string          `toml:"extra_args"`            // additional CLI arguments
+
+	// PermissionMode is the legacy (pre-policy) knob, retained for backwards
+	// compatibility and translated on load. Use PermissionPolicy instead.
+	PermissionMode string `toml:"permission_mode"`
+}
+
+// ResolvePermissionPolicy translates the (possibly legacy) permission config to a
+// policy name. It returns a non-empty warning when a legacy permission_mode is
+// mapped, and an error when both permission_mode and permission_policy are set.
+func (c ClaudeConfig) ResolvePermissionPolicy() (policy, warning string, err error) {
+	if c.PermissionMode != "" && c.PermissionPolicy != "" {
+		return "", "", fmt.Errorf("config: set either claude.permission_policy or the legacy claude.permission_mode, not both (remove permission_mode)")
+	}
+	if c.PermissionPolicy != "" {
+		switch c.PermissionPolicy {
+		case "allow_all", "deny_all", "accept_edits_only":
+			return c.PermissionPolicy, "", nil
+		default:
+			// Reject unknown values loudly — silently falling back to allow_all
+			// would be a security footgun (a typo'd deny becomes allow).
+			return "", "", fmt.Errorf("config: unknown claude.permission_policy %q (want allow_all, deny_all, or accept_edits_only)", c.PermissionPolicy)
+		}
+	}
+	switch c.PermissionMode {
+	case "", "bypassPermissions":
+		return "allow_all", "", nil // silent: equivalent behaviour
+	case "default":
+		return "allow_all", "claude.permission_mode=default mapped to permission_policy=allow_all", nil
+	case "acceptEdits":
+		return "accept_edits_only", "claude.permission_mode=acceptEdits mapped to permission_policy=accept_edits_only", nil
+	case "dontAsk":
+		return "deny_all", "claude.permission_mode=dontAsk mapped to permission_policy=deny_all", nil
+	case "plan":
+		return "allow_all", "claude.permission_mode=plan mapped to permission_policy=allow_all (plan mode is not preserved)", nil
+	default:
+		return "allow_all", fmt.Sprintf("unknown claude.permission_mode=%q mapped to permission_policy=allow_all", c.PermissionMode), nil
+	}
 }
 
 // IdentityConfig defines a bot identity persona.
