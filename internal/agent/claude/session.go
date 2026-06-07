@@ -84,13 +84,32 @@ func (s *session) readLoop(p proc, gen int) {
 	scanner := bufio.NewScanner(p.Stdout())
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	healthy := false // produced system/init or a completed turn
+	firstLine := true
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
-		if peekType(line) == "control_request" {
+		typ := peekType(line)
+
+		// Compatibility probe (spec stage 2a): the first system line must be a
+		// well-formed init, else surface an explicit protocol error rather than
+		// a silent/degraded turn.
+		if firstLine {
+			firstLine = false
+			if typ == "system" {
+				if err := probeInitShape(line); err != nil {
+					s.emit(agent.Event{Type: agent.EventTurnError, ErrorMessage: err.Error()})
+					s.markClosed()
+					_ = p.Terminate()
+					s.closeEvents()
+					break
+				}
+			}
+		}
+
+		if typ == "control_request" {
 			s.handleControlRequest(p, line)
 			continue
 		}
@@ -98,13 +117,15 @@ func (s *session) readLoop(p proc, gen int) {
 			if ev.Type == agent.EventSessionReady {
 				healthy = true
 			}
+			// Update terminal state (idle eviction bookkeeping) BEFORE publishing
+			// the event. Otherwise the consumer can dispatch the next queued turn
+			// (marking the session in-flight) and onTerminal would then clobber
+			// it back to idle and arm the eviction timer against a live turn.
 			if isTerminal(ev.Type) {
 				healthy = true
-			}
-			s.emit(ev)
-			if isTerminal(ev.Type) {
 				s.onTerminal()
 			}
+			s.emit(ev)
 		}
 	}
 
@@ -355,6 +376,30 @@ func (s *session) stopIdleTimerLocked() {
 // ---------------------------------------------------------------------------
 
 func (s *session) emit(ev agent.Event) {
+	// Terminal events (TurnDone/TurnError/Interrupted) must NEVER be dropped —
+	// the router relies on them to release per-thread locks and processing
+	// state. Block (without holding emitMu, so closeEvents can still proceed)
+	// until the event is delivered or the session is permanently closed.
+	if isTerminal(ev.Type) {
+		for {
+			s.emitMu.Lock()
+			if s.eventsClosed {
+				s.emitMu.Unlock()
+				return
+			}
+			select {
+			case s.events <- ev:
+				s.emitMu.Unlock()
+				return
+			default:
+			}
+			s.emitMu.Unlock()
+			time.Sleep(2 * time.Millisecond) // buffer full: wait for the consumer to drain
+		}
+	}
+
+	// Non-terminal events are best-effort: a full buffer means a slow consumer;
+	// dropping a text/tool delta degrades output but is not a correctness bug.
 	s.emitMu.Lock()
 	defer s.emitMu.Unlock()
 	if s.eventsClosed {
@@ -363,7 +408,7 @@ func (s *session) emit(ev agent.Event) {
 	select {
 	case s.events <- ev:
 	default:
-		slog.Warn("claude: event channel full, dropping event", "session_id", s.id, "type", ev.Type)
+		slog.Warn("claude: event channel full, dropping non-terminal event", "session_id", s.id, "type", ev.Type)
 	}
 }
 

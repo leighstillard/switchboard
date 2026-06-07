@@ -605,3 +605,84 @@ func TestSendMessageUnknownSession(t *testing.T) {
 		t.Error("expected error for unknown session")
 	}
 }
+
+// TestMalformedInitSurfacesProtocolError verifies the stage-2a compatibility
+// probe is wired: a first system line that is not a well-formed init yields an
+// explicit "(init)" TurnError and closes the channel (not a silent empty turn).
+func TestMalformedInitSurfacesProtocolError(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"system","subtype":"init","model":"m"}`) // missing session_id
+	te := waitFor(t, events, agent.EventTurnError)
+	if !strings.Contains(te.ErrorMessage, "init") {
+		t.Errorf("want init protocol error, got %q", te.ErrorMessage)
+	}
+	expectClosed(t, events)
+}
+
+// TestTerminalEventNeverDropped fills the event buffer, then emits a terminal
+// event from another goroutine; once the consumer drains, the terminal event
+// must still arrive (terminal events are never dropped).
+func TestTerminalEventNeverDropped(t *testing.T) {
+	b, _, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	b.mu.Lock()
+	s := b.sessions[id]
+	b.mu.Unlock()
+
+	// Saturate the buffer with non-terminal events (none drained yet).
+	for i := 0; i < cap(s.events)+5; i++ {
+		s.emit(agent.Event{Type: agent.EventTextDelta, Text: "x"})
+	}
+
+	emitted := make(chan struct{})
+	go func() {
+		s.emit(agent.Event{Type: agent.EventTurnDone}) // must block, not drop
+		close(emitted)
+	}()
+
+	// Drain until the terminal event appears.
+	sawDone := false
+	deadline := time.After(2 * time.Second)
+	for !sawDone {
+		select {
+		case ev := <-events:
+			if ev.Type == agent.EventTurnDone {
+				sawDone = true
+			}
+		case <-deadline:
+			t.Fatal("TurnDone was dropped on a full channel")
+		}
+	}
+	<-emitted
+	_ = b.Close()
+}
+
+// TestNextTurnAfterTerminalNotEvicted guards the ordering fix: terminal idle
+// bookkeeping runs BEFORE the terminal event is published, so a turn dispatched
+// immediately after TurnDone is not clobbered and evicted.
+func TestNextTurnAfterTerminalNotEvicted(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.IdleEvictionTimeout = 10 * time.Minute
+	clk := newFakeClock()
+	b := newForTest(cfg, newFakeCommander(), clk)
+	fc := b.cmd.(*fakeCommander)
+
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "t1")
+	p1.feed(initLine(id), `{"type":"result","subtype":"success"}`)
+	waitFor(t, events, agent.EventTurnDone)
+
+	// Dispatch the next turn immediately (as the router would on TurnDone).
+	if err := b.SendMessage(context.Background(), id, "t2", nil); err != nil {
+		t.Fatalf("SendMessage t2: %v", err)
+	}
+	// The new turn is in-flight; advancing past the idle timeout must NOT evict.
+	clk.Advance(11 * time.Minute)
+	time.Sleep(20 * time.Millisecond)
+	if p1.terms() != 0 {
+		t.Error("next in-flight turn was evicted (terminal bookkeeping raced the consumer)")
+	}
+	_ = b.Close()
+}

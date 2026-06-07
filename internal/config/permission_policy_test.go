@@ -13,6 +13,8 @@ func TestResolvePermissionPolicy(t *testing.T) {
 		{"empty default allow", ClaudeConfig{}, "allow_all", false, false},
 		{"bypass silent", ClaudeConfig{PermissionMode: "bypassPermissions"}, "allow_all", false, false},
 		{"explicit policy", ClaudeConfig{PermissionPolicy: "deny_all"}, "deny_all", false, false},
+		{"explicit accept_edits_only", ClaudeConfig{PermissionPolicy: "accept_edits_only"}, "accept_edits_only", false, false},
+		{"unknown policy errors", ClaudeConfig{PermissionPolicy: "denyall"}, "", false, true},
 		{"legacy default warns", ClaudeConfig{PermissionMode: "default"}, "allow_all", true, false},
 		{"legacy acceptEdits", ClaudeConfig{PermissionMode: "acceptEdits"}, "accept_edits_only", true, false},
 		{"legacy dontAsk", ClaudeConfig{PermissionMode: "dontAsk"}, "deny_all", true, false},

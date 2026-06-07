@@ -162,6 +162,9 @@ func main() {
 			ExtraArgs:           cfg.Claude.ExtraArgs,
 		}
 		claudeBackend = claude.New(claudeCfg)
+		// Close on shutdown so the long-running claude processes (and their MCP
+		// grandchildren) are terminated rather than orphaned.
+		defer claudeBackend.Close()
 		slog.Info("claude backend initialized", "model", claudeCfg.Model, "cli_version", ver, "permission_policy", policy)
 	}
 

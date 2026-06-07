@@ -161,7 +161,14 @@ func (c ClaudeConfig) ResolvePermissionPolicy() (policy, warning string, err err
 		return "", "", fmt.Errorf("config: set either claude.permission_policy or the legacy claude.permission_mode, not both (remove permission_mode)")
 	}
 	if c.PermissionPolicy != "" {
-		return c.PermissionPolicy, "", nil
+		switch c.PermissionPolicy {
+		case "allow_all", "deny_all", "accept_edits_only":
+			return c.PermissionPolicy, "", nil
+		default:
+			// Reject unknown values loudly — silently falling back to allow_all
+			// would be a security footgun (a typo'd deny becomes allow).
+			return "", "", fmt.Errorf("config: unknown claude.permission_policy %q (want allow_all, deny_all, or accept_edits_only)", c.PermissionPolicy)
+		}
 	}
 	switch c.PermissionMode {
 	case "", "bypassPermissions":
