@@ -626,12 +626,18 @@ func truncateForSlack(text string, maxLen int) string {
 	if len(text) <= maxLen {
 		return text
 	}
-	// Find last newline before the limit.
-	cutoff := text[:maxLen]
-	if idx := lastIndexByte(cutoff, '\n'); idx > maxLen/2 {
-		return text[:idx] + "\n\n_...message truncated (exceeded Slack limit)_"
+	// Reserve room for the suffix so the final string never exceeds maxLen.
+	const suffix = "\n\n_...message truncated (exceeded Slack limit)_"
+	cutAt := maxLen - len(suffix)
+	if cutAt < 0 {
+		cutAt = 0
 	}
-	return text[:maxLen] + "\n\n_...message truncated (exceeded Slack limit)_"
+	// Prefer cutting at the last newline before the reserved cut point.
+	cutoff := text[:cutAt]
+	if idx := lastIndexByte(cutoff, '\n'); idx > maxLen/2 {
+		return text[:idx] + suffix
+	}
+	return text[:cutAt] + suffix
 }
 
 func lastIndexByte(s string, c byte) int {

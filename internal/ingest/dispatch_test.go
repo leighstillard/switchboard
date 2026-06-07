@@ -3,10 +3,15 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/format5/switchboard/internal/config"
 )
@@ -57,6 +62,68 @@ func TestDispatchEndpoint_Success(t *testing.T) {
 	}
 	if resp["session_id"] != "session_test_123" {
 		t.Errorf("session_id = %q, want session_test_123", resp["session_id"])
+	}
+}
+
+func TestDispatchEndpoint_RejectsUnauthenticated(t *testing.T) {
+	st := testStore(t)
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources: map[string]config.SourceConfig{
+			"dispatch": {Secret: "dispatch-secret"},
+		},
+	}
+	srv := NewServer(cfg, st)
+	srv.SetDispatchHandler(func(ctx context.Context, channelID, prompt, userID string) (string, string, error) {
+		t.Fatal("dispatch handler must not run for unauthenticated request")
+		return "", "", nil
+	})
+
+	body, _ := json.Marshal(map[string]string{"channel_id": "C0ABC123", "prompt": "deploy"})
+	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestDispatchEndpoint_ValidSignature(t *testing.T) {
+	st := testStore(t)
+	secret := "dispatch-secret"
+	cfg := config.IngestConfig{
+		ListenAddr: "127.0.0.1:0",
+		MaxBodyKB:  1024,
+		Sources: map[string]config.SourceConfig{
+			"dispatch": {Secret: secret},
+		},
+	}
+	srv := NewServer(cfg, st)
+	var called bool
+	srv.SetDispatchHandler(func(ctx context.Context, channelID, prompt, userID string) (string, string, error) {
+		called = true
+		return "1234567890.123456", "session_test_123", nil
+	})
+
+	body, _ := json.Marshal(map[string]string{"channel_id": "C0ABC123", "prompt": "deploy"})
+	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "." + string(body)))
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewReader(body))
+	req.Header.Set("X-Switchboard-Signature", signature)
+	req.Header.Set("X-Switchboard-Timestamp", timestamp)
+	w := httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	if !called {
+		t.Error("dispatch handler was not called for authenticated request")
 	}
 }
 

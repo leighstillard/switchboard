@@ -256,12 +256,37 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read and bound the body before authenticating, so HMAC verification
+	// runs over the exact bytes and large payloads cannot exhaust memory.
+	maxBody := int64(s.cfg.MaxBodyKB) * 1024
+	if maxBody <= 0 {
+		maxBody = 1024 * 1024 // default 1MB
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxBody {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Require authentication using the same HMAC scheme as webhook ingest,
+	// keyed off the "dispatch" source secret. Unauthenticated dispatches
+	// would allow arbitrary, billable agent executions.
+	if !s.verifySignature("dispatch", r, body) {
+		slog.Warn("ingest: dispatch HMAC verification failed", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		ChannelID string `json:"channel_id"`
 		Prompt    string `json:"prompt"`
 		UserID    string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -275,7 +300,7 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	threadTS, sessionID, err := s.dispatchHandler(r.Context(), req.ChannelID, req.Prompt, req.UserID)
 	if err != nil {
 		slog.Error("ingest: dispatch failed", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "dispatch failed", http.StatusInternalServerError)
 		return
 	}
 
