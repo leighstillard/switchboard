@@ -33,22 +33,15 @@ talking to.
 - Touch points: identity rendering, message post path, possibly config to
   let users supply their own per-agent icons.
 
-## Handover (separate feature, captured here for reference)
+## Handover / agent switching — PROMOTED to the spec (2026-06-07)
 
-In-thread handover to another agent via natural-language instruction in Slack
-(not a slash command). Example: "build this feature, then use codex to do a
-code review of it."
-
-- Lives one layer above `agent.Backend`. Router decides which backend takes
-  the next turn for a given thread.
-- Warm claude process stays held in a router-side per-thread map across
-  handover. On switchboard restart we use `claude --resume <session_id>`
-  with the UUID stored in `sessions.jcode_session` (captured originally from
-  `system/init`). Not `--continue` — that's workdir-relative and would
-  cross-wire concurrent threads sharing a workdir.
-- Idle-timeout eviction of warm sessions (kill the subprocess after N
-  minutes of inactivity, rehydrate via `--resume` on next message) is a
-  future polish — not needed for the initial handover feature.
-- See `docs/superpowers/specs/2026-05-25-claude-code-backend-design.md`
-  §"Handover compatibility" for the close-semantics + warm-session
-  decisions that are load-bearing for this feature.
+In-thread handover to another agent via natural-language instruction ("build
+this feature, then use codex to review it") is **no longer backlog** — it is now
+designed in `docs/superpowers/specs/2026-05-25-claude-code-backend-design.md`
+§"Agent switching": reversible switching, one session id per backend per thread
+(persisted in `thread_backend_sessions`), switch-at-turn-boundary timing,
+dormant-session draining, **process ownership inside the backend** (not a
+router-side map), and idle eviction (all specified, not deferred). Delivery is
+PR 2 in that spec's delivery plan. Kept here only as a pointer. Note: uses
+`--resume <session_id>`, not `--continue` (which is workdir-relative and would
+cross-wire concurrent threads sharing a workdir).

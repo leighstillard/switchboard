@@ -1,10 +1,40 @@
 # Claude Code Backend — Design
 
-**Date:** 2026-05-25 (revised 2026-06-06)
+**Date:** 2026-05-25 (revised 2026-06-07)
 **Status:** Revised (pending review)
 **Branch:** `feat/claude-code-backend`
 
 ## Revision history
+
+- **2026-06-07 — Auth, env, and agent-switching revision.** Seven changes:
+  1. **`--bare` removed.** `claude --help` documents `--bare` as forcing Anthropic
+     auth to be "strictly `ANTHROPIC_API_KEY` or apiKeyHelper via `--settings`
+     (OAuth and keychain are **never read**)." switchboard runs on the operator's
+     **Claude subscription**, not a metered API key, so `--bare` would either fail
+     (no key) or silently bill the wrong account. Replaced with **selective
+     settings loading** via `--setting-sources project,local` (excludes the
+     `user` layer where the host's noisy SessionStart hooks live) — this fixes
+     the empty-response bug **without** disabling OAuth/keychain. See §Invocation.
+  2. **Environment is preserved**, not allow-listed. Only `CLAUDECODE` is
+     stripped. The previous allow-list risked dropping vars the CLI/keychain
+     helper needs for OAuth. See §Environment hygiene.
+  3. **Reversible per-thread agent switching** with **one session id per
+     backend per thread**, persisted, so claude→codex→claude returns to the
+     original warm claude conversation. Promoted from BACKLOG into this spec.
+     See §Agent switching.
+  4. **Process ownership lives inside each backend**, not in a router-side map.
+     The router selects *which* backend takes the next turn; the backend owns
+     its subprocess lifecycle. See §Agent switching and §Router wiring.
+  5. **Switch timing, inactive-event handling, persistence, and idle eviction**
+     are now specified (not deferred). See §Agent switching.
+  6. **Subscription-authenticated multi-turn + handover smoke test** added —
+     a real `claude` run under OAuth (no API key in env) that does several turns
+     and a round-trip handover. See §Testing.
+  7. **Claude CLI protocol is pinned/probed** at startup. See §CLI compatibility.
+
+  Retained from the 2026-06-06 rewrite: normalized event translation, the
+  persistent (long-running) process, the `--permission-prompt-tool stdio`
+  permission protocol, setpgid process-group cleanup, and `--resume` recovery.
 
 - **2026-06-06 — Mechanism rewrite.** The original design spawned `claude -p ''`
   per turn with `--permission-mode bypassPermissions` and `--session-id <uuid>`.
@@ -20,10 +50,12 @@
   **long-running** `claude` process per session, stdin held open, turns written
   as stream-json lines into the live process, `--permission-prompt-tool stdio`
   with in-process auto-approve, setpgid + process-group kill, `CLAUDECODE` env
-  stripped. The **hook root cause is addressed separately by `--bare`** (skips
-  hooks, LSP, plugins — see §Invocation). Long-running is still the right shape
-  because (a) state stays warm across turns, (b) it composes cleanly with the
-  upcoming agent-handover feature.
+  stripped. The **hook root cause is addressed by excluding the `user` settings
+  layer** (where the host SessionStart hooks live) — see §Invocation. (This
+  entry originally specified `--bare`; superseded by the 2026-06-07 revision
+  above, which switches to `--setting-sources` to keep subscription OAuth.)
+  Long-running is still the right shape because (a) state stays warm across
+  turns, (b) it composes cleanly with the agent-switching feature.
 - **2026-06-06 — Restart resume strategy.** Original plan persisted the claude
   session UUID and used `--resume <uuid>` for `SubscribeExisting`. An interim
   revision tried `claude --continue`, but `--continue` is documented as "the
@@ -34,10 +66,9 @@
   `sessions.jcode_session` column (already present via `migrateV4`); no new
   schema is required.
 - **2026-06-06 — Handover-readiness.** The redesign is intentionally compatible
-  with the upcoming in-thread agent-handover feature (see `docs/BACKLOG.md`):
-  warm claude process held in a router-side per-thread map, not torn down on
-  handover. See §Handover compatibility for how this composes with the
-  close-once channel contract.
+  with in-thread agent handover. (This entry originally proposed a router-side
+  warm-process map; the 2026-06-07 revision moved process ownership **inside the
+  backend** and specified the full switching design — see §Agent switching.)
 
 ## Problem
 
@@ -86,7 +117,7 @@ Process `cwd` is set to the session workdir (there is no `--cwd` flag):
 
 ```
 claude \
-  --bare \
+  --setting-sources project,local \
   --input-format stream-json \
   --output-format stream-json \
   --verbose \
@@ -99,14 +130,29 @@ claude \
 
 Notes on each flag:
 
-- **`--bare`.** "Minimal mode: skip hooks, LSP, plugins" (per `claude --help`).
-  Load-bearing for switchboard: the host's `~/.claude/settings.json` defines
-  SessionStart hooks (superpowers, brainspike, claude-mem) that fire in every
-  spawned `claude` and bloat the system prompt with tens of KB of guidance.
-  Bloated prompts caused the empty-response bug observed on the original
-  mechanism. Stripping `CLAUDECODE` from env is not enough — hooks come from
-  settings, not env. `--bare` is what closes that gap. **Without `--bare` the
-  rewrite would reproduce the same empty-response symptom.**
+- **`--setting-sources project,local`** (replaces the earlier `--bare`).
+  `claude --help`: "Comma-separated list of setting sources to load (user,
+  project, local)." Omitting a source skips that layer. The empty-response bug
+  came from SessionStart hooks (superpowers, brainspike, claude-mem) defined in
+  the **`user`** layer (`~/.claude/settings.json`); excluding `user` stops those
+  hooks from firing and bloating the system prompt, which was the actual root
+  cause. **Why not `--bare`:** `--bare` also documents that "Anthropic auth is
+  strictly `ANTHROPIC_API_KEY` or apiKeyHelper via `--settings` (OAuth and
+  keychain are **never read**)." switchboard authenticates with the operator's
+  **Claude subscription** (OAuth/keychain), not a metered API key, so `--bare`
+  would break or mis-bill auth. `--setting-sources` is a *settings*-layer filter
+  only — it does **not** touch credentials, so subscription OAuth/keychain are
+  read normally. This is the precise, minimal fix.
+  - **Project/local hygiene.** The excluded layer is `user`; `project` and
+    `local` settings come from the session **workdir**. switchboard controls the
+    workdir (a normal checkout), so it does not normally carry SessionStart-hook
+    bloat — but if a target repo's `.claude/settings.json` adds noisy hooks, the
+    operator can tighten the set (see `setting_sources` config). The
+    subscription smoke test (§Testing) asserts the chosen set both authenticates
+    via OAuth **and** does not reproduce the empty-response symptom.
+  - **Configurable.** `setting_sources` is a `[claude]` config knob defaulting to
+    `"project,local"`; set it to `"local"` (or empty) to exclude more, or
+    `"user,project,local"` to opt back into the full host config.
 - **No `-p '' `.** Print mode forces a single-turn run that exits when stdin
   closes; we want a session-lifetime process that reads many turns from stdin.
 - **`--input-format stream-json` + `--output-format stream-json`.** Bidirectional
@@ -132,10 +178,10 @@ Notes on each flag:
   jcode's behavior where user input is observable on the event stream.
 - **`--append-system-prompt`.** Adds a small switchboard-specific system prompt
   (e.g. "you are running inside a Slack-bridged session, format responses for
-  Slack mrkdwn") without replacing Claude Code's built-in system prompt.
-  Confirmed safe to combine with `--bare`: `claude --help` lists
-  `--append-system-prompt` among the explicit context-injection flags
-  permitted in bare mode (alongside `--settings`, `--agents`, `--plugin-dir`).
+  Slack mrkdwn") without replacing Claude Code's built-in system prompt. Since
+  the `user` settings layer is excluded, this flag (plus `--mcp-config` /
+  `--add-dir` when needed) is how switchboard injects the context it actually
+  wants, rather than inheriting whatever the host user configured.
 - **`--model`.** Per-config / per-channel override.
 - **`--resume <session_id>`.** Used **only** for recovery (after switchboard
   restart, after a crash mid-turn, after a Cancel). The UUID comes from the
@@ -227,14 +273,21 @@ adopted preemptively from the cc-connect reference (`session.go:149-154`).
 
 ### Environment hygiene
 
-Before spawning, the parent environment is filtered:
+The child **inherits the parent environment in full**, with exactly one
+removal:
 
 - **Strip `CLAUDECODE`** — its presence triggers "nested session" detection in
   the CLI which changes behavior; switchboard is a bridge, not a nested
   Claude Code instance.
-- Pass through `ANTHROPIC_*`, `CLAUDE_*`, `AWS_*` (for Bedrock), `NO_PROXY`,
-  and switchboard-relevant vars.
-- Inject any `extra_env` from `[claude]` config last (overrides above).
+- **Everything else passes through unchanged.** An earlier draft used an
+  allow-list (`ANTHROPIC_*`, `CLAUDE_*`, `AWS_*`, …), but that is fragile:
+  subscription OAuth / the keychain helper and the CLI's own runtime depend on
+  ambient vars (`HOME`, `PATH`, `XDG_*`, `SSH_AUTH_SOCK`, proxy vars, locale,
+  etc.) that an allow-list inevitably misses, which would manifest as
+  intermittent auth failures. Preserve the env; subtract only `CLAUDECODE`.
+- Apply `extra_env` from `[claude]` config **last**, so it can override any
+  inherited var (including, if an operator deliberately wants it, forcing
+  `ANTHROPIC_API_KEY` for a non-subscription deployment).
 
 ### Resume / crash recovery
 
@@ -478,7 +531,15 @@ binary = "claude"
 model = "claude-sonnet-4-6"
 permission_policy = "allow_all"  # allow_all | deny_all | accept_edits_only
 append_system_prompt = ""    # optional, appended to claude's built-in prompt
+setting_sources = "project,local"  # settings layers to load; excludes "user"
+                                   # (host SessionStart hooks) by default. Does
+                                   # NOT affect OAuth/keychain auth.
 graceful_stop_timeout = "30s"
+idle_eviction_timeout = "30m"  # tear down a dormant warm subprocess after this
+                               # idle; "0" = never. Session id is retained for
+                               # --resume rehydration.
+min_version = "2.1.0"        # fail-fast (if claude selected) below this CLI version
+max_version = ""             # optional ceiling; above it warns but proceeds
 extra_args = []              # optional escape hatch (appended after our flags)
 
 [claude.extra_env]           # optional, matches switchboard's existing
@@ -493,8 +554,9 @@ model = "claude-sonnet-4-6"  # optional per-channel model override
 - `RoutingConfig2` already has `Backend BackendRoutingConfig` (`Default string`)
   from `d28a85d`.
 - `ClaudeConfig` already exists; this revision **drops `permission_mode`** and
-  adds `permission_policy`, `append_system_prompt`, `graceful_stop_timeout`,
-  `extra_env` (as `map[string]string`, matching the convention at
+  adds `permission_policy`, `append_system_prompt`, `setting_sources`,
+  `graceful_stop_timeout`, `idle_eviction_timeout`, `min_version`/`max_version`,
+  and `extra_env` (as `map[string]string`, matching the convention at
   `config.go:48` `Repos` and `config.go:164` `Match`).
 - `ChannelConfig.Backend` and `ChannelConfig.Model` already exist
   (`config.go:158-160`).
@@ -530,71 +592,188 @@ is selected anywhere and the binary is absent or non-functional, startup
 missing binary is logged as a warning and startup proceeds (jcode-only hosts
 are not blocked).
 
+## CLI compatibility (pin / probe the protocol)
+
+The integration is coupled to the `claude` CLI's stream-json protocol and flag
+surface, both of which can change across releases. Two guards:
+
+1. **Version probe at startup.** `claude --version` is parsed (current dev
+   baseline: **2.1.168**). switchboard carries a `supported_cli` range in
+   `[claude]` config (`min_version`, optional `max_version`; default
+   `min_version = "2.1.0"`, no max). If the detected version is below the floor,
+   startup behaves like the binary-validation rule above: **fail fast** if claude
+   is selected, **warn** otherwise. A version above a configured ceiling logs a
+   warning ("untested CLI version") but proceeds, so a routine CLI upgrade is not
+   a hard outage — the smoke tests are the real compatibility gate.
+2. **Protocol probe on first spawn.** The first `system/init` event is validated
+   for the fields the translator depends on (`session_id`, and the stream-event
+   envelope shape used for `content_block_delta`). If `system/init` is missing or
+   shaped unexpectedly, the backend emits `TurnError` with a clear
+   "incompatible claude CLI protocol" message rather than silently producing
+   empty turns (the failure mode that motivated this whole revision).
+
+Pinning the exact CLI version in the deployment (e.g. the install step records a
+known-good version) is recommended operationally; the config range is the
+in-process backstop. The build-tag smoke tests (§Testing) are run against the
+pinned version before each release to catch protocol drift the probe can't.
+
 ## Store
 
-`migrateV4` (already merged in `d28a85d` + self-healed in `8940919`) adds
-`backend TEXT NOT NULL DEFAULT 'jcode'` to `sessions`. On recovery the router
-reads `backend` to select the correct `Backend` for `SubscribeExisting`.
+`migrateV4` (merged in `d28a85d`, self-healed in `8940919`) adds
+`backend TEXT NOT NULL DEFAULT 'jcode'` to `sessions`. `sessions.backend` is the
+thread's **active** backend; on recovery the router reads it to pick the
+`Backend` for `SubscribeExisting`. The `jcode_session` column (and its
+`idx_sessions_jcode` index) keep their names and generically hold the **active**
+backend's session id — for claude, the `system/init` UUID passed to `--resume`.
 
-The `jcode_session` column **and the `idx_sessions_jcode` index keep their
-names** — the column generically holds "the backend session id". For claude
-sessions, this column stores the UUID captured from `system/init` and is the
-value passed to `--resume` on respawn / restart-recovery.
+### New: per-backend session ids (`thread_backend_sessions`)
 
-**No additional schema changes are needed for this revision.** The UUID is
-captured at first spawn and written to the existing column. Future in-thread
-handover may want a JSON map column for warm prior-backend session IDs (see
-`docs/BACKLOG.md`) — that's deferred until the handover feature lands.
+Reversible switching (§Agent switching) needs each backend's session id retained
+per thread, not just the active one. A new migration adds:
 
-## Handover compatibility
+```sql
+CREATE TABLE IF NOT EXISTS thread_backend_sessions (
+    channel_id     TEXT NOT NULL,
+    thread_ts      TEXT NOT NULL,
+    backend        TEXT NOT NULL,         -- "jcode" | "claude" | …
+    session_id     TEXT NOT NULL,         -- backend-native id (claude UUID, jcode session_…)
+    last_active_at INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, thread_ts, backend),
+    FOREIGN KEY (channel_id, thread_ts) REFERENCES sessions(channel_id, thread_ts)
+);
+```
 
-A planned follow-up feature (see `docs/BACKLOG.md`) lets the user hand off a
-thread to another agent mid-conversation — e.g. "build this feature, then use
-codex to do a code review of it". This spec is intentionally compatible with
-that future feature; the design rules below resolve the tension between
-holding a warm process across handover and the close-once channel contract.
+- On first turn under a backend: insert its `(thread, backend, session_id)` row.
+- On switch: set `sessions.backend` (+ mirror the new active id into
+  `sessions.jcode_session` for the existing recovery path), and upsert the
+  incoming backend's row, bumping `last_active_at`.
+- On switch-back / recovery: look up `(thread, active_backend)` →
+  `SubscribeExisting(session_id)` → `--resume`.
+- Idle eviction tears down the *process* but leaves the row intact; the id is
+  the resume handle.
 
-- **Handover does not call `Close()`** on the warm claude session. The session
-  stays in a router-side `map[(channel, thread)]*ClaudeSession` and its
-  subprocess remains running.
-- **While handed off**, the router stops fanning the session's event channel to
-  `coalesce`. Between turns, a claude subprocess emits nothing on stdout (it
-  blocks on stdin waiting for the next message), so the channel sits empty —
-  no buffering pressure, no goroutine leak.
-- **Returning control** to claude is just a `SendMessage` to the warm session.
-  No respawn, no `--resume`, full context still warm.
-- **`Close()` is called only on permanent termination**: thread archived,
-  switchboard shutdown, or an explicit eviction policy (idle timeout — out of
-  scope for this PR; logged in BACKLOG). Close-once contract is preserved
-  because handover is not termination.
-- **If the warm subprocess dies while held in the map** (OOM, crash), the
-  router treats it like any other crash — emit `Interrupted`, respawn with
-  `--resume <stored uuid>` on the next `SendMessage`. The warm-process
-  invariant is steady-state, not absolute.
+**Migration versioning.** This is the next free `user_version` above the
+in-flight cron (`V5`) and reaction (`V6`) migrations — i.e. **V7** once those
+land (renumber if merge order differs). Per the repo's established convention it
+ships with an idempotent self-heal backstop (`ensureThreadBackendSessionsTable`)
+that runs unconditionally in `migrate()`, mirroring `ensureBackendColumn` /
+`ensureCronLastFiredTable` / `ensureMessageTSColumn`. Coordinate the number with
+those PRs before merge.
 
-**Operational note.** Until idle-eviction lands (see `docs/BACKLOG.md`), a
-long-running switchboard accumulates one warm `claude` subprocess (plus its
-MCP grandchild tree) per `(channel, thread)` ever conversed with. Hosts with
-many active threads should expect commensurate RAM/FD pressure. This is
-acceptable for the initial handover feature because the active-thread set is
-small on dev/single-user deployments; on a multi-tenant host the eviction
-policy becomes load-bearing.
+> Note: the `sessions.jcode_session` mirror of the active id is kept so the
+> existing restart-recovery path needs no change; `thread_backend_sessions` is
+> additive. A later cleanup could make `thread_backend_sessions` the sole source
+> of truth and drop the mirror, but that is out of scope here.
 
-The router-side map is out of scope for this PR — it lands with the handover
-feature. This PR delivers the backend in a shape that **does not preclude** it:
-`Subscribe`/`SubscribeExisting`/`SendMessage`/`Close` are pure-per-session and
-do not assume the lifetime is bounded by a single turn.
+## Agent switching
+
+The user can hand a thread to another agent mid-conversation in natural language
+— "build this feature, then use codex to review it" — and later return. This is
+now an in-scope design concern (promoted from BACKLOG). The switch must be
+**reversible**: returning to a prior backend resumes *that backend's own*
+conversation, warm, where it left off.
+
+### Session identity: one session id per backend per thread
+
+A thread is a `(channel_id, thread_ts)`. Each **backend** that has ever taken a
+turn in that thread owns its own session id:
+
+- claude's session id is the `system/init` UUID (passed to `--resume`).
+- jcode's session id is its `session_<animal>_<digits>` id.
+- a future codex backend would have its own.
+
+These are **distinct conversations** that happen to share a Slack thread. The
+thread's **active** backend (the one that takes the next turn) is one of them;
+the others are dormant but retained, so a switch back is a resume, not a fresh
+start. Persistence is described in §Store.
+
+### Process ownership lives inside the backend
+
+The router does **not** hold a map of subprocesses. Each backend owns its
+process lifecycle entirely, keyed by its own session id (claude's
+`map[sessionID]*session` guarded by a mutex; jcode's existing per-session socket
+map). The router's vocabulary is only: *which backend + which session id takes
+the next turn.* This keeps process concerns (spawn, warm-hold, setpgid kill,
+`--resume` rehydrate, idle eviction) encapsulated where the stdio contract
+lives, and keeps the router a pure dispatcher. It also means the close-once
+event-channel contract is enforced in one place per backend.
+
+### Switch timing
+
+A switch takes effect **at a turn boundary**, never mid-turn. The router applies
+a pending switch only after the current turn reaches a terminal event
+(`TurnDone` / `TurnError` / `Interrupted`). Consequences:
+
+- The outgoing session's event channel is **quiescent** at switch time (its last
+  turn already finalized), so there is no half-rendered turn to reconcile.
+- The switch itself is just: stop routing new `SendMessage`s to backend A's
+  session; route the next user message to backend B (calling `Subscribe` if B
+  has no session id for this thread yet, else resuming B's stored session id).
+- If a switch instruction arrives mid-turn, it is queued and applied at the next
+  boundary; the user sees the current turn finish under the old agent first.
+
+### Inactive (dormant) backend handling
+
+When backend A becomes dormant, its warm subprocess is **not** closed. Between
+turns a claude process blocks on stdin and emits nothing, so:
+
+- Its event channel sits empty in steady state — no buffering pressure, no
+  goroutine leak. Because switching happens only at a turn boundary, there is no
+  trailing burst to absorb.
+- The backend nonetheless keeps its reader goroutine **draining** the dormant
+  process's stdout defensively (discarding anything that arrives while dormant,
+  except a process-exit signal). A blocked, unread pipe would otherwise risk
+  stdio backpressure if the process ever did emit. The router does not consume
+  the dormant channel; the backend owns the drain.
+- If a dormant subprocess dies (OOM, crash), the backend notes it and clears the
+  warm handle but **keeps the persisted session id**. The next time that backend
+  is made active, it rehydrates via `SubscribeExisting` → `--resume <session id>`
+  exactly like restart recovery.
+
+### Idle eviction
+
+Each backend runs an **idle-eviction timer per session** (config
+`idle_eviction_timeout`, default `"30m"`, `0` = never). When a dormant session
+exceeds the timeout, the backend tears down the subprocess (SIGTERM-group →
+SIGKILL-group) but **retains the persisted session id**. The conversation is not
+lost — the next activation rehydrates with `--resume`. This bounds the
+steady-state cost: a long-running switchboard holds at most one live subprocess
+per *recently active* `(thread, backend)`, not per thread ever conversed with.
+Eviction is owned by the backend (process ownership rule), not the router.
+
+### Lifecycle summary
+
+- **Switch away from a backend:** dormant, warm, drained — no `Close()`.
+- **Switch back to a backend:** `SendMessage` to the warm session (no respawn),
+  or `SubscribeExisting`+`--resume` if it was idle-evicted or crashed.
+- **`Close()`** is called only on **permanent** termination: thread archived or
+  switchboard shutdown. Idle eviction is a process teardown, **not** a `Close()`
+  of the logical session (the session id survives for resume). The close-once
+  channel contract therefore holds: a channel closes exactly once, on permanent
+  termination — switching and eviction do not close it.
 
 ## Router wiring
 
 - `New()` constructs the jcode adapter always, and the claude backend when
   configured (lazily).
 - A `backendFor(channelID) agent.Backend` selector (same shape as the existing
-  `channelConfig` helper) resolves jcode vs claude per channel and is used by
-  `handleNewSession` and recovery.
+  `channelConfig` helper) resolves the **configured** backend per channel and is
+  used by `handleNewSession` and recovery.
 - The `jcode *jcode.Client` field becomes `defaultBackend agent.Backend` plus a
   `claudeBackend agent.Backend` (nil when unconfigured); `consumeEvents` switches
   on `agent.Event`.
+- **Per-thread active backend.** Beyond the static per-channel default, the
+  router tracks each thread's *currently active* backend (in
+  `sessions.backend`, see §Store) so a natural-language switch can move a thread
+  to a different agent. The router holds **no subprocess handles** — it holds, per
+  thread, only `{active backend, the session id to drive next}` and resolves the
+  process via the owning backend's `Subscribe`/`SubscribeExisting`/`SendMessage`.
+- **Applying a switch** (the agent-switching feature; the parsing of the natural
+  -language instruction is its own piece, out of scope here): at the next turn
+  boundary, persist the new active backend + session id, then dispatch the next
+  user message to the new backend. The previous backend's session is left
+  dormant and warm inside that backend per §Agent switching.
 
 ## Testing
 
@@ -611,12 +790,16 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
 - **`internal/agent/claude/backend_test.go`** (rewritten) — fake exec seam
   streams a recorded `claude` session; assert lifecycle:
   - spawn → `system/init` → `SessionReady` emitted with init's session UUID.
-  - **`--bare` is on the argv** of every spawn (load-bearing: this is what
-    prevents the host SessionStart hooks from firing and reproducing the
-    empty-response bug).
+  - **`--setting-sources project,local` is on the argv** of every spawn (the
+    `user` layer is excluded — this is what stops the host SessionStart hooks
+    from firing and reproducing the empty-response bug), and the value matches
+    the `setting_sources` config knob.
+  - **`--bare` is NOT on the argv** (it would disable OAuth/keychain and break
+    subscription auth).
   - **`--include-partial-messages` is NOT on the argv** (would be a no-op at
     best; documented as `--print`-only).
-  - **`CLAUDECODE` is stripped** from the spawned process env.
+  - **`CLAUDECODE` is stripped** from the spawned process env, and **all other
+    parent env vars are passed through** (assert a sentinel var survives).
   - `SendMessage` writes the expected `{"type":"user","message":…}` line to
     stdin (capture via the fake stdin pipe).
   - `control_request` (`subtype:can_use_tool`) → policy invoked → expected
@@ -638,71 +821,116 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
     spawn a fake child that itself spawns a grandchild that sleeps 60s;
     `Close` must terminate both. Skipped on non-Unix.
 - **`internal/agent/claude/streaming_smoke_test.go`** (new, build-tag-gated;
-  not part of the default test pass) — spawns a real `claude --bare` with our
-  flag set (minus `--include-partial-messages`). Two assertions, both before
-  the terminal `result`:
+  not part of the default test pass) — spawns a real `claude` with our flag set
+  (`--setting-sources project,local`, minus `--include-partial-messages`). Two
+  assertions, both before the terminal `result`:
   1. A short text-only prompt produces at least one `content_block_delta`
      with `text_delta`.
   2. A prompt that provokes a tool call (e.g. "list files in `/tmp`")
      produces at least one `content_block_delta` with `input_json_delta`.
-  Together these validate the BL-2 assumption that base stream-json gives us
-  live deltas for **both** text and tool input without
-  `--include-partial-messages`. Gated behind a build tag because it needs a
-  real binary and a real model; run manually before tagging the release that
-  ships this PR.
+  Together these validate that base stream-json gives us live deltas for
+  **both** text and tool input without `--include-partial-messages`. Gated
+  behind a build tag because it needs a real binary and a real model.
+- **`internal/agent/claude/subscription_smoke_test.go`** (new, build-tag-gated)
+  — the load-bearing end-to-end guard for this revision. It must run against the
+  operator's **Claude subscription**, so the test:
+  1. **Asserts the env has no `ANTHROPIC_API_KEY`** (skips with a clear message
+     if one is set, so it can't accidentally pass on API-key billing), then
+     spawns claude with the real flag set under OAuth/keychain.
+  2. **Multi-turn:** sends turn 1 ("remember the number 42"), waits for
+     `TurnDone`; sends turn 2 ("what number did I say?"), asserts the reply
+     references 42 — proving the persistent process keeps context across turns
+     **and** that OAuth auth actually worked (a non-empty `text` response, i.e.
+     the empty-response bug is gone with `--setting-sources` instead of
+     `--bare`).
+  3. **Handover round-trip:** records claude's session id, simulates a switch
+     away (stop driving claude; the session goes dormant, not closed) and back
+     via `SubscribeExisting(session_id)` → `--resume`, then sends turn 3 ("what
+     number again?") and asserts it still answers 42 — proving the per-backend
+     session id resumes the *same* conversation.
+  Gated behind a build tag (needs a real subscription-authenticated binary);
+  run before tagging the release.
+- **`internal/agent/claude/compat_test.go`** — version-range parsing
+  (`min_version`/`max_version` accept/reject), and a translator test that a
+  malformed/absent `system/init` yields `TurnError` "incompatible … protocol"
+  rather than empty output (§CLI compatibility, probe #2). These are ordinary
+  unit tests (no real binary).
 - **`internal/agent/claude/permission_test.go`** — `AllowAll.Decide` returns
   `{allow, input}`; `DenyAll.Decide` returns `{deny, "…"}`;
   `AcceptEditsOnly.Decide` returns allow for Edit/Write/NotebookEdit/MultiEdit
   and deny for Bash.
 - **Router selector test** — channel/global backend resolution (mirrors the
-  `usePerThreadWorkdir` table tests). Already exists; no changes needed for
-  the revised recovery path (`--resume <uuid>` uses the existing
-  `sessions.jcode_session` column the selector already reads).
-- **Store** — `migrateV4` test already exists (merged in `d28a85d`); no
-  additional schema change here.
+  `usePerThreadWorkdir` table tests). Already exists; recovery uses the active
+  backend + its stored session id.
+- **Store** — `migrateV4` test already exists (merged in `d28a85d`). Add a
+  `thread_backend_sessions` migration test (table created; upsert/lookup
+  round-trips a per-backend session id; self-heal backstop restores the table
+  when `user_version` is advanced past it — same shape as the existing
+  `ensureBackendColumn` self-heal test).
 
-## Delivery plan (one PR on top of current trunk)
+## Delivery plan
 
 PR A (backend abstraction) and the initial PR B (subprocess-per-turn claude
 backend) **are already merged** as `4526aa0` and `d28a85d`. This revision is
-delivered as a single follow-up PR on `feat/claude-code-backend`:
+delivered as **two** follow-up PRs so the backend rewrite is reviewable
+independently of the cross-backend switching feature.
 
-**PR — Claude backend rewrite (subprocess-per-turn → one persistent process):**
-1. Config: add `permission_policy`, `append_system_prompt`,
-   `graceful_stop_timeout`, `extra_env` (as `map[string]string`). Backwards-compat
-   translation of legacy `permission_mode` per §Backwards-compat — translate +
-   warn, or fail-loud when both are set.
+**PR 1 — Claude backend rewrite (subprocess-per-turn → one persistent
+process), auth, env, CLI compatibility:**
+1. Config: add `permission_policy`, `append_system_prompt`, `setting_sources`
+   (default `"project,local"`), `graceful_stop_timeout`, `idle_eviction_timeout`,
+   `min_version`/`max_version`, `extra_env` (as `map[string]string`).
+   Backwards-compat translation of legacy `permission_mode` per §Backwards-compat.
 2. `internal/agent/claude/backend.go` — rewrite for long-running process:
-   `--bare`, spawn-once, stdin-held-open, setpgid + group-kill, `CLAUDECODE`
-   env strip, `--resume <uuid>` recovery using the UUID stored in
-   `sessions.jcode_session`.
+   `--setting-sources project,local` (no `--bare`), spawn-once, stdin-held-open,
+   setpgid + group-kill, **env inherited in full minus `CLAUDECODE`**,
+   `--resume <uuid>` recovery using the UUID stored in `sessions.jcode_session`,
+   and the per-session **idle-eviction timer** (process owned by the backend).
 3. `internal/agent/claude/permission.go` — new file; `AllowAll` default,
-   `control_request` handler wired in `backend.go`. Includes the deny-shape
-   default-message fallback.
+   `control_request` handler wired in `backend.go`. Deny-shape default-message
+   fallback.
 4. `internal/agent/claude/proc_unix.go` (+ `proc_windows.go` stub) — setpgid
    spawn + group-kill helpers (Windows TBD; build-tag scoped).
-5. `internal/agent/claude/backend_test.go` — rewrite; cover the new lifecycle
-   including `--bare`-on-argv, `CLAUDECODE`-stripped, `--resume`-on-respawn,
-   and the permission allow/deny/default-message paths.
-6. `internal/agent/claude/streaming_smoke_test.go` — build-tag-gated; verifies
-   base stream-json gives us live text deltas without
-   `--include-partial-messages`. Manual gate before release.
-7. No schema change. No router-interface change. `Subscribe` /
-   `SubscribeExisting` / `SendMessage` / `Cancel` / `Close` signatures stay.
+5. `internal/agent/claude/compat.go` — `claude --version` parse + `min/max`
+   range check (startup); `system/init` shape probe → `TurnError` on mismatch.
+6. `internal/agent/claude/backend_test.go` — rewrite; cover the new lifecycle
+   including **`--setting-sources`-on-argv, `--bare`-NOT-on-argv**, env
+   pass-through with `CLAUDECODE`-stripped, `--resume`-on-respawn, idle eviction
+   (process gone, session id retained), and permission allow/deny/default-message.
+7. `streaming_smoke_test.go`, `subscription_smoke_test.go`, `compat_test.go` per
+   §Testing. Subscription + streaming smoke tests are build-tag-gated; run
+   against the pinned CLI before release.
+8. No router-interface change. `Subscribe` / `SubscribeExisting` / `SendMessage`
+   / `Cancel` / `Close` signatures stay.
+
+**PR 2 — Agent switching:**
+1. Migration: `thread_backend_sessions` (next free `user_version`, with
+   self-heal backstop) + store accessors (upsert / lookup per `(thread,
+   backend)`).
+2. Router: track per-thread active backend; apply a pending switch at the next
+   turn boundary; resolve the target session id and dispatch to the owning
+   backend (`Subscribe` first time, else `SubscribeExisting`+`--resume`).
+3. Natural-language switch detection ("…use codex to review it") — its own
+   contained piece; emits a switch intent the router applies at the boundary.
+4. Handover round-trip covered by the subscription smoke test from PR 1
+   (extended) plus router-level unit tests for boundary timing and dormant-
+   channel drain.
 
 > **Risk note — the rewrite is invisible to the router but very visible to
-> claude's stdio contract.** The translator already passes its tests; the
-> rewrite's risk is concentrated in (a) the control_request stdio protocol,
-> (b) process-group cleanup, and (c) the `--resume <stored_uuid>` recovery
-> path correctly re-attaching and emitting a usable `system/init`. Each gets
-> a dedicated test. The fake exec seam is the safety net.
+> claude's stdio contract.** Risk concentrates in (a) the control_request stdio
+> protocol, (b) process-group cleanup, (c) `--resume` recovery re-attaching with
+> a usable `system/init`, and (d) **auth: confirming subscription OAuth survives
+> `--setting-sources` (no `--bare`)** — the subscription smoke test is the gate
+> for (d). The fake exec seam is the unit-test safety net.
 
 ## Decisions captured (from brainstorming and revision)
 
 - **Scope:** full parity.
 - **Mechanism:** `claude` CLI subprocess, **one long-running process per
-  session**, stdin held open, stream-json on both sides. `--bare` to skip
-  host hooks/LSP/plugins.
+  session**, stdin held open, stream-json on both sides. `--setting-sources
+  project,local` (exclude the `user` layer) to skip the host SessionStart hooks
+  that caused the empty-response bug — **not** `--bare`, which would disable
+  subscription OAuth.
 - **Permissions:** `--permission-prompt-tool stdio` with in-process
   auto-approve policy (default `allow_all` — matches jcode's autonomous
   posture). **Not** `bypassPermissions`. Legacy `permission_mode` config
@@ -716,10 +944,16 @@ delivered as a single follow-up PR on `feat/claude-code-backend`:
 - **Restart resume:** `--resume <session_id>` using the UUID from
   `sessions.jcode_session` (captured originally from `system/init`). Not
   `--continue` — workdir-relative semantics cross-wire concurrent sessions.
-- **Process tree:** setpgid + SIGTERM-group → SIGKILL-group; strips
-  `CLAUDECODE` from env to prevent nested-session detection.
-- **Binary validation:** validate at every startup.
-- **Handover-readiness:** warm process held in router-side per-thread map,
-  not torn down on handover. Close-once contract preserved because handover
-  is not termination. Router-side map lands with the handover feature. See
-  `docs/BACKLOG.md` and §Handover compatibility.
+- **Process tree:** setpgid + SIGTERM-group → SIGKILL-group.
+- **Environment:** inherit the parent env in full; strip only `CLAUDECODE`
+  (prevents nested-session detection). No allow-list (it would starve OAuth).
+- **Auth:** the operator's Claude **subscription** (OAuth/keychain), preserved by
+  *not* using `--bare`. A subscription-authenticated smoke test guards it.
+- **Binary validation + CLI compatibility:** validate `claude --version` at every
+  startup; enforce a configurable `min_version` (fail-fast if claude selected),
+  warn above `max_version`; probe `system/init` shape on first spawn.
+- **Agent switching:** reversible, **one session id per backend per thread**
+  (persisted in `thread_backend_sessions`); switches apply at a **turn
+  boundary**; **process ownership lives inside each backend** (not a router map);
+  dormant sessions stay warm + drained; **idle eviction** tears down the process
+  but keeps the resume id. See §Agent switching.
