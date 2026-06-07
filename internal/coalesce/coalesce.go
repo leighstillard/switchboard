@@ -113,7 +113,7 @@ type SessionCoalescer struct {
 
 	// The Slack message being updated (nil = first flush creates it).
 	progressMessageTS *string
-	turnID            uint64 // monotonic counter; guards late OnPosted callbacks
+	turnID            uint64 // monotonic callback epoch; guards late OnPosted callbacks (bumped on turn reset and same-turn overflow rollover)
 
 	// segments is an ordered stream of text chunks and completed tool entries,
 	// interleaved in the order they were produced. This replaces the old
@@ -684,8 +684,11 @@ func (sc *SessionCoalescer) checkOverflow() {
 	if estimated > maxSlackTextLen {
 		// Flush current content as a finalized message, then reset.
 		sc.flushLocked(false)
-		// Start new progress message.
+		// Start new progress message. Bump turnID so any in-flight OnPosted
+		// callback from the prior message in this same turn is invalidated and
+		// cannot repoint progressMessageTS at the now-superseded message.
 		sc.progressMessageTS = nil
+		sc.turnID++
 		sc.segments = sc.segments[:0]
 	}
 }
