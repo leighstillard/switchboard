@@ -35,6 +35,17 @@
   Retained from the 2026-06-06 rewrite: normalized event translation, the
   persistent (long-running) process, the `--permission-prompt-tool stdio`
   permission protocol, setpgid process-group cleanup, and `--resume` recovery.
+- **2026-06-07 — codex review fixes.** (1) `thread_backend_sessions` FK gets
+  `ON DELETE CASCADE` so `DeleteSession` doesn't fail the constraint. (2) A
+  switch **forwards the residual task** ("…review it") to the new backend as its
+  first prompt instead of waiting for a new message. (3) Dormant handling is the
+  **router consuming + filtering** every channel (the backend gets no
+  activate/deactivate signal, so it can't drain); idleness is inferred from
+  `SendMessage` timestamps. (4) Added **`CloseSession(sessionID)`** for
+  per-thread teardown (`Close()` tears down the whole backend). (5) The protocol
+  probe is **two-stage**: validate `system/init` shape, then validate the first
+  `stream_event` envelope under a timeout (init alone can't prove the later
+  envelope).
 
 - **2026-06-06 — Mechanism rewrite.** The original design spawned `claude -p ''`
   per turn with `--permission-mode bypassPermissions` and `--session-id <uuid>`.
@@ -414,11 +425,24 @@ type Backend interface {
     SubscribeExisting(ctx context.Context, sessionID, workdir string) (<-chan Event, error)
     SendMessage(ctx context.Context, sessionID, content string, images []Image) error
     Cancel(ctx context.Context, sessionID string) error
-    Close() error
+    CloseSession(ctx context.Context, sessionID string) error  // permanent teardown of ONE session
+    Close() error                                              // teardown of the whole backend
 }
 ```
 
-These are exactly the methods the router calls today. The full set of call sites
+**`CloseSession(sessionID)` vs `Close()`** (codex P2). `Close()` tears down the
+*entire* backend (all sessions) — used at switchboard shutdown. Per-thread
+permanent teardown (a thread is archived, or a logical session is abandoned)
+needs to close **one** session without killing the others: that is
+`CloseSession`. It terminates that session's process group, closes its event
+channel exactly once, and removes its warm handle. (Idle eviction is distinct: it
+tears down the *process* but keeps the persisted session id and does **not**
+close the logical session — the next activation resumes it. `CloseSession` is
+permanent: it would also delete the `thread_backend_sessions` row.) jcode's
+adapter implements `CloseSession` by closing that one socket; `Close()` closes
+all sockets.
+
+These are the methods the router calls (Close-per-session added this revision). The full set of call sites
 to migrate in PR A: `router.go` **418, 470, 525, 529, 548, 633, 681, 860, 1129**
 (Subscribe / SubscribeExisting / SendMessage / Cancel). `Image` is a small
 backend-neutral struct.
@@ -605,12 +629,18 @@ surface, both of which can change across releases. Two guards:
    is selected, **warn** otherwise. A version above a configured ceiling logs a
    warning ("untested CLI version") but proceeds, so a routine CLI upgrade is not
    a hard outage — the smoke tests are the real compatibility gate.
-2. **Protocol probe on first spawn.** The first `system/init` event is validated
-   for the fields the translator depends on (`session_id`, and the stream-event
-   envelope shape used for `content_block_delta`). If `system/init` is missing or
-   shaped unexpectedly, the backend emits `TurnError` with a clear
-   "incompatible claude CLI protocol" message rather than silently producing
-   empty turns (the failure mode that motivated this whole revision).
+2. **Protocol probe, in two stages** (codex P2 — `system/init` alone cannot
+   prove the later stream-event envelope, so don't claim it does):
+   - *Stage 2a — init shape.* Validate the first `system/init` for the fields the
+     backend reads from it directly (`session_id`, model). If it is absent or
+     malformed, emit `TurnError` "incompatible claude CLI protocol (init)".
+   - *Stage 2b — first stream event.* On the **first real turn**, validate the
+     first `stream_event` envelope the translator depends on (the
+     `content_block_delta` shape) **within a timeout**. If no well-formed stream
+     event arrives before the timeout, emit `TurnError` "incompatible claude CLI
+     protocol (stream)". This catches an envelope change that `system/init`
+     cannot reveal, and replaces the silent-empty-turn failure mode that
+     motivated this revision with an explicit, actionable error.
 
 Pinning the exact CLI version in the deployment (e.g. the install step records a
 known-good version) is recommended operationally; the config range is the
@@ -640,9 +670,18 @@ CREATE TABLE IF NOT EXISTS thread_backend_sessions (
     last_active_at INTEGER NOT NULL,
     created_at     INTEGER NOT NULL,
     PRIMARY KEY (channel_id, thread_ts, backend),
-    FOREIGN KEY (channel_id, thread_ts) REFERENCES sessions(channel_id, thread_ts)
+    FOREIGN KEY (channel_id, thread_ts)
+        REFERENCES sessions(channel_id, thread_ts) ON DELETE CASCADE
 );
 ```
+
+> **`ON DELETE CASCADE` is required** (codex P1). `foreign_keys=ON` is set, and
+> `DeleteSession` deletes the parent `sessions` row directly (it relies on
+> `turn_queue` being empty at deletion time, which is not true for
+> `thread_backend_sessions` — it holds a row per backend ever used in the
+> thread). Without `CASCADE`, stale-session recovery's `DeleteSession` would
+> fail the FK constraint. With it, the per-backend rows are removed atomically
+> when the session is deleted.
 
 - On first turn under a backend: insert its `(thread, backend, session_id)` row.
 - On switch: set `sessions.backend` (+ mirror the new active id into
@@ -707,25 +746,41 @@ a pending switch only after the current turn reaches a terminal event
 
 - The outgoing session's event channel is **quiescent** at switch time (its last
   turn already finalized), so there is no half-rendered turn to reconcile.
-- The switch itself is just: stop routing new `SendMessage`s to backend A's
-  session; route the next user message to backend B (calling `Subscribe` if B
-  has no session id for this thread yet, else resuming B's stored session id).
-- If a switch instruction arrives mid-turn, it is queued and applied at the next
-  boundary; the user sees the current turn finish under the old agent first.
+
+- **The switch carries the task forward** (codex P1). An instruction like "build
+  this feature, then **use codex to review it**" has two parts: the work for the
+  current agent, and a *residual task for the new agent*. The natural-language
+  switch detector extracts both: the pre-switch portion runs under backend A;
+  the post-switch portion ("review it") is captured as the **first prompt for
+  backend B**. At the turn boundary the router (a) activates B (`Subscribe` if B
+  has no session id for this thread yet, else `SubscribeExisting`+`--resume` of
+  B's stored id) and (b) **immediately `SendMessage`s the residual task** to B —
+  it does **not** sit idle waiting for the user to re-state it. If the
+  instruction has no residual task (a bare "switch to codex"), then there is no
+  auto-prompt and B simply becomes active for the user's next message.
+
+- A switch instruction arriving mid-turn is queued and applied at the next
+  boundary; the user sees the current turn finish under the old agent first,
+  then the new agent pick up the forwarded task.
 
 ### Inactive (dormant) backend handling
 
 When backend A becomes dormant, its warm subprocess is **not** closed. Between
 turns a claude process blocks on stdin and emits nothing, so:
 
-- Its event channel sits empty in steady state — no buffering pressure, no
-  goroutine leak. Because switching happens only at a turn boundary, there is no
-  trailing burst to absorb.
-- The backend nonetheless keeps its reader goroutine **draining** the dormant
-  process's stdout defensively (discarding anything that arrives while dormant,
-  except a process-exit signal). A blocked, unread pipe would otherwise risk
-  stdio backpressure if the process ever did emit. The router does not consume
-  the dormant channel; the backend owns the drain.
+- **The router keeps consuming the channel and filters** (codex P1). The earlier
+  draft had the backend "drain dormant events," but the router's consumer stays
+  attached to the channel and the backend has no activate/deactivate signal — so
+  the backend can't know to drain. Resolution: the **router** keeps ranging over
+  every live session's channel (active and dormant) and simply **does not render
+  dormant sessions' events to `coalesce`** — it discards them. This needs no new
+  interface method and no backpressure risk (the channel is always drained by
+  its existing consumer). A dormant claude emits nothing in steady state anyway;
+  this just makes the contract implementable as written.
+- **Idle tracking needs no signal either.** The backend infers idleness from its
+  own `SendMessage` timestamps per session (it sees every send), so the
+  idle-eviction timer (below) is backend-internal and does not depend on a
+  router-driven activate/deactivate.
 - If a dormant subprocess dies (OOM, crash), the backend notes it and clears the
   warm handle but **keeps the persisted session id**. The next time that backend
   is made active, it rehydrates via `SubscribeExisting` → `--resume <session id>`
@@ -744,14 +799,17 @@ Eviction is owned by the backend (process ownership rule), not the router.
 
 ### Lifecycle summary
 
-- **Switch away from a backend:** dormant, warm, drained — no `Close()`.
+- **Switch away from a backend:** dormant, warm, router-filtered — no teardown.
 - **Switch back to a backend:** `SendMessage` to the warm session (no respawn),
   or `SubscribeExisting`+`--resume` if it was idle-evicted or crashed.
-- **`Close()`** is called only on **permanent** termination: thread archived or
-  switchboard shutdown. Idle eviction is a process teardown, **not** a `Close()`
-  of the logical session (the session id survives for resume). The close-once
-  channel contract therefore holds: a channel closes exactly once, on permanent
-  termination — switching and eviction do not close it.
+- **`CloseSession(id)`** — permanent teardown of **one** session: thread
+  archived / logical session abandoned. Closes that channel once, kills that
+  process group, deletes its `thread_backend_sessions` row.
+- **`Close()`** — teardown of the **whole** backend, at switchboard shutdown.
+- **Idle eviction** is a *process* teardown only — **not** `CloseSession`: the
+  session id and its row survive for `--resume`. The close-once channel contract
+  holds: a session's channel closes exactly once, on `CloseSession` or `Close` —
+  switching and idle eviction do not close it.
 
 ## Router wiring
 
@@ -813,6 +871,10 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
     `pgid` and signal); after grace period escalates to SIGKILL.
   - `Close` closes stdin first; if the process exits within grace, no signals
     are sent.
+  - **`CloseSession(id)` tears down only that session** — its channel closes
+    once and its process group is killed, while a second concurrently-open
+    session keeps running and its channel stays open. (`Close()` then tears down
+    the remaining one.)
   - `SubscribeExisting(uuid, workdir)` spawns with `--resume <uuid>` (cwd =
     workdir) and emits nothing until `SendMessage`. If `--resume` fails
     (subprocess exits with non-zero before any event), the next `SendMessage`
@@ -851,10 +913,11 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
   Gated behind a build tag (needs a real subscription-authenticated binary);
   run before tagging the release.
 - **`internal/agent/claude/compat_test.go`** — version-range parsing
-  (`min_version`/`max_version` accept/reject), and a translator test that a
-  malformed/absent `system/init` yields `TurnError` "incompatible … protocol"
-  rather than empty output (§CLI compatibility, probe #2). These are ordinary
-  unit tests (no real binary).
+  (`min_version`/`max_version` accept/reject); and the **two-stage** probe
+  (§CLI compatibility, probe #2): malformed/absent `system/init` → `TurnError`
+  "(init)"; and a first turn whose stream-event envelope never arrives well-formed
+  within the timeout → `TurnError` "(stream)". Ordinary unit tests (fake exec
+  seam, no real binary), including a timeout case driven by a fake clock.
 - **`internal/agent/claude/permission_test.go`** — `AllowAll.Decide` returns
   `{allow, input}`; `DenyAll.Decide` returns `{deny, "…"}`;
   `AcceptEditsOnly.Decide` returns allow for Edit/Write/NotebookEdit/MultiEdit
@@ -900,21 +963,28 @@ process), auth, env, CLI compatibility:**
 7. `streaming_smoke_test.go`, `subscription_smoke_test.go`, `compat_test.go` per
    §Testing. Subscription + streaming smoke tests are build-tag-gated; run
    against the pinned CLI before release.
-8. No router-interface change. `Subscribe` / `SubscribeExisting` / `SendMessage`
-   / `Cancel` / `Close` signatures stay.
+8. **Backend-interface addition:** `CloseSession(ctx, sessionID)` for per-thread
+   permanent teardown (codex P2), implemented in both adapters and called by the
+   router where it deletes a session today. `Subscribe` / `SubscribeExisting` /
+   `SendMessage` / `Cancel` / `Close` signatures otherwise unchanged.
 
 **PR 2 — Agent switching:**
-1. Migration: `thread_backend_sessions` (next free `user_version`, with
-   self-heal backstop) + store accessors (upsert / lookup per `(thread,
-   backend)`).
+1. Migration: `thread_backend_sessions` (next free `user_version`, **FK with
+   `ON DELETE CASCADE`** per codex P1, self-heal backstop) + store accessors
+   (upsert / lookup per `(thread, backend)`).
 2. Router: track per-thread active backend; apply a pending switch at the next
    turn boundary; resolve the target session id and dispatch to the owning
-   backend (`Subscribe` first time, else `SubscribeExisting`+`--resume`).
+   backend (`Subscribe` first time, else `SubscribeExisting`+`--resume`). The
+   router **consumes every live channel and filters dormant ones** (codex P1) —
+   no backend drain signal.
 3. Natural-language switch detection ("…use codex to review it") — its own
-   contained piece; emits a switch intent the router applies at the boundary.
-4. Handover round-trip covered by the subscription smoke test from PR 1
-   (extended) plus router-level unit tests for boundary timing and dormant-
-   channel drain.
+   contained piece; emits a switch intent **plus the residual task**, which the
+   router applies at the boundary by activating the new backend and **sending the
+   residual task as its first prompt** (codex P1), not waiting for a new message.
+4. Tests: router-level boundary timing; **task-forwarding** (switch intent with a
+   residual task auto-sends it to the new backend; bare switch does not);
+   dormant-channel filtering; `DeleteSession` cascades `thread_backend_sessions`.
+   Plus the PR 1 subscription smoke test's handover round-trip.
 
 > **Risk note — the rewrite is invisible to the router but very visible to
 > claude's stdio contract.** Risk concentrates in (a) the control_request stdio
@@ -953,7 +1023,9 @@ process), auth, env, CLI compatibility:**
   startup; enforce a configurable `min_version` (fail-fast if claude selected),
   warn above `max_version`; probe `system/init` shape on first spawn.
 - **Agent switching:** reversible, **one session id per backend per thread**
-  (persisted in `thread_backend_sessions`); switches apply at a **turn
-  boundary**; **process ownership lives inside each backend** (not a router map);
-  dormant sessions stay warm + drained; **idle eviction** tears down the process
-  but keeps the resume id. See §Agent switching.
+  (persisted in `thread_backend_sessions`, FK `ON DELETE CASCADE`); switches
+  apply at a **turn boundary** and **forward the residual task** to the new
+  backend as its first prompt; **process ownership lives inside each backend**
+  (not a router map); the **router consumes + filters** dormant channels;
+  per-thread teardown via **`CloseSession`**, whole-backend via `Close`; **idle
+  eviction** tears down the process but keeps the resume id. See §Agent switching.
