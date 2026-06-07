@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -122,6 +123,27 @@ func (c *Client) Subscribe(ctx context.Context, workdir string) (string, <-chan 
 		return "", nil, fmt.Errorf("jcode: ensure daemon: %w", err)
 	}
 
+	// Retry once on "no session_id" race condition: the daemon may emit done
+	// before swarm_status when a session is being created concurrently.
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		sessionID, events, err := c.trySubscribe(ctx, workdir)
+		if err == nil {
+			return sessionID, events, nil
+		}
+		if attempt < maxAttempts && strings.Contains(err.Error(), "no session_id received") {
+			slog.Warn("jcode: subscribe race detected, retrying",
+				"workdir", workdir, "attempt", attempt, "err", err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		return "", nil, err
+	}
+	return "", nil, errors.New("jcode: subscribe failed after retries")
+}
+
+// trySubscribe performs a single subscribe attempt.
+func (c *Client) trySubscribe(ctx context.Context, workdir string) (string, <-chan *jcodeproto.ServerEvent, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return "", nil, fmt.Errorf("jcode: dial: %w", err)
