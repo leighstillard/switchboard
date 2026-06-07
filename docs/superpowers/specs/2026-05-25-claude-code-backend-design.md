@@ -40,12 +40,23 @@
   switch **forwards the residual task** ("…review it") to the new backend as its
   first prompt instead of waiting for a new message. (3) Dormant handling is the
   **router consuming + filtering** every channel (the backend gets no
-  activate/deactivate signal, so it can't drain); idleness is inferred from
-  `SendMessage` timestamps. (4) Added **`CloseSession(sessionID)`** for
-  per-thread teardown (`Close()` tears down the whole backend). (5) The protocol
-  probe is **two-stage**: validate `system/init` shape, then validate the first
-  `stream_event` envelope under a timeout (init alone can't prove the later
-  envelope).
+  activate/deactivate signal, so it can't drain). (4) Added
+  **`CloseSession(sessionID)`** for per-session teardown (`Close()` tears down the
+  whole backend). (5) The protocol probe is **two-stage**: validate `system/init`
+  shape, then validate the first `stream_event` envelope under a timeout.
+- **2026-06-07 — codex review round 2.** (a) **Idle eviction never kills an
+  in-flight turn** — idle is measured from the last *terminal* event, not the
+  last `SendMessage`; an in-flight session is never an eviction candidate. (b)
+  **FK cascade made reliable across the pooled connections** — `foreign_keys`
+  enabled via the DSN (it is connection-local and was only set on one of four
+  pool connections) **and** `DeleteSession` deletes children transactionally so
+  it doesn't depend on the pragma. (c) **Thread teardown closes every backend
+  session** — a switched thread owns one session per backend; the router
+  enumerates all `thread_backend_sessions` rows, calls each backend's
+  `CloseSession`, then deletes persistence. **Backends never touch the store.**
+  (d) Documented that an **`allow_all` Claude session inherits the daemon's full
+  authority** (Switchboard/Slack via cc-connect, `gh`, filesystem, MCP, the
+  switchboard DB) — see §Permission protocol.
 
 - **2026-06-06 — Mechanism rewrite.** The original design spawned `claude -p ''`
   per turn with `--permission-mode bypassPermissions` and `--session-id <uuid>`.
@@ -270,6 +281,21 @@ MultiEdit, deny others), `prompt_in_slack` (post a prompt to the thread and
 wait — out of scope for this PR). For now: a single global `allow_all` default
 with a config knob to set it per-backend.
 
+> **Trust precondition — an `allow_all` Claude session has the daemon's full
+> authority** (codex). Because the child inherits switchboard's environment
+> (§Environment hygiene preserves it, stripping only `CLAUDECODE`) and resolves
+> the operator's subscription OAuth/keychain, an `allow_all` claude session runs
+> with **the same ambient authority as the switchboard process itself**: the
+> host filesystem and shell, the `gh` token, `cc-connect` (and therefore
+> **Switchboard/Slack send + react** authority), the switchboard SQLite, and any
+> configured MCP servers. Tool calls are not gated, so the model can take any of
+> these actions autonomously. This is an explicit, accepted decision — it mirrors
+> jcode's existing posture and the reality that a Slack bot has no human to
+> approve tool use mid-turn — but it must be documented: **do not point an
+> `allow_all` backend at an untrusted workdir or an untrusted instruction
+> source.** Stricter isolation (a sandbox, or `accept_edits_only` / a future
+> `prompt_in_slack`) is the migration path if that posture is ever too broad.
+
 ### Process group + cleanup
 
 On Unix, spawn with `setpgid` so the claude CLI and every grandchild process
@@ -431,18 +457,28 @@ type Backend interface {
 ```
 
 **`CloseSession(sessionID)` vs `Close()`** (codex P2). `Close()` tears down the
-*entire* backend (all sessions) — used at switchboard shutdown. Per-thread
-permanent teardown (a thread is archived, or a logical session is abandoned)
-needs to close **one** session without killing the others: that is
-`CloseSession`. It terminates that session's process group, closes its event
-channel exactly once, and removes its warm handle. (Idle eviction is distinct: it
-tears down the *process* but keeps the persisted session id and does **not**
-close the logical session — the next activation resumes it. `CloseSession` is
-permanent: it would also delete the `thread_backend_sessions` row.) jcode's
-adapter implements `CloseSession` by closing that one socket; `Close()` closes
-all sockets.
+*entire* backend (all sessions) — used at switchboard shutdown. `CloseSession`
+closes **one** backend session without killing the others: it terminates that
+session's process group, closes its event channel exactly once, and removes its
+warm handle. (Idle eviction is distinct: it tears down the *process* but keeps
+the warm-handle-less session resumable; `CloseSession` is permanent for that
+session.) jcode's adapter implements `CloseSession` by closing that one socket;
+`Close()` closes all sockets.
 
-These are the methods the router calls (Close-per-session added this revision). The full set of call sites
+**Backends do not touch the store** (codex P2, round 2). `CloseSession` tears
+down *process + channel only*; it does **not** delete `thread_backend_sessions`
+rows. Persistence is owned by the store/router layer. A **thread** is not a
+single session — after switching it owns one session **per backend** — so
+permanent thread teardown is a router/store operation:
+
+> **Thread teardown** (thread archived): the router enumerates **all**
+> `thread_backend_sessions` rows for `(channel_id, thread_ts)`, calls the owning
+> backend's `CloseSession(session_id)` for **each**, then deletes the persistence
+> (the `sessions` row; `thread_backend_sessions` rows go with it via the
+> transactional delete / cascade in §Store). Closing only the active backend's
+> session would leak the dormant backends' processes.
+
+These are the methods the router calls (`CloseSession` added this revision). The full set of call sites
 to migrate in PR A: `router.go` **418, 470, 525, 529, 548, 633, 681, 860, 1129**
 (Subscribe / SubscribeExisting / SendMessage / Cancel). `Image` is a small
 backend-neutral struct.
@@ -675,13 +711,27 @@ CREATE TABLE IF NOT EXISTS thread_backend_sessions (
 );
 ```
 
-> **`ON DELETE CASCADE` is required** (codex P1). `foreign_keys=ON` is set, and
-> `DeleteSession` deletes the parent `sessions` row directly (it relies on
-> `turn_queue` being empty at deletion time, which is not true for
-> `thread_backend_sessions` — it holds a row per backend ever used in the
-> thread). Without `CASCADE`, stale-session recovery's `DeleteSession` would
-> fail the FK constraint. With it, the per-backend rows are removed atomically
-> when the session is deleted.
+> **`ON DELETE CASCADE` is required** (codex P1). `DeleteSession` deletes the
+> parent `sessions` row directly; it relies on `turn_queue` being empty at
+> deletion time, which is **not** true for `thread_backend_sessions` (a row per
+> backend ever used). Without `CASCADE` the delete would fail the FK constraint.
+>
+> **But the cascade only fires if FK enforcement is on for the connection doing
+> the delete** (codex P1, round 2). Today `open()` runs `PRAGMA foreign_keys=ON`
+> once via `db.Exec` (`internal/store/store.go:177`) — but `foreign_keys` is a
+> **connection-local** pragma and the pool has 4 connections
+> (`SetMaxOpenConns(4)`), so the delete may land on a connection where FK
+> enforcement is off and the cascade silently does **not** run. Two fixes, do
+> **both**:
+> 1. **Enable `foreign_keys` in the DSN** so every pooled connection turns it on
+>    at open: `sql.Open("sqlite", dbPath + "?_pragma=foreign_keys(1)")`
+>    (modernc.org/sqlite DSN form; also move `busy_timeout` into the DSN for the
+>    same reason). This also makes the existing `turn_queue` FK reliable.
+> 2. **Make `DeleteSession` transactional and explicit** — in one transaction,
+>    `DELETE FROM thread_backend_sessions WHERE channel_id=? AND thread_ts=?`
+>    then `DELETE FROM sessions …`. This is correct even if FK enforcement is off
+>    on the connection, so it does not depend solely on (1). (Belt and braces:
+>    the declared `CASCADE` documents intent and covers any other delete path.)
 
 - On first turn under a backend: insert its `(thread, backend, session_id)` row.
 - On switch: set `sessions.backend` (+ mirror the new active id into
@@ -777,10 +827,11 @@ turns a claude process blocks on stdin and emits nothing, so:
   interface method and no backpressure risk (the channel is always drained by
   its existing consumer). A dormant claude emits nothing in steady state anyway;
   this just makes the contract implementable as written.
-- **Idle tracking needs no signal either.** The backend infers idleness from its
-  own `SendMessage` timestamps per session (it sees every send), so the
-  idle-eviction timer (below) is backend-internal and does not depend on a
-  router-driven activate/deactivate.
+- **Idle tracking needs no signal either.** The backend tracks each session's
+  turn state internally (it sees every `SendMessage` and every terminal event it
+  emits), so the idle-eviction timer (below) is backend-internal and does not
+  depend on a router-driven activate/deactivate. Critically, idle is measured
+  from the **last terminal event**, not the last send — see §Idle eviction.
 - If a dormant subprocess dies (OOM, crash), the backend notes it and clears the
   warm handle but **keeps the persisted session id**. The next time that backend
   is made active, it rehydrates via `SubscribeExisting` → `--resume <session id>`
@@ -789,22 +840,39 @@ turns a claude process blocks on stdin and emits nothing, so:
 ### Idle eviction
 
 Each backend runs an **idle-eviction timer per session** (config
-`idle_eviction_timeout`, default `"30m"`, `0` = never). When a dormant session
-exceeds the timeout, the backend tears down the subprocess (SIGTERM-group →
+`idle_eviction_timeout`, default `"30m"`, `0` = never). When a session has been
+idle past the timeout, the backend tears down the subprocess (SIGTERM-group →
 SIGKILL-group) but **retains the persisted session id**. The conversation is not
 lost — the next activation rehydrates with `--resume`. This bounds the
 steady-state cost: a long-running switchboard holds at most one live subprocess
 per *recently active* `(thread, backend)`, not per thread ever conversed with.
 Eviction is owned by the backend (process ownership rule), not the router.
 
+**Never evict an in-flight turn** (codex P1). "Idle" is measured from the
+session's **last terminal event** (`TurnDone` / `TurnError` / `Interrupted`),
+**not** from the last `SendMessage`. A turn that legitimately runs longer than
+the timeout (e.g. a 40-minute build/test) must not be killed mid-task. Concretely:
+
+- On `SendMessage`, mark the session **in-flight** and stop/disable its idle
+  timer.
+- On the turn's terminal event, mark it **idle** and (re)start the countdown from
+  that moment.
+- The eviction sweep only considers sessions currently in the idle state whose
+  countdown has elapsed; an in-flight session is never a candidate, no matter how
+  long the turn runs.
+
 ### Lifecycle summary
 
 - **Switch away from a backend:** dormant, warm, router-filtered — no teardown.
 - **Switch back to a backend:** `SendMessage` to the warm session (no respawn),
   or `SubscribeExisting`+`--resume` if it was idle-evicted or crashed.
-- **`CloseSession(id)`** — permanent teardown of **one** session: thread
-  archived / logical session abandoned. Closes that channel once, kills that
-  process group, deletes its `thread_backend_sessions` row.
+- **`CloseSession(id)`** — permanent teardown of **one** backend session: closes
+  that channel once, kills that process group, drops the warm handle. It does
+  **not** touch the store.
+- **Thread teardown** (thread archived) — a router/store operation: enumerate
+  **all** per-backend rows for the thread, call each backend's `CloseSession`,
+  then delete the persistence. Not just the active backend (the dormant ones own
+  live processes too).
 - **`Close()`** — teardown of the **whole** backend, at switchboard shutdown.
 - **Idle eviction** is a *process* teardown only — **not** `CloseSession`: the
   session id and its row survive for `--resume`. The close-once channel contract
@@ -874,7 +942,12 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
   - **`CloseSession(id)` tears down only that session** — its channel closes
     once and its process group is killed, while a second concurrently-open
     session keeps running and its channel stays open. (`Close()` then tears down
-    the remaining one.)
+    the remaining one.) Assert `CloseSession` does **not** touch the store
+    (no row deletion — that's the router/store's job).
+  - **Idle eviction never kills an in-flight turn** (codex P1, round 2): with a
+    short `idle_eviction_timeout` and a fake clock, a session whose turn is still
+    streaming past the timeout is **not** evicted; only after its terminal event
+    + timeout does the sweep tear the process down (session id retained).
   - `SubscribeExisting(uuid, workdir)` spawns with `--resume <uuid>` (cwd =
     workdir) and emits nothing until `SendMessage`. If `--resume` fails
     (subprocess exits with non-zero before any event), the next `SendMessage`
@@ -929,7 +1002,14 @@ Strict TDD via the existing `rtk proxy go test -json | tdd-guard-go` pipeline.
   `thread_backend_sessions` migration test (table created; upsert/lookup
   round-trips a per-backend session id; self-heal backstop restores the table
   when `user_version` is advanced past it — same shape as the existing
-  `ensureBackendColumn` self-heal test).
+  `ensureBackendColumn` self-heal test). Also: a **`DeleteSession` cascade test**
+  — insert several per-backend rows, `DeleteSession`, assert both the `sessions`
+  row and **all** `thread_backend_sessions` rows are gone, run with FK
+  enforcement on (via DSN) to prove the pooled-connection fix (codex P1 r2).
+- **Thread teardown** (router-level) — a thread with sessions under two backends:
+  teardown calls `CloseSession` on **both** backends (assert via recording
+  backends) and then deletes persistence; closing only the active one would leak
+  the dormant backend's process (codex P2 r2).
 
 ## Delivery plan
 
@@ -963,15 +1043,23 @@ process), auth, env, CLI compatibility:**
 7. `streaming_smoke_test.go`, `subscription_smoke_test.go`, `compat_test.go` per
    §Testing. Subscription + streaming smoke tests are build-tag-gated; run
    against the pinned CLI before release.
-8. **Backend-interface addition:** `CloseSession(ctx, sessionID)` for per-thread
-   permanent teardown (codex P2), implemented in both adapters and called by the
-   router where it deletes a session today. `Subscribe` / `SubscribeExisting` /
+8. **Backend-interface addition:** `CloseSession(ctx, sessionID)` for per-session
+   teardown (codex P2) — process + channel only, **no store access** —
+   implemented in both adapters. `Subscribe` / `SubscribeExisting` /
    `SendMessage` / `Cancel` / `Close` signatures otherwise unchanged.
+9. **Idle-eviction timer keyed off terminal events** (codex P1 r2): in-flight
+   turns are never evicted; countdown starts at the turn's terminal event.
+10. **DSN fix:** open SQLite with `?_pragma=foreign_keys(1)` (+ `busy_timeout`)
+    so FK enforcement is on for every pooled connection — prerequisite for any
+    `ON DELETE CASCADE` to fire reliably (codex P1 r2). Existing `turn_queue` FK
+    benefits too.
 
 **PR 2 — Agent switching:**
-1. Migration: `thread_backend_sessions` (next free `user_version`, **FK with
-   `ON DELETE CASCADE`** per codex P1, self-heal backstop) + store accessors
-   (upsert / lookup per `(thread, backend)`).
+1. Migration: `thread_backend_sessions` (next free `user_version`, **FK
+   `ON DELETE CASCADE`**, self-heal backstop) + store accessors (upsert / lookup
+   / **list-all-for-thread**). `DeleteSession` becomes **transactional**: delete
+   `thread_backend_sessions` children then the `sessions` row in one tx, so it is
+   correct regardless of per-connection FK state (codex P1 r2).
 2. Router: track per-thread active backend; apply a pending switch at the next
    turn boundary; resolve the target session id and dispatch to the owning
    backend (`Subscribe` first time, else `SubscribeExisting`+`--resume`). The
@@ -981,9 +1069,14 @@ process), auth, env, CLI compatibility:**
    contained piece; emits a switch intent **plus the residual task**, which the
    router applies at the boundary by activating the new backend and **sending the
    residual task as its first prompt** (codex P1), not waiting for a new message.
-4. Tests: router-level boundary timing; **task-forwarding** (switch intent with a
+4. **Thread teardown** (router): on archive/permanent close, **enumerate all**
+   `thread_backend_sessions` rows for the thread, call each owning backend's
+   `CloseSession`, then delete persistence (codex P2 r2). Not just the active
+   backend.
+5. Tests: router-level boundary timing; **task-forwarding** (switch intent with a
    residual task auto-sends it to the new backend; bare switch does not);
-   dormant-channel filtering; `DeleteSession` cascades `thread_backend_sessions`.
+   dormant-channel filtering; **thread teardown closes every backend's session**;
+   `DeleteSession` removes all `thread_backend_sessions` rows transactionally.
    Plus the PR 1 subscription smoke test's handover round-trip.
 
 > **Risk note — the rewrite is invisible to the router but very visible to
@@ -1023,9 +1116,17 @@ process), auth, env, CLI compatibility:**
   startup; enforce a configurable `min_version` (fail-fast if claude selected),
   warn above `max_version`; probe `system/init` shape on first spawn.
 - **Agent switching:** reversible, **one session id per backend per thread**
-  (persisted in `thread_backend_sessions`, FK `ON DELETE CASCADE`); switches
-  apply at a **turn boundary** and **forward the residual task** to the new
-  backend as its first prompt; **process ownership lives inside each backend**
-  (not a router map); the **router consumes + filters** dormant channels;
-  per-thread teardown via **`CloseSession`**, whole-backend via `Close`; **idle
-  eviction** tears down the process but keeps the resume id. See §Agent switching.
+  (persisted in `thread_backend_sessions`, FK `ON DELETE CASCADE` with
+  `foreign_keys` enabled **via the DSN** so it holds on every pooled connection,
+  plus a transactional `DeleteSession`); switches apply at a **turn boundary**
+  and **forward the residual task** to the new backend as its first prompt;
+  **process ownership lives inside each backend** (not a router map), and
+  **backends never touch the store**; the **router consumes + filters** dormant
+  channels; per-session teardown via **`CloseSession`** (process + channel only),
+  **thread teardown enumerates all backends'** sessions then deletes persistence,
+  whole-backend via `Close`; **idle eviction** keys off the **terminal event**
+  (never kills an in-flight turn) and keeps the resume id. See §Agent switching.
+- **Security posture:** an **`allow_all` Claude session inherits the daemon's
+  full authority** (Switchboard/Slack via cc-connect, `gh`, filesystem, MCP, the
+  switchboard DB) — accepted, but don't point it at an untrusted workdir or
+  instruction source. See §Permission protocol.
