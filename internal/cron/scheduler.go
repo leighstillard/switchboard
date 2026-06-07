@@ -60,17 +60,14 @@ type parsedJob struct {
 
 // Scheduler runs cron jobs on their schedules, dispatching prompts via the
 // Dispatcher interface. It ticks every 30 seconds and deduplicates firings
-// so each job fires at most once per minute.
+// so each job fires at most once per minute. Dedup state is persisted in
+// SQLite via store.ClaimCronFire, surviving process restarts.
 type Scheduler struct {
 	dispatcher Dispatcher
 	store      *store.Store
 
 	mu   sync.RWMutex
 	jobs []parsedJob
-
-	// lastFired tracks the last minute each job fired at, keyed by job ID.
-	// This prevents duplicate firings for the same minute boundary.
-	lastFired map[string]time.Time
 }
 
 // New creates a Scheduler from the given jobs. Jobs with invalid schedules
@@ -79,7 +76,6 @@ func New(jobs []Job, dispatcher Dispatcher, st *store.Store) (*Scheduler, error)
 	s := &Scheduler{
 		dispatcher: dispatcher,
 		store:      st,
-		lastFired:  make(map[string]time.Time),
 	}
 
 	parsed, err := parseJobs(jobs)
@@ -149,18 +145,19 @@ func (s *Scheduler) tick(ctx context.Context) {
 			continue
 		}
 
-		// Dedup: skip if already fired this minute.
-		s.mu.RLock()
-		last, seen := s.lastFired[j.ID]
-		s.mu.RUnlock()
-		if seen && last.Equal(now) {
+		// Atomic dedup via SQLite: only one process/tick can claim a job
+		// for a given minute, even across restarts.
+		claimed, err := s.store.ClaimCronFire(j.ID, now.Unix())
+		if err != nil {
+			slog.Error("cron: claim fire failed",
+				"job_id", j.ID,
+				"error", err,
+			)
 			continue
 		}
-
-		// Mark as fired before dispatching to avoid racing ticks.
-		s.mu.Lock()
-		s.lastFired[j.ID] = now
-		s.mu.Unlock()
+		if !claimed {
+			continue
+		}
 
 		slog.Info("cron: firing job",
 			"job_id", j.ID,

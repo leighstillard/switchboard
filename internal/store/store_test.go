@@ -37,8 +37,8 @@ func TestNew_WALAndIntegrity(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 }
 
@@ -115,13 +115,13 @@ func TestMigrateV4(t *testing.T) {
 		t.Errorf("Backend = %q, want jcode (default)", got2.Backend)
 	}
 
-	// Verify version is 4.
+	// Verify version is 5 (latest migration).
 	var version int
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 
 	s.Close()
@@ -143,9 +143,10 @@ func TestMigrateV4(t *testing.T) {
 }
 
 // TestMigrate_SelfHealsStrandedBackendColumn reproduces the shared-data_dir
-// fault: a divergent branch lineage bumps user_version past 4 while the
-// sessions table lacks the backend column, so migrateV4 is skipped and the
-// column is stranded. migrate() must restore it regardless of user_version.
+// fault: a divergent branch lineage bumps user_version past the latest
+// migration while the sessions table lacks the backend column, so migrateV4 is
+// skipped and the column is stranded. migrate() must restore it regardless of
+// user_version.
 func TestMigrate_SelfHealsStrandedBackendColumn(t *testing.T) {
 	dir := t.TempDir()
 
@@ -153,11 +154,12 @@ func TestMigrate_SelfHealsStrandedBackendColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Simulate the fault: drop backend, then advance the version past 4.
+	// Simulate the fault: drop backend, then advance the version past the
+	// latest migration so every version-gated migration is skipped.
 	if _, err := s.db.Exec(`ALTER TABLE sessions DROP COLUMN backend`); err != nil {
 		t.Fatalf("drop backend: %v", err)
 	}
-	if _, err := s.db.Exec(`PRAGMA user_version = 5`); err != nil {
+	if _, err := s.db.Exec(`PRAGMA user_version = 6`); err != nil {
 		t.Fatalf("bump user_version: %v", err)
 	}
 	s.Close()
@@ -1262,5 +1264,104 @@ func TestCronJob_ConcurrentDaemonAndCLI(t *testing.T) {
 	}
 	if daemonJobs[0].ID != "concurrent-test" {
 		t.Errorf("daemon sees wrong job ID: %q", daemonJobs[0].ID)
+	}
+}
+
+func TestClaimCronFire(t *testing.T) {
+	s := newTestStore(t)
+
+	// First claim should succeed.
+	claimed, err := s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("first claim should succeed")
+	}
+
+	// Second claim for the same minute should fail.
+	claimed, err = s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Error("second claim for same minute should fail")
+	}
+
+	// Claim for the next minute should succeed.
+	claimed, err = s.ClaimCronFire("test-job", 1780210860)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("claim for next minute should succeed")
+	}
+
+	// Different job, same minute as first, should succeed.
+	claimed, err = s.ClaimCronFire("other-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("different job same minute should succeed")
+	}
+
+	// Clock moves backward (e.g. NTP correction or restored VM snapshot):
+	// a claim with an earlier-but-different minute must still succeed so
+	// firings aren't suppressed until wall time catches up. "test-job" last
+	// claimed 1780210860; an earlier minute differs and should claim.
+	claimed, err = s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("claim after clock moved backward should succeed")
+	}
+
+	// But the exact same (now earlier) minute must still be deduped.
+	claimed, err = s.ClaimCronFire("test-job", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Error("repeat claim for same minute should fail after backward move")
+	}
+}
+
+func TestDeleteCronJob_RemovesDedupRow(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Unix()
+
+	job := &CronJob{
+		ID:        "dedup-cleanup",
+		Schedule:  "* * * * *",
+		ChannelID: "C0AL12WCNBG",
+		Prompt:    "test",
+		Enabled:   true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.InsertCronJob(job); err != nil {
+		t.Fatalf("InsertCronJob: %v", err)
+	}
+
+	// Record a firing so a dedup row exists.
+	if _, err := s.ClaimCronFire("dedup-cleanup", 1780210800); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deleting the job should remove the orphaned dedup row.
+	if err := s.DeleteCronJob("dedup-cleanup"); err != nil {
+		t.Fatalf("DeleteCronJob: %v", err)
+	}
+
+	// A fresh claim for the previously-recorded minute should succeed,
+	// proving the dedup row was cleared.
+	claimed, err := s.ClaimCronFire("dedup-cleanup", 1780210800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Error("claim after delete should succeed (dedup row should be gone)")
 	}
 }
