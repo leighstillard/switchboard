@@ -178,3 +178,75 @@ func writeEvent(conn net.Conn, evType string, payload map[string]any) {
 	data, _ := json.Marshal(payload)
 	conn.Write(append(data, '\n'))
 }
+
+// handleFakeConnKeepAlive subscribes successfully then blocks until the client
+// closes the connection (so the session stays alive until CloseSession).
+func handleFakeConnKeepAlive(t *testing.T, conn net.Conn) {
+	t.Helper()
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		return
+	}
+	writeEvent(conn, jcodeproto.EventAck, map[string]any{"id": 1})
+	writeEvent(conn, jcodeproto.EventSwarmStatus, map[string]any{
+		"members": []map[string]any{
+			{"session_id": "session_test_123", "friendly_name": "test", "status": "ready", "working_dir": "/tmp/wd"},
+		},
+	})
+	writeEvent(conn, jcodeproto.EventDone, map[string]any{"id": 1})
+	// Block until the client closes the connection.
+	_, _ = reader.ReadBytes('\n')
+}
+
+func TestCloseSessionRemovesOnlyThatSession(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "jcode.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go handleFakeConnKeepAlive(t, conn)
+		}
+	}()
+
+	client := &Client{socketPath: sockPath, autoSpawn: false, sessions: make(map[string]*sessionConn)}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, events, err := client.Subscribe(ctx, "/tmp/wd")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := client.getSession(id); err != nil {
+		t.Fatalf("session should be registered: %v", err)
+	}
+
+	if err := client.CloseSession(id); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	if _, err := client.getSession(id); err == nil {
+		t.Error("session should be removed after CloseSession")
+	}
+
+	// The session's event channel must close.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("events channel not closed after CloseSession")
+		}
+	}
+}

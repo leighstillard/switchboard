@@ -29,6 +29,9 @@ func (m *mockBackend) SendMessage(ctx context.Context, sessionID, content string
 func (m *mockBackend) Cancel(ctx context.Context, sessionID string) error {
 	return nil
 }
+func (m *mockBackend) CloseSession(ctx context.Context, sessionID string) error {
+	return nil
+}
 func (m *mockBackend) Close() error {
 	return nil
 }
