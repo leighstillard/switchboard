@@ -621,6 +621,61 @@ func TestMalformedInitSurfacesProtocolError(t *testing.T) {
 	expectClosed(t, events)
 }
 
+// TestPreInitNoiseThenInit verifies benign events before system/init don't skip
+// the init gate: rate_limit_event + control_request are handled/skipped, then a
+// valid init unblocks normal turn output.
+func TestPreInitNoiseThenInit(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(
+		`{"type":"rate_limit_event","remaining":100}`,
+		`{"type":"control_request","request_id":"pre","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}`,
+		initLine(id),
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"after noise"}]}}`,
+		`{"type":"result","subtype":"success"}`,
+	)
+	// The pre-init control_request was still answered.
+	waitForStdin(t, p, `"request_id":"pre"`)
+	if ready := waitFor(t, events, agent.EventSessionReady); ready.SessionID != id {
+		t.Errorf("SessionReady id = %q", ready.SessionID)
+	}
+	if txt := waitFor(t, events, agent.EventTextDelta); txt.Text != "after noise" {
+		t.Errorf("text = %q", txt.Text)
+	}
+	waitFor(t, events, agent.EventTurnDone)
+	_ = b.Close()
+}
+
+// TestOutputBeforeInitRejected: assistant/result before any init is a protocol
+// violation → explicit TurnError + channel close.
+func TestOutputBeforeInitRejected(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"premature"}]}}`)
+	te := waitFor(t, events, agent.EventTurnError)
+	if !strings.Contains(te.ErrorMessage, "init") {
+		t.Errorf("want init protocol error, got %q", te.ErrorMessage)
+	}
+	expectClosed(t, events)
+}
+
+// TestMissingInitRejected: a process that produces only pre-init noise and then
+// exits without ever emitting init surfaces a TurnError (not a silent success).
+func TestMissingInitRejected(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(`{"type":"rate_limit_event","remaining":100}`)
+	p.exitWith("exited before init", nil)
+	te := waitFor(t, events, agent.EventTurnError)
+	if te.ErrorMessage == "" {
+		t.Error("missing init must surface a non-empty TurnError")
+	}
+	expectClosed(t, events)
+}
+
 // TestTerminalEventNeverDropped fills the event buffer, then emits a terminal
 // event from another goroutine; once the consumer drains, the terminal event
 // must still arrive (terminal events are never dropped).

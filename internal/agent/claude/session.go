@@ -84,8 +84,18 @@ func (s *session) readLoop(p proc, gen int) {
 	scanner := bufio.NewScanner(p.Stdout())
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	healthy := false // produced system/init or a completed turn
-	firstLine := true
+	initSeen := false
 
+	// abort tears the session down with an explicit protocol TurnError.
+	abort := func(msg string) {
+		s.emit(agent.Event{Type: agent.EventTurnError, ErrorMessage: msg})
+		s.markClosed()
+		s.closeEvents()
+		_ = p.Terminate()
+		go killAfterGrace(p, s.backend.cfg.GracefulStopTimeout)
+	}
+
+scan:
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -93,19 +103,31 @@ func (s *session) readLoop(p proc, gen int) {
 		}
 		typ := peekType(line)
 
-		// Compatibility probe (spec stage 2a): the first system line must be a
-		// well-formed init, else surface an explicit protocol error rather than
-		// a silent/degraded turn.
-		if firstLine {
-			firstLine = false
-			if typ == "system" {
+		// Compatibility gate (spec stage 2a): a valid system/init must arrive
+		// before any turn output. Benign events (rate_limit_event,
+		// control_request) may precede it and are handled/skipped without
+		// satisfying the gate; assistant/user/result before init is a protocol
+		// violation.
+		if !initSeen {
+			switch typ {
+			case "system":
 				if err := probeInitShape(line); err != nil {
-					s.emit(agent.Event{Type: agent.EventTurnError, ErrorMessage: err.Error()})
-					s.markClosed()
-					_ = p.Terminate()
-					s.closeEvents()
-					break
+					abort(err.Error())
+					break scan
 				}
+				initSeen = true
+				healthy = true
+				// fall through to translate the init (emits SessionReady)
+			case "assistant", "user", "result":
+				abort("incompatible claude CLI protocol: turn output before system/init")
+				break scan
+			default:
+				// Pre-init noise (rate_limit_event, control_request, unknown):
+				// handle permissions, otherwise skip, and keep waiting for init.
+				if typ == "control_request" {
+					s.handleControlRequest(p, line)
+				}
+				continue
 			}
 		}
 
