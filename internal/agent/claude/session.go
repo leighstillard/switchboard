@@ -14,16 +14,16 @@ import (
 )
 
 // session manages one long-running claude process and its event stream. The
-// process is respawned (with --resume) transparently on crash, cancel, or idle
-// eviction; the event channel survives respawns and is closed exactly once, on
-// CloseSession/Close or an unrecoverable resume failure.
+// process is spawned lazily on the first turn (claude emits nothing until it
+// receives a message) and respawned (with --resume) transparently on crash,
+// cancel, or idle eviction. The event channel survives respawns and is closed
+// exactly once, on CloseSession/Close or an unrecoverable resume failure.
 type session struct {
 	backend *Backend
 	id      string
 	workdir string
 
 	events chan agent.Event
-	ready  chan string // first system/init id (or "" on early failure)
 	trans  *translator
 
 	// stdinMu serializes ALL writes to the child stdin — user turns AND
@@ -34,14 +34,14 @@ type session struct {
 	emitMu       sync.Mutex
 	eventsClosed bool
 
-	mu            sync.Mutex
-	proc          proc
-	readGen       int // bumped on every spawn/teardown so stale readLoops are ignored
-	inFlight      bool
-	closed        bool
-	fatal         bool
-	resumePending bool
-	idleTimer     timer
+	mu         sync.Mutex
+	proc       proc
+	readGen    int  // bumped on every spawn/teardown so stale readLoops are ignored
+	freshSpawn bool // true until the first spawn: use --session-id, then --resume
+	inFlight   bool
+	closed     bool
+	fatal      bool
+	idleTimer  timer
 }
 
 func newSession(b *Backend, id, workdir string) *session {
@@ -50,50 +50,26 @@ func newSession(b *Backend, id, workdir string) *session {
 		id:      id,
 		workdir: workdir,
 		events:  make(chan agent.Event, 64),
-		ready:   make(chan string, 1),
 		trans:   newTranslator(),
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Spawn / start
+// Spawn
 // ---------------------------------------------------------------------------
 
-// startFresh spawns a new process and blocks until system/init yields the
-// session id (or the process fails / times out).
-func (s *session) startFresh(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	err := s.spawnLocked(ctx, false)
-	s.mu.Unlock()
-	if err != nil {
-		return "", err
-	}
-
-	select {
-	case id := <-s.ready:
-		if id == "" {
-			s.teardown()
-			return "", errInit
-		}
-		return id, nil
-	case <-time.After(initTimeout):
-		s.teardown()
-		return "", errInitTimeout
-	case <-ctx.Done():
-		s.teardown()
-		return "", ctx.Err()
-	}
-}
-
-// spawnLocked starts the subprocess and its read loop. Caller holds s.mu.
-func (s *session) spawnLocked(ctx context.Context, resume bool) error {
+// spawnLocked starts the subprocess and its read loop. Caller holds s.mu. The
+// first spawn of a fresh session passes --session-id <id>; every later spawn
+// (and any resumed session) passes --resume <id>.
+func (s *session) spawnLocked(ctx context.Context) error {
+	resume := !s.freshSpawn
 	args := s.backend.buildArgs(s.id, resume)
 	p, err := s.backend.cmd.Start(ctx, args, s.workdir, s.backend.baseEnv)
 	if err != nil {
 		return err
 	}
 	s.proc = p
-	s.resumePending = false
+	s.freshSpawn = false
 	s.readGen++
 	gen := s.readGen
 	go s.readLoop(p, gen)
@@ -107,8 +83,7 @@ func (s *session) spawnLocked(ctx context.Context, resume bool) error {
 func (s *session) readLoop(p proc, gen int) {
 	scanner := bufio.NewScanner(p.Stdout())
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	signaled := false // signalled startFresh's ready channel
-	healthy := false  // produced system/init or a completed turn
+	healthy := false // produced system/init or a completed turn
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -122,17 +97,6 @@ func (s *session) readLoop(p proc, gen int) {
 		for _, ev := range s.trans.translateLine(line) {
 			if ev.Type == agent.EventSessionReady {
 				healthy = true
-				if ev.SessionID != "" {
-					s.mu.Lock()
-					if s.id == "" {
-						s.id = ev.SessionID
-					}
-					s.mu.Unlock()
-				}
-				if !signaled {
-					signaled = true
-					s.signalReady(ev.SessionID)
-				}
 			}
 			if isTerminal(ev.Type) {
 				healthy = true
@@ -145,9 +109,6 @@ func (s *session) readLoop(p proc, gen int) {
 	}
 
 	stderr, werr := p.Wait()
-	if !signaled {
-		s.signalReady("") // unblock a startFresh waiter on early failure
-	}
 	s.onProcExit(gen, healthy, stderr, werr)
 }
 
@@ -209,7 +170,6 @@ func (s *session) onProcExit(gen int, healthy bool, stderr string, werr error) {
 	wasInFlight := s.inFlight
 	s.proc = nil
 	s.inFlight = false
-	s.resumePending = true
 	s.stopIdleTimerLocked()
 	// A turn that exited before the process ever became healthy means the
 	// spawn/--resume itself failed (e.g. claude has no record of the session).
@@ -222,8 +182,6 @@ func (s *session) onProcExit(gen int, healthy bool, stderr string, werr error) {
 
 	switch {
 	case resumeFail:
-		// Could not start/resume: surface the captured stderr and close the
-		// channel — this session id is unrecoverable.
 		s.emit(agent.Event{
 			Type:         agent.EventTurnError,
 			ErrorMessage: "claude session unrecoverable: " + tail(stderr, 500),
@@ -255,7 +213,7 @@ func (s *session) send(ctx context.Context, content string, images []agent.Image
 	s.inFlight = true
 	s.stopIdleTimerLocked()
 	if s.proc == nil {
-		if err := s.spawnLocked(ctx, true); err != nil {
+		if err := s.spawnLocked(ctx); err != nil {
 			s.inFlight = false
 			s.mu.Unlock()
 			s.emit(agent.Event{Type: agent.EventTurnError, ErrorMessage: "claude spawn failed: " + err.Error()})
@@ -288,7 +246,6 @@ func (s *session) cancel() {
 	s.proc = nil
 	s.readGen++ // supersede the current readLoop so it won't respawn/Interrupt
 	s.inFlight = false
-	s.resumePending = true
 	s.stopIdleTimerLocked()
 	s.mu.Unlock()
 
@@ -310,7 +267,6 @@ func (s *session) evict() {
 	p := s.proc
 	s.proc = nil
 	s.readGen++
-	s.resumePending = true
 	s.mu.Unlock()
 
 	if p != nil {
@@ -369,7 +325,7 @@ func killAfterGrace(p proc, grace time.Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Idle timer (caller holds s.mu)
+// Idle timer
 // ---------------------------------------------------------------------------
 
 func (s *session) onTerminal() {
@@ -426,13 +382,6 @@ func (s *session) markClosed() {
 	s.closed = true
 	s.stopIdleTimerLocked()
 	s.mu.Unlock()
-}
-
-func (s *session) signalReady(id string) {
-	select {
-	case s.ready <- id:
-	default:
-	}
 }
 
 func (s *session) writeLine(p proc, v any) error {

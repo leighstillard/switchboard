@@ -62,27 +62,19 @@ type fakeProc struct {
 	mu        sync.Mutex
 	termCalls int
 	killCalls int
-	pid       int
 }
 
 func newFakeProc() *fakeProc {
 	r, w := io.Pipe()
-	p := &fakeProc{
-		stdoutR: r,
-		stdoutW: w,
-		stdin:   &syncBuffer{},
-		waitCh:  make(chan struct{}),
-		pid:     4242,
-	}
-	// Closing stdin (clean teardown) makes the process exit, like claude on EOF.
-	p.stdin.onClose = p.exit
+	p := &fakeProc{stdoutR: r, stdoutW: w, stdin: &syncBuffer{}, waitCh: make(chan struct{})}
+	p.stdin.onClose = p.exit // closing stdin (clean teardown) exits the process, like claude on EOF
 	return p
 }
 
 func (p *fakeProc) Stdin() io.WriteCloser { return p.stdin }
 func (p *fakeProc) Stdout() io.Reader     { return p.stdoutR }
 func (p *fakeProc) Wait() (string, error) { <-p.waitCh; return p.stderr, p.exitErr }
-func (p *fakeProc) Pid() int              { return p.pid }
+func (p *fakeProc) Pid() int              { return 4242 }
 
 func (p *fakeProc) Terminate() error {
 	p.mu.Lock()
@@ -102,14 +94,12 @@ func (p *fakeProc) Kill() error {
 
 func (p *fakeProc) terms() int { p.mu.Lock(); defer p.mu.Unlock(); return p.termCalls }
 
-// feed writes stream-json lines to the process stdout.
 func (p *fakeProc) feed(lines ...string) {
 	for _, l := range lines {
 		_, _ = io.WriteString(p.stdoutW, l+"\n")
 	}
 }
 
-// exitWith sets stderr/err then exits the process (EOF + Wait returns).
 func (p *fakeProc) exitWith(stderr string, err error) {
 	p.stderr = stderr
 	p.exitErr = err
@@ -132,7 +122,6 @@ type startCall struct {
 type fakeCommander struct {
 	mu      sync.Mutex
 	calls   []startCall
-	procs   []*fakeProc
 	newProc chan *fakeProc
 }
 
@@ -144,7 +133,6 @@ func (c *fakeCommander) Start(_ context.Context, args []string, workdir string, 
 	p := newFakeProc()
 	c.mu.Lock()
 	c.calls = append(c.calls, startCall{args: args, workdir: workdir, env: env})
-	c.procs = append(c.procs, p)
 	c.mu.Unlock()
 	c.newProc <- p
 	return p, nil
@@ -177,45 +165,37 @@ func (c *fakeCommander) lastEnv() []string {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const initLine = `{"type":"system","subtype":"init","session_id":"sess-1","model":"claude-sonnet-4-20250514"}`
+const model = "claude-sonnet-4-20250514"
+
+func initLine(id string) string {
+	return `{"type":"system","subtype":"init","session_id":"` + id + `","model":"` + model + `"}`
+}
 
 func testBackend(t *testing.T) (*Backend, *fakeCommander, *fakeClock) {
 	t.Helper()
 	fc := newFakeCommander()
 	clk := newFakeClock()
-	b := newForTest(DefaultConfig(), fc, clk)
-	return b, fc, clk
+	return newForTest(DefaultConfig(), fc, clk), fc, clk
 }
 
-// startSubscribe runs Subscribe, feeds init to the spawned proc, returns results.
-func startSubscribe(t *testing.T, b *Backend, fc *fakeCommander) (string, <-chan agent.Event, *fakeProc) {
-	return startSubscribeID(t, b, fc, "sess-1")
-}
-
-func startSubscribeID(t *testing.T, b *Backend, fc *fakeCommander, id string) (string, <-chan agent.Event, *fakeProc) {
+// subscribe registers a session (no process spawned yet — claude is lazy).
+func subscribe(t *testing.T, b *Backend) (string, <-chan agent.Event) {
 	t.Helper()
-	type res struct {
-		id  string
-		ev  <-chan agent.Event
-		err error
+	id, ev, err := b.Subscribe(context.Background(), "/wd")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
 	}
-	ch := make(chan res, 1)
-	go func() {
-		sid, ev, err := b.Subscribe(context.Background(), "/wd")
-		ch <- res{sid, ev, err}
-	}()
-	p := fc.waitProc(t)
-	p.feed(`{"type":"system","subtype":"init","session_id":"` + id + `","model":"claude-sonnet-4-20250514"}`)
-	select {
-	case r := <-ch:
-		if r.err != nil {
-			t.Fatalf("Subscribe: %v", r.err)
-		}
-		return r.id, r.ev, p
-	case <-time.After(2 * time.Second):
-		t.Fatal("Subscribe did not return")
-		return "", nil, nil
+	return id, ev
+}
+
+// firstTurn sends the first message (triggering the lazy spawn) and returns the
+// spawned process.
+func firstTurn(t *testing.T, b *Backend, fc *fakeCommander, id, content string) *fakeProc {
+	t.Helper()
+	if err := b.SendMessage(context.Background(), id, content, nil); err != nil {
+		t.Fatalf("SendMessage: %v", err)
 	}
+	return fc.waitProc(t)
 }
 
 func waitFor(t *testing.T, events <-chan agent.Event, typ agent.EventType) agent.Event {
@@ -236,7 +216,6 @@ func waitFor(t *testing.T, events <-chan agent.Event, typ agent.EventType) agent
 	}
 }
 
-// expectClosed drains buffered events then asserts the channel is closed.
 func expectClosed(t *testing.T, events <-chan agent.Event) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
@@ -289,41 +268,42 @@ func argValue(args []string, flag string) (string, bool) {
 // Tests
 // ---------------------------------------------------------------------------
 
-func TestSubscribeEmitsSessionReady(t *testing.T) {
+func TestSubscribeIsLazyNoSpawn(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	id, events, _ := startSubscribe(t, b, fc)
-	if id != "sess-1" {
-		t.Errorf("session id = %q, want sess-1", id)
+	id, _ := subscribe(t, b)
+	if fc.callCount() != 0 {
+		t.Errorf("Subscribe must not spawn a process; got %d", fc.callCount())
 	}
-	ev := waitFor(t, events, agent.EventSessionReady)
-	if ev.SessionID != "sess-1" || ev.Model == "" {
-		t.Errorf("SessionReady = %+v", ev)
+	if len(id) != 36 {
+		t.Errorf("expected a generated uuid session id, got %q", id)
 	}
 	_ = b.Close()
 }
 
-func TestSpawnArgs(t *testing.T) {
+func TestFreshSpawnArgs(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	startSubscribe(t, b, fc)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
 	args := fc.lastArgs()
 
 	if v, _ := argValue(args, "--setting-sources"); v != "project,local" {
 		t.Errorf("--setting-sources = %q, want project,local", v)
 	}
-	if !argHasFlag(args, "--permission-prompt-tool") {
-		t.Error("missing --permission-prompt-tool")
+	if v, _ := argValue(args, "--session-id"); v != id {
+		t.Errorf("fresh spawn --session-id = %q, want %q", v, id)
 	}
-	if !argHasFlag(args, "--input-format") || !argHasFlag(args, "--replay-user-messages") {
-		t.Error("missing persistent-mode flags")
+	if argHasFlag(args, "--resume") {
+		t.Error("fresh spawn must not have --resume")
+	}
+	for _, f := range []string{"--permission-prompt-tool", "--input-format", "--replay-user-messages", "--verbose"} {
+		if !argHasFlag(args, f) {
+			t.Errorf("missing %q", f)
+		}
 	}
 	for _, forbidden := range []string{"--bare", "--include-partial-messages", "--permission-mode", "-p", "--print"} {
 		if argHasFlag(args, forbidden) {
 			t.Errorf("argv must not contain %q: %v", forbidden, args)
 		}
-	}
-	// Fresh spawn has no --resume.
-	if argHasFlag(args, "--resume") {
-		t.Error("fresh spawn must not have --resume")
 	}
 	_ = b.Close()
 }
@@ -333,11 +313,11 @@ func TestEnvStripsCLAUDECODEKeepsRest(t *testing.T) {
 	t.Setenv("SWITCHBOARD_SENTINEL", "keepme")
 	b := newForTest(DefaultConfig(), newFakeCommander(), newFakeClock())
 	fc := b.cmd.(*fakeCommander)
-	startSubscribe(t, b, fc)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
 
-	env := fc.lastEnv()
 	var sawSentinel, sawClaudeCode bool
-	for _, e := range env {
+	for _, e := range fc.lastEnv() {
 		if e == "SWITCHBOARD_SENTINEL=keepme" {
 			sawSentinel = true
 		}
@@ -360,13 +340,15 @@ func TestExtraEnvOverrides(t *testing.T) {
 	cfg.ExtraEnv = map[string]string{"OVERRIDE_ME": "new"}
 	b := newForTest(cfg, newFakeCommander(), newFakeClock())
 	fc := b.cmd.(*fakeCommander)
-	startSubscribe(t, b, fc)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+
 	count := 0
 	for _, e := range fc.lastEnv() {
 		if strings.HasPrefix(e, "OVERRIDE_ME=") {
 			count++
 			if e != "OVERRIDE_ME=new" {
-				t.Errorf("extra_env override = %q, want new", e)
+				t.Errorf("override = %q, want new", e)
 			}
 		}
 	}
@@ -378,21 +360,21 @@ func TestExtraEnvOverrides(t *testing.T) {
 
 func TestSendMessageWritesUserLineAndText(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	id, events, p := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-
-	if err := b.SendMessage(context.Background(), id, "hello there", nil); err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hello there")
 	waitForStdin(t, p, `"type":"user"`)
 	waitForStdin(t, p, "hello there")
 
 	p.feed(
+		initLine(id),
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}]}}`,
 		`{"type":"result","subtype":"success"}`,
 	)
-	txt := waitFor(t, events, agent.EventTextDelta)
-	if txt.Text != "hi back" {
+	ready := waitFor(t, events, agent.EventSessionReady)
+	if ready.SessionID != id {
+		t.Errorf("SessionReady id = %q, want %q", ready.SessionID, id)
+	}
+	if txt := waitFor(t, events, agent.EventTextDelta); txt.Text != "hi back" {
 		t.Errorf("text = %q", txt.Text)
 	}
 	waitFor(t, events, agent.EventTurnDone)
@@ -401,10 +383,8 @@ func TestSendMessageWritesUserLineAndText(t *testing.T) {
 
 func TestControlRequestAllowAll(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	id, events, p := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-	_ = b.SendMessage(context.Background(), id, "do it", nil)
-
+	id, _ := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "do it")
 	p.feed(`{"type":"control_request","request_id":"req_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}`)
 	waitForStdin(t, p, `"type":"control_response"`)
 	s := p.stdin.String()
@@ -422,10 +402,8 @@ func TestControlRequestDenyAll(t *testing.T) {
 	cfg.PermissionPolicy = "deny_all"
 	b := newForTest(cfg, newFakeCommander(), newFakeClock())
 	fc := b.cmd.(*fakeCommander)
-	id, events, p := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-	_ = b.SendMessage(context.Background(), id, "do it", nil)
-
+	id, _ := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "do it")
 	p.feed(`{"type":"control_request","request_id":"req_2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}`)
 	waitForStdin(t, p, `"type":"control_response"`)
 	s := p.stdin.String()
@@ -437,30 +415,26 @@ func TestControlRequestDenyAll(t *testing.T) {
 
 func TestCrashMidTurnEmitsInterruptedThenResumes(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	id, events, p1 := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-
-	_ = b.SendMessage(context.Background(), id, "long task", nil)
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "long task")
 	waitForStdin(t, p1, "long task")
-	// Crash mid-turn: produce a partial assistant message, then die with no result.
-	p1.feed(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}`)
+	p1.feed(
+		initLine(id), // healthy
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}`,
+	)
 	waitFor(t, events, agent.EventTextDelta)
-	p1.exitWith("boom", nil)
+	p1.exitWith("boom", nil) // crash, no result
 
 	waitFor(t, events, agent.EventInterrupted)
 
-	// Channel must NOT be closed — the session recovers on the next turn.
+	// Channel stays open; next turn respawns with --resume.
 	if err := b.SendMessage(context.Background(), id, "retry", nil); err != nil {
 		t.Fatalf("SendMessage after crash: %v", err)
 	}
-	p2 := fc.waitProc(t)
-	if !argHasFlag(fc.lastArgs(), "--resume") {
-		t.Error("respawn after crash must use --resume")
+	fc.waitProc(t)
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != id {
+		t.Errorf("respawn must --resume %q, got %q (args %v)", id, v, fc.lastArgs())
 	}
-	if v, _ := argValue(fc.lastArgs(), "--resume"); v != "sess-1" {
-		t.Errorf("--resume id = %q, want sess-1", v)
-	}
-	_ = p2
 	_ = b.Close()
 }
 
@@ -470,43 +444,29 @@ func TestResumeFailureSurfacesTurnErrorAndClosesChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubscribeExisting: %v", err)
 	}
-	// No spawn yet (lazy).
 	if fc.callCount() != 0 {
-		t.Errorf("SubscribeExisting must not spawn; got %d", fc.callCount())
+		t.Errorf("SubscribeExisting must be lazy; got %d spawns", fc.callCount())
 	}
 
-	_ = b.SendMessage(context.Background(), "old-sess", "continue", nil)
+	if err := b.SendMessage(context.Background(), "old-sess", "continue", nil); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
 	p := fc.waitProc(t)
-	if !argHasFlag(fc.lastArgs(), "--resume") {
-		t.Error("lazy resume spawn must use --resume")
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != "old-sess" {
+		t.Errorf("lazy resume must --resume old-sess, got %q", v)
 	}
-	// Resume fails: process exits before any init.
-	p.exitWith("No conversation found with session ID old-sess", nil)
+	p.exitWith("No conversation found with session ID old-sess", nil) // exits before init
 
-	te := waitFor(t, events, agent.EventTurnError)
-	if te.ErrorMessage == "" {
+	if te := waitFor(t, events, agent.EventTurnError); te.ErrorMessage == "" {
 		t.Error("TurnError must carry a message")
 	}
-	// Channel must be closed (session unrecoverable).
-	closed := false
-	deadline := time.After(2 * time.Second)
-	for !closed {
-		select {
-		case _, ok := <-events:
-			if !ok {
-				closed = true
-			}
-		case <-deadline:
-			t.Fatal("channel not closed after resume failure")
-		}
-	}
+	expectClosed(t, events)
 }
 
 func TestCancelTerminatesAndInterrupts(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	id, events, p := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-	_ = b.SendMessage(context.Background(), id, "task", nil)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "task")
 	waitForStdin(t, p, "task")
 
 	if err := b.Cancel(context.Background(), id); err != nil {
@@ -521,35 +481,44 @@ func TestCancelTerminatesAndInterrupts(t *testing.T) {
 
 func TestCloseClosesStdinFirstNoSignalOnCleanExit(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	_, events, p := startSubscribe(t, b, fc)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "task")
+	waitForStdin(t, p, "task")
 
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// fakeProc exits when stdin is closed → clean exit within grace.
 	if p.terms() != 0 {
-		t.Errorf("clean exit must not require SIGTERM; terms=%d", p.terms())
+		t.Errorf("clean exit (stdin close) must not require SIGTERM; terms=%d", p.terms())
 	}
 	expectClosed(t, events)
 }
 
 func TestCloseSessionIsolatesOneSession(t *testing.T) {
 	b, fc, _ := testBackend(t)
-	idA, evA, _ := startSubscribeID(t, b, fc, "sessA")
-	idB, evB, pB := startSubscribeID(t, b, fc, "sessB")
+	idA, evA := subscribe(t, b)
+	firstTurn(t, b, fc, idA, "a")
+	idB, evB := subscribe(t, b)
+	pB := firstTurn(t, b, fc, idB, "b")
 
 	if err := b.CloseSession(context.Background(), idA); err != nil {
 		t.Fatalf("CloseSession: %v", err)
 	}
 	expectClosed(t, evA)
 
-	// Session B still works.
+	// Session B still works and its channel stays open.
 	if err := b.SendMessage(context.Background(), idB, "still here", nil); err != nil {
 		t.Fatalf("session B SendMessage: %v", err)
 	}
 	waitForStdin(t, pB, "still here")
-	// Drain B's buffered SessionReady; the channel must remain open.
-	waitFor(t, evB, agent.EventSessionReady)
+	select {
+	case ev, ok := <-evB:
+		if !ok {
+			t.Error("session B channel must stay open")
+		}
+		_ = ev
+	default:
+	}
 	_ = b.Close()
 }
 
@@ -560,18 +529,14 @@ func TestIdleEvictionTearsDownProcessKeepsSession(t *testing.T) {
 	b := newForTest(cfg, newFakeCommander(), clk)
 	fc := b.cmd.(*fakeCommander)
 
-	id, events, p1 := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-	_ = b.SendMessage(context.Background(), id, "task", nil)
-	p1.feed(`{"type":"result","subtype":"success"}`)
+	id, events := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "task")
+	p1.feed(initLine(id), `{"type":"result","subtype":"success"}`)
 	waitFor(t, events, agent.EventTurnDone) // terminal → idle timer armed
 
-	// Give onTerminal time to arm the timer, then advance past the timeout.
-	waitForStdin(t, p1, "task")
 	time.Sleep(20 * time.Millisecond)
 	clk.Advance(11 * time.Minute)
 
-	// Process is torn down (terminated) but the channel stays open.
 	deadline := time.After(2 * time.Second)
 	for p1.terms() == 0 {
 		select {
@@ -588,11 +553,12 @@ func TestIdleEvictionTearsDownProcessKeepsSession(t *testing.T) {
 	default:
 	}
 
-	// Next turn respawns with --resume (session id retained).
-	_ = b.SendMessage(context.Background(), id, "again", nil)
+	if err := b.SendMessage(context.Background(), id, "again", nil); err != nil {
+		t.Fatalf("SendMessage post-eviction: %v", err)
+	}
 	fc.waitProc(t)
-	if !argHasFlag(fc.lastArgs(), "--resume") {
-		t.Error("post-eviction respawn must use --resume")
+	if v, _ := argValue(fc.lastArgs(), "--resume"); v != id {
+		t.Errorf("post-eviction respawn must --resume %q, got %q", id, v)
 	}
 	_ = b.Close()
 }
@@ -604,13 +570,10 @@ func TestIdleEvictionNeverKillsInFlight(t *testing.T) {
 	b := newForTest(cfg, newFakeCommander(), clk)
 	fc := b.cmd.(*fakeCommander)
 
-	id, events, p1 := startSubscribe(t, b, fc)
-	waitFor(t, events, agent.EventSessionReady)
-	// Start a turn but never emit a terminal event — it's in-flight.
-	_ = b.SendMessage(context.Background(), id, "long build", nil)
-	waitForStdin(t, p1, "long build")
+	id, _ := subscribe(t, b)
+	p1 := firstTurn(t, b, fc, id, "long build")
+	waitForStdin(t, p1, "long build") // in-flight, no terminal event
 
-	// Advance well past the eviction timeout.
 	clk.Advance(30 * time.Minute)
 	time.Sleep(20 * time.Millisecond)
 

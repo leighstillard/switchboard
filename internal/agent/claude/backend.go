@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/format5/switchboard/internal/agent"
+	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -58,9 +59,6 @@ func (c *Config) applyDefaults() {
 	}
 	// IdleEvictionTimeout 0 means "never", so leave it.
 }
-
-// initTimeout bounds how long Subscribe waits for the first system/init.
-const initTimeout = 60 * time.Second
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -130,9 +128,10 @@ func buildEnv(extra map[string]string) []string {
 	return out
 }
 
-// buildArgs constructs the long-running claude CLI flags. resume passes
-// --resume <sessionID> (recovery/rehydration); fresh sessions omit it and read
-// the assigned id from system/init.
+// buildArgs constructs the long-running claude CLI flags. A fresh session sets
+// its own id with --session-id; a resumed/respawned session passes --resume.
+// (claude emits no output until the first turn, so we cannot read an assigned id
+// from system/init before sending — we choose the id ourselves.)
 func (b *Backend) buildArgs(sessionID string, resume bool) []string {
 	args := []string{
 		"--setting-sources", b.cfg.SettingSources,
@@ -148,8 +147,12 @@ func (b *Backend) buildArgs(sessionID string, resume bool) []string {
 	if b.cfg.AppendSystemPrompt != "" {
 		args = append(args, "--append-system-prompt", b.cfg.AppendSystemPrompt)
 	}
-	if resume && sessionID != "" {
-		args = append(args, "--resume", sessionID)
+	if sessionID != "" {
+		if resume {
+			args = append(args, "--resume", sessionID)
+		} else {
+			args = append(args, "--session-id", sessionID)
+		}
 	}
 	args = append(args, b.cfg.ExtraArgs...)
 	return args
@@ -159,14 +162,14 @@ func (b *Backend) buildArgs(sessionID string, resume bool) []string {
 // agent.Backend implementation
 // ---------------------------------------------------------------------------
 
-// Subscribe spawns a fresh claude process and returns once system/init yields
-// the session id.
+// Subscribe registers a new session with a self-assigned id (passed to claude
+// via --session-id on the first turn) and returns immediately. The process is
+// spawned lazily on the first SendMessage, since claude emits nothing until it
+// receives a message.
 func (b *Backend) Subscribe(ctx context.Context, workdir string) (string, <-chan agent.Event, error) {
-	s := newSession(b, "", workdir)
-	id, err := s.startFresh(ctx)
-	if err != nil {
-		return "", nil, err
-	}
+	id := uuid.NewString()
+	s := newSession(b, id, workdir)
+	s.freshSpawn = true // first spawn uses --session-id
 	b.mu.Lock()
 	b.sessions[id] = s
 	b.mu.Unlock()
@@ -181,8 +184,8 @@ func (b *Backend) SubscribeExisting(ctx context.Context, sessionID, workdir stri
 	if s, ok := b.sessions[sessionID]; ok {
 		return s.events, nil
 	}
+	// freshSpawn defaults false → the first spawn uses --resume.
 	s := newSession(b, sessionID, workdir)
-	s.resumePending = true
 	b.sessions[sessionID] = s
 	return s.events, nil
 }
