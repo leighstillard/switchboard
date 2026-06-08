@@ -43,12 +43,12 @@ type WebhookEvent struct {
 
 // Router orchestrates message flow between Slack, jcode, and webhook sources.
 type Router struct {
-	cfg      *config.Config
-	store    *store.Store
-	backend  agent.Backend // default (jcode) backend
+	cfg           *config.Config
+	store         *store.Store
+	backend       agent.Backend // default (jcode) backend
 	claudeBackend agent.Backend // optional Claude backend (may be nil)
-	edge     *slack.Edge
-	outbound *outbound.Queue
+	edge          *slack.Edge
+	outbound      *outbound.Queue
 
 	mu         sync.RWMutex
 	routes     []config.RouteConfig
@@ -548,8 +548,7 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 	r.edge.AddReaction(msg.ChannelID, msg.MessageTS, "eyes")
 
 	// Send the user's message to agent.
-	var images []agent.Image
-	// TODO: handle file attachments -> images
+	images := imagesFromSlackFiles(ctx, msg.Files, r.edge.DownloadFile)
 	if err := be.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
 		slog.Error("router: failed to send message to agent", "err", err)
 		r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
@@ -607,7 +606,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 		// Send message to agent. If the session is stale (e.g. jcode restarted),
 		// attempt to re-subscribe before giving up.
-		var images []agent.Image
+		images := imagesFromSlackFiles(ctx, msg.Files, r.edge.DownloadFile)
 		if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
 			slog.Warn("router: send failed, attempting re-subscribe",
 				"session_id", session.JcodeSession, "err", err)
@@ -684,12 +683,13 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 		// Enqueue the turn.
 		item := &store.TurnQueueItem{
-			ChannelID:  msg.ChannelID,
-			ThreadTS:   threadTS,
-			MessageTS:  msg.MessageTS,
-			EnqueuedAt: time.Now().Unix(),
-			UserID:     msg.UserID,
-			Text:       msg.Text,
+			ChannelID:       msg.ChannelID,
+			ThreadTS:        threadTS,
+			MessageTS:       msg.MessageTS,
+			EnqueuedAt:      time.Now().Unix(),
+			UserID:          msg.UserID,
+			Text:            msg.Text,
+			AttachmentsJSON: slackFileAttachmentsJSON(msg.Files),
 		}
 		if err := r.store.EnqueueTurn(item); err != nil {
 			slog.Error("router: failed to enqueue turn", "err", err)
@@ -923,8 +923,10 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 
 	// Concatenate queued messages.
 	var texts []string
+	var files []slack.SlackFile
 	for _, t := range turns {
 		texts = append(texts, t.Text)
+		files = append(files, slackFilesFromAttachmentsJSON(t.AttachmentsJSON)...)
 	}
 	combined := strings.Join(texts, "\n\n---\n\n")
 
@@ -945,7 +947,8 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 
 	// Send combined message to agent.
 	be := r.backendForSession(sessionID, "")
-	if err := be.SendMessage(ctx, sessionID, combined, nil); err != nil {
+	images := imagesFromSlackFiles(ctx, files, r.edge.DownloadFile)
+	if err := be.SendMessage(ctx, sessionID, combined, images); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
 		// Remove the coalKey we just added since the send failed.
@@ -1686,6 +1689,7 @@ func parseCoalescerKey(key string) (channelID, threadTS string) {
 	}
 	return parts[0], parts[1]
 }
+
 // extractField extracts a dotted path from a nested map.
 func extractField(payload map[string]interface{}, path string) string {
 	parts := strings.Split(path, ".")

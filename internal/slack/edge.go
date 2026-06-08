@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -25,17 +27,17 @@ import (
 // InboundMessage is the normalized representation of a Slack message event
 // after eligibility filtering and @mention stripping.
 type InboundMessage struct {
-	ChannelID    string
-	ThreadTS     string // empty if top-level
-	MessageTS    string // the message's own timestamp
-	UserID       string
-	BotID        string // empty if from human
-	Text         string // with @mention stripped
-	Files        []SlackFile
-	IsTopLevel   bool // thread_ts == ts or empty
-	IsDM         bool
-	IsAppMention bool // true if originated from app_mention event
-	MentionsBot  bool // true if the original text contained our @mention
+	ChannelID     string
+	ThreadTS      string // empty if top-level
+	MessageTS     string // the message's own timestamp
+	UserID        string
+	BotID         string // empty if from human
+	Text          string // with @mention stripped
+	Files         []SlackFile
+	IsTopLevel    bool // thread_ts == ts or empty
+	IsDM          bool
+	IsAppMention  bool // true if originated from app_mention event
+	MentionsBot   bool // true if the original text contained our @mention
 	MentionsOther bool // true if the text contains @mentions of other users
 }
 
@@ -236,20 +238,29 @@ func (e *Edge) handleInnerEvent(inner slackevents.EventsAPIInnerEvent) {
 // ---------------------------------------------------------------------------
 
 func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
+	channelID, threadTS, messageTS, userID, botID, text, files := messageEventParts(ev)
+
 	slog.Debug("slack edge: message event",
-		"channel", ev.Channel, "user", ev.User, "subtype", ev.SubType,
-		"bot_id", ev.BotID, "text_len", len(ev.Text))
+		"channel", channelID, "user", userID, "subtype", ev.SubType,
+		"bot_id", botID, "text_len", len(text), "files", len(files))
 
 	// Drop subtypes we never process.
 	switch ev.SubType {
-	case "message_changed", "message_deleted":
+	case "message_deleted":
 		return
+	case "message_changed":
+		// Mobile Slack can attach files asynchronously by editing the original
+		// message. Treat those as inbound file uploads, but keep ignoring plain
+		// text edits so the agent does not receive duplicate turns.
+		if len(files) == 0 {
+			return
+		}
 	}
 
 	// Drop bot_message from non-allowlisted bots.
 	if ev.SubType == "bot_message" {
 		e.mu.RLock()
-		allowed := e.allowlist[ev.BotID]
+		allowed := e.allowlist[botID]
 		e.mu.RUnlock()
 		if !allowed {
 			return
@@ -257,13 +268,10 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	}
 
 	// Drop self-messages.
-	if ev.User == e.botUserID {
+	if userID == e.botUserID {
 		return
 	}
 
-	channelID := ev.Channel
-	threadTS := ev.ThreadTimeStamp
-	messageTS := ev.TimeStamp
 	isDM := (ev.ChannelType == slackevents.ChannelTypeIM)
 	isTopLevel := (threadTS == "" || threadTS == messageTS)
 
@@ -281,30 +289,16 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	// Reply in owned thread: always process (no mention needed).
 	// DM to bot: always process.
 
-	mentionsBot := strings.Contains(ev.Text, "<@"+e.botUserID+">")
-	mentionsOther := hasMentionOtherThan(ev.Text, e.botUserID)
-	text := e.stripBotMention(ev.Text)
-
-	// Extract files from the Message field (populated by custom UnmarshalJSON).
-	var files []SlackFile
-	if ev.Message != nil {
-		for _, f := range ev.Message.Files {
-			files = append(files, SlackFile{
-				ID:       f.ID,
-				Name:     f.Name,
-				MimeType: f.Mimetype,
-				Size:     f.Size,
-				URL:      f.URLPrivate,
-			})
-		}
-	}
+	mentionsBot := strings.Contains(text, "<@"+e.botUserID+">")
+	mentionsOther := hasMentionOtherThan(text, e.botUserID)
+	text = e.stripBotMention(text)
 
 	msg := &InboundMessage{
 		ChannelID:     channelID,
 		ThreadTS:      threadTS,
 		MessageTS:     messageTS,
-		UserID:        ev.User,
-		BotID:         ev.BotID,
+		UserID:        userID,
+		BotID:         botID,
 		Text:          text,
 		Files:         files,
 		IsTopLevel:    isTopLevel,
@@ -314,6 +308,51 @@ func (e *Edge) handleMessage(ev *slackevents.MessageEvent) {
 	}
 
 	e.dispatch(msg)
+}
+
+func messageEventParts(ev *slackevents.MessageEvent) (channelID, threadTS, messageTS, userID, botID, text string, files []SlackFile) {
+	channelID = ev.Channel
+	threadTS = ev.ThreadTimeStamp
+	messageTS = ev.TimeStamp
+	userID = ev.User
+	botID = ev.BotID
+	text = ev.Text
+
+	if ev.Message != nil {
+		if ev.Message.Channel != "" {
+			channelID = ev.Message.Channel
+		}
+		if ev.Message.ThreadTimestamp != "" {
+			threadTS = ev.Message.ThreadTimestamp
+		}
+		if ev.Message.Timestamp != "" {
+			messageTS = ev.Message.Timestamp
+		}
+		if ev.Message.User != "" {
+			userID = ev.Message.User
+		}
+		if ev.Message.BotID != "" {
+			botID = ev.Message.BotID
+		}
+		text = ev.Message.Text
+		files = slackFiles(ev.Message.Files)
+	}
+
+	return channelID, threadTS, messageTS, userID, botID, text, files
+}
+
+func slackFiles(files []slackapi.File) []SlackFile {
+	out := make([]SlackFile, 0, len(files))
+	for _, f := range files {
+		out = append(out, SlackFile{
+			ID:       f.ID,
+			Name:     f.Name,
+			MimeType: f.Mimetype,
+			Size:     f.Size,
+			URL:      f.URLPrivate,
+		})
+	}
+	return out
 }
 
 func (e *Edge) handleAppMention(ev *slackevents.AppMentionEvent) {
@@ -326,16 +365,7 @@ func (e *Edge) handleAppMention(ev *slackevents.AppMentionEvent) {
 
 	text := e.stripBotMention(ev.Text)
 
-	var files []SlackFile
-	for _, f := range ev.Files {
-		files = append(files, SlackFile{
-			ID:       f.ID,
-			Name:     f.Name,
-			MimeType: f.Mimetype,
-			Size:     f.Size,
-			URL:      f.URLPrivate,
-		})
-	}
+	files := slackFiles(ev.Files)
 
 	msg := &InboundMessage{
 		ChannelID:     ev.Channel,
@@ -422,10 +452,10 @@ func (e *Edge) UpdateMessage(channelID, ts, text string, opts ...outbound.PostOp
 // UploadFile uploads a file to a Slack channel/thread.
 func (e *Edge) UploadFile(channelID, threadTS, filename string, content []byte) error {
 	params := slackapi.UploadFileParameters{
-		Filename:       filename,
-		Reader:         bytes.NewReader(content),
-		FileSize:       len(content),
-		Channel:        channelID,
+		Filename:        filename,
+		Reader:          bytes.NewReader(content),
+		FileSize:        len(content),
+		Channel:         channelID,
 		ThreadTimestamp: threadTS,
 	}
 
@@ -434,6 +464,35 @@ func (e *Edge) UploadFile(channelID, threadTS, filename string, content []byte) 
 		return fmt.Errorf("slack: upload file: %w", err)
 	}
 	return nil
+}
+
+// DownloadFile fetches a Slack private file URL using the bot token.
+func (e *Edge) DownloadFile(ctx context.Context, file SlackFile) ([]byte, error) {
+	if file.URL == "" {
+		return nil, fmt.Errorf("slack: file %s has no private URL", file.ID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, file.URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("slack: create file download request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+e.cfg.BotToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("slack: download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("slack: download file: status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("slack: read file body: %w", err)
+	}
+	return data, nil
 }
 
 // AddReaction adds an emoji reaction to a message.
