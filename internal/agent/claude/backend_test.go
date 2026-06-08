@@ -647,6 +647,28 @@ func TestPreInitNoiseThenInit(t *testing.T) {
 	_ = b.Close()
 }
 
+// TestHookStartedBeforeInitSkipped: system/hook_started arriving before
+// system/init must be silently skipped (not treated as a protocol violation).
+func TestHookStartedBeforeInitSkipped(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, events := subscribe(t, b)
+	p := firstTurn(t, b, fc, id, "hi")
+	p.feed(
+		`{"type":"system","subtype":"hook_started","hook_id":"h1"}`,
+		initLine(id),
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`,
+		`{"type":"result","subtype":"success"}`,
+	)
+	if ready := waitFor(t, events, agent.EventSessionReady); ready.SessionID != id {
+		t.Errorf("SessionReady id = %q", ready.SessionID)
+	}
+	if txt := waitFor(t, events, agent.EventTextDelta); txt.Text != "hello" {
+		t.Errorf("text = %q", txt.Text)
+	}
+	waitFor(t, events, agent.EventTurnDone)
+	_ = b.Close()
+}
+
 // TestOutputBeforeInitRejected: assistant/result before any init is a protocol
 // violation → explicit TurnError + channel close.
 func TestOutputBeforeInitRejected(t *testing.T) {

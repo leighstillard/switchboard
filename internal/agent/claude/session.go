@@ -111,6 +111,10 @@ scan:
 		if !initSeen {
 			switch typ {
 			case "system":
+				if peekSubtype(line) != "init" {
+					// Non-init system events before init (hook_started, thinking_tokens, …): skip.
+					continue
+				}
 				if err := probeInitShape(line); err != nil {
 					abort(err.Error())
 					break scan
@@ -497,6 +501,14 @@ func peekType(line []byte) string {
 	}
 	_ = json.Unmarshal(line, &e)
 	return e.Type
+}
+
+func peekSubtype(line []byte) string {
+	var e struct {
+		Subtype string `json:"subtype"`
+	}
+	_ = json.Unmarshal(line, &e)
+	return e.Subtype
 }
 
 func isTerminal(t agent.EventType) bool {
