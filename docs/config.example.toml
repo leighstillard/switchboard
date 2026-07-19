@@ -25,10 +25,40 @@ app_token = "${SLACK_APP_TOKEN}"      # xapp-... (Socket Mode)
 bot_token = "${SLACK_BOT_TOKEN}"      # xoxb-...
 signing_secret = "${SLACK_SIGNING_SECRET}"
 
+[routing.backend]
+# Default agent backend for channels that don't set their own.
+default = "jcode"  # "jcode" or "claude"; empty defaults to "jcode"
+
+[routing.llm]
+# LLM notification router: when an inbound webhook matches no [[routes]] rule,
+# a Claude model picks the destination thread. Fails safe to fallback_channel_id.
+enabled = false
+model = "claude-haiku-4-5"
+confidence_threshold = 80        # below this, fall back instead of routing
+max_input_tokens = 4000
+include_thread_count = 30        # recent threads offered as candidates
+api_key = "${ANTHROPIC_API_KEY}"
+monthly_budget_usd = 5.0         # hard cap; router disables itself when exceeded
+
 [jcode]
 socket_path = ""  # empty = use $XDG_RUNTIME_DIR/jcode.sock (default)
 auto_spawn = true
 spawn_command = "jcode serve --quiet --no-update"
+
+[claude]
+# Claude Code CLI backend. Runs one long-running `claude` process per session.
+# Inherits the ambient environment, including subscription OAuth / keychain creds.
+binary = "claude"                       # CLI on PATH
+model = "claude-sonnet-4-20250514"      # default model
+permission_policy = "accept_edits_only" # allow_all | deny_all | accept_edits_only
+setting_sources = "project,local"       # excludes user-layer hooks by default
+append_system_prompt = ""               # appended to the system prompt
+graceful_stop_timeout = "30s"
+idle_eviction_timeout = "30m"           # "0" = never evict
+min_version = "2.1.0"                    # startup version floor
+# max_version = ""                       # optional ceiling
+# extra_env = { FOO = "bar" }            # applied last, overrides inherited env
+# extra_args = []                        # additional CLI arguments
 
 # Bot identities (used via chat:write.customize scope)
 [identities.pm]
@@ -56,6 +86,8 @@ name = "slopwatch"
 workdir = "~/workspace/slopwatch"
 identity = "Slopwatch Worker"
 icon_url = "https://example.com/slopwatch.png"
+backend = "claude"                   # optional; inherit routing.backend.default if unset
+model = "claude-sonnet-4-20250514"   # optional per-channel model override
 
 [ingest]
 listen_addr = "127.0.0.1:8765"  # behind Cloudflare Tunnel

@@ -1,6 +1,13 @@
 # Switchboard
 
-Slack-side router that connects [jcode](https://github.com/1jehuang/jcode) coding-agent sessions to Slack threads, and unifies inbound engineering signals (GitHub, Temporal, cron, monitoring) into the same channels.
+Slack-side router that connects coding-agent sessions to Slack threads, and unifies inbound engineering signals (GitHub, Temporal, cron, monitoring) into the same channels.
+
+Two agent backends are supported behind a common `agent.Backend` abstraction:
+
+- **[jcode](https://github.com/1jehuang/jcode)** — daemon over a Unix socket (the original backend)
+- **Claude Code** — the `claude` CLI, run as one long-running process per session
+
+The backend is selectable globally and per-channel, so different Slack channels can drive different agents from the same bridge.
 
 ## Quick Start
 
@@ -19,10 +26,10 @@ cp docs/config.example.toml ~/.config/switchboard/config.toml
 ## Architecture
 
 ```
-Slack (Socket Mode) ──> Edge ──> Router ──> jcode Client ──> jcode daemon
-                                   ^
-Webhooks (HTTP) ──> Ingest ────────┘
-                                   │
+Slack (Socket Mode) ──> Edge ──> Router ──> agent.Backend ──┬─> jcode daemon (Unix socket)
+                                   ^                         └─> Claude Code (claude CLI)
+Webhooks (HTTP) ──> Ingest ────────┤
+                                   │  (unmatched events → LLM router)
                                    v
                               SQLite (state)
                                    │
@@ -30,26 +37,49 @@ Webhooks (HTTP) ──> Ingest ────────┘
                         Coalescer ──> Outbound Queue ──> Slack API
 ```
 
-One Slack thread = one jcode session. Replies in a thread continue the session.
+One Slack thread = one agent session. Replies in a thread continue the session.
+Both backends translate their native event streams into one normalized event
+vocabulary (`internal/agent`), so the router and coalescer are backend-agnostic.
 
 ## Key Features
 
-- **Bidirectional Slack <-> jcode** with thread-per-session granularity
+- **Bidirectional Slack <-> agent** with thread-per-session granularity
+- **Dual backends** — jcode and Claude Code, selectable globally and per-channel
+- **Per-channel model override** — pin a model per channel independent of backend
+- **Image support both ways** — Slack image uploads are forwarded to the agent; agent-generated images post back to the thread
+- **LLM notification router** — webhook events that match no deterministic rule are routed to a thread by a Claude model (budget-capped, confidence-gated)
+- **Cron scheduler** — scheduled prompt dispatches that stream a response into a new thread (dedup state persisted in SQLite)
+- **Programmatic dispatch** — `POST /api/correlate` (authenticated, fail-closed) maps external IDs to threads so routed webhooks land in the originating session
 - **Durable webhook ingest** with HMAC verification and at-least-once delivery
 - **Per-channel rate limiting** with round-robin fairness
 - **Lazy message coalescing** (at most 1 update/sec per session)
+- **Block Kit rendering** with terse tool descriptions
 - **Multiple bot identities** via `chat:write.customize`
 - **Auto-spawn** jcode daemon if not running
 - **Bridge restart recovery** from SQLite state
+
+### Claude Code backend
+
+The Claude Code backend runs the `claude` CLI as one long-running process per
+session (survives idle periods, respawns on demand, evicted after a configurable
+idle timeout). It inherits the ambient environment — including subscription
+OAuth / keychain credentials — and enforces a configurable permission policy
+(`allow_all`, `deny_all`, or `accept_edits_only`). A minimum CLI version is
+enforced on startup. See `[claude]` in the configuration reference.
 
 ## Configuration
 
 See `docs/config.example.toml` for the full configuration reference. Key sections:
 
 - `[slack]` - Slack app/bot tokens
-- `[[channels]]` - Channel ID to workdir mapping
-- `[ingest]` - Webhook server settings
+- `[routing.backend]` - Default agent backend (`jcode` or `claude`)
+- `[routing.llm]` - LLM notification router (model, budget, confidence threshold)
+- `[jcode]` - jcode socket connection and auto-spawn
+- `[claude]` - Claude Code CLI: binary, model, permission policy, idle eviction, min version
+- `[[channels]]` - Channel ID to workdir mapping (optional per-channel `backend` and `model`)
+- `[ingest]` - Webhook server and per-source HMAC secrets
 - `[[routes]]` - Deterministic event routing rules
+- `[[cron]]` - Scheduled prompt dispatches
 - `[identities.*]` - Bot display personas
 
 ## Commands
@@ -57,6 +87,7 @@ See `docs/config.example.toml` for the full configuration reference. Key section
 In any active agent thread:
 - `!stop` / `!cancel` - Cancel the current turn
 - `!purge` - Clear queued messages
+- `!/<cmd>` - Passthrough: sends `/<cmd>` to the agent (Slack eats a leading `/`)
 
 ## Documentation
 
