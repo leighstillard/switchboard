@@ -91,6 +91,9 @@ func saveNonImageFiles(ctx context.Context, files []slack.SlackFile, dataDir str
 			base = file.ID
 		}
 		path := filepath.Join(dataDir, "attachments", file.ID+"_"+base)
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs // the agent's cwd differs from ours; never hand it a relative path
+		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
 			err = os.WriteFile(path, data, 0o644)
 		}

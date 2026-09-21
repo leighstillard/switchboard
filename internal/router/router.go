@@ -632,7 +632,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 			// Re-subscribe succeeded; start event consumer and retry send.
 			go r.consumeEvents(ctx, session.JcodeSession, events)
-			if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+			if err := be.SendMessage(ctx, session.JcodeSession, text, images); err != nil {
 				// Send still fails after re-subscribe. Create replacement session.
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
