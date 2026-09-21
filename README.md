@@ -46,7 +46,7 @@ vocabulary (`internal/agent`), so the router and coalescer are backend-agnostic.
 - **Bidirectional Slack <-> agent** with thread-per-session granularity
 - **Dual backends** — jcode and Claude Code, selectable globally and per-channel
 - **Per-channel model override** — pin a model per channel independent of backend
-- **Image support both ways** — Slack image uploads are forwarded to the agent; agent-generated images post back to the thread
+- **Image support both ways** — Slack image uploads are forwarded to the agent; agent-generated images post back to the thread; non-image attachments are saved under the bridge data dir and their paths are given to the agent
 - **LLM notification router** — webhook events that match no deterministic rule are routed to a thread by a Claude model (budget-capped, confidence-gated)
 - **Cron scheduler** — scheduled prompt dispatches that stream a response into a new thread (dedup state persisted in SQLite)
 - **Programmatic dispatch** — `POST /api/correlate` (authenticated, fail-closed) maps external IDs to threads so routed webhooks land in the originating session

@@ -549,7 +549,8 @@ func (r *Router) handleNewSession(ctx context.Context, msg *slack.InboundMessage
 
 	// Send the user's message to agent.
 	images := imagesFromSlackFiles(ctx, msg.Files, r.edge.DownloadFile)
-	if err := be.SendMessage(ctx, sessionID, msg.Text, images); err != nil {
+	text := msg.Text + saveNonImageFiles(ctx, msg.Files, r.cfg.Bridge.DataDir, r.cfg.Bridge.Files.MaxInboundMB<<20, r.edge.DownloadFile)
+	if err := be.SendMessage(ctx, sessionID, text, images); err != nil {
 		slog.Error("router: failed to send message to agent", "err", err)
 		r.postError(msg.ChannelID, threadTS, "Failed to send message to agent: "+err.Error())
 		return
@@ -607,7 +608,8 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 		// Send message to agent. If the session is stale (e.g. jcode restarted),
 		// attempt to re-subscribe before giving up.
 		images := imagesFromSlackFiles(ctx, msg.Files, r.edge.DownloadFile)
-		if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+		text := msg.Text + saveNonImageFiles(ctx, msg.Files, r.cfg.Bridge.DataDir, r.cfg.Bridge.Files.MaxInboundMB<<20, r.edge.DownloadFile)
+		if err := be.SendMessage(ctx, session.JcodeSession, text, images); err != nil {
 			slog.Warn("router: send failed, attempting re-subscribe",
 				"session_id", session.JcodeSession, "err", err)
 
@@ -630,7 +632,7 @@ func (r *Router) handleContinuation(ctx context.Context, msg *slack.InboundMessa
 
 			// Re-subscribe succeeded; start event consumer and retry send.
 			go r.consumeEvents(ctx, session.JcodeSession, events)
-			if err := be.SendMessage(ctx, session.JcodeSession, msg.Text, images); err != nil {
+			if err := be.SendMessage(ctx, session.JcodeSession, text, images); err != nil {
 				// Send still fails after re-subscribe. Create replacement session.
 				slog.Warn("router: send failed after re-subscribe, creating replacement",
 					"session_id", session.JcodeSession, "err", err)
@@ -948,7 +950,8 @@ func (r *Router) handleTurnEnd(ctx context.Context, sessionID, coalKey string, e
 	// Send combined message to agent.
 	be := r.backendForSession(sessionID, "")
 	images := imagesFromSlackFiles(ctx, files, r.edge.DownloadFile)
-	if err := be.SendMessage(ctx, sessionID, combined, images); err != nil {
+	text := combined + saveNonImageFiles(ctx, files, r.cfg.Bridge.DataDir, r.cfg.Bridge.Files.MaxInboundMB<<20, r.edge.DownloadFile)
+	if err := be.SendMessage(ctx, sessionID, text, images); err != nil {
 		slog.Warn("router: failed to send queued messages, will retry on next user message",
 			"session_id", sessionID, "err", err)
 		// Remove the coalKey we just added since the send failed.

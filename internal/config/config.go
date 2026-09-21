@@ -264,6 +264,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
+	// Defaults.
+	if cfg.Bridge.Files.MaxInboundMB == 0 {
+		cfg.Bridge.Files.MaxInboundMB = 25 // matches docs/config.example.toml
+	}
+
 	// Expand paths.
 	cfg.Bridge.DataDir = expandPath(cfg.Bridge.DataDir)
 	cfg.Bridge.DefaultWorkdir = expandPath(cfg.Bridge.DefaultWorkdir)
