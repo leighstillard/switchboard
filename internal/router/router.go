@@ -1663,7 +1663,6 @@ func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 	}()
 }
 
-// underDir reports whether path (already cleaned) is dir or inside it.
 // underDir reports whether path (already symlink-resolved) is dir or inside
 // it. dir is symlink-resolved here; "" or a missing dir never matches.
 func underDir(path, dir string) bool {
