@@ -138,6 +138,45 @@ func TestExtractDirectives_StrictMode_DropsInvalid(t *testing.T) {
 	}
 }
 
+func TestExtractDirectives_ValidAttach(t *testing.T) {
+	text := "Before\n```switchboard\n{\"render\": \"attach\", \"path\": \"/tmp/report.pdf\"}\n```\nAfter"
+	result := ExtractDirectives(text, false)
+
+	if len(result.Attachments) != 1 || result.Attachments[0] != "/tmp/report.pdf" {
+		t.Errorf("Attachments = %v, want [/tmp/report.pdf]", result.Attachments)
+	}
+	if strings.Contains(result.CleanText, "switchboard") {
+		t.Error("attach directive block was not removed from CleanText")
+	}
+	if len(result.Blocks) != 0 {
+		t.Errorf("attach directive produced %d blocks, want 0", len(result.Blocks))
+	}
+}
+
+func TestExtractDirectives_AttachRelativePath_Strict(t *testing.T) {
+	text := "Before\n```switchboard\n{\"render\": \"attach\", \"path\": \"relative/file.pdf\"}\n```\nAfter"
+	result := ExtractDirectives(text, true)
+
+	if len(result.Attachments) != 0 {
+		t.Errorf("relative attach path should not be accepted, got %v", result.Attachments)
+	}
+	if strings.Contains(result.CleanText, "switchboard") {
+		t.Error("strict mode should drop the invalid directive, not leave it in text")
+	}
+}
+
+func TestExtractDirectives_AttachRelativePath_NonStrict(t *testing.T) {
+	text := "Before\n```switchboard\n{\"render\": \"attach\", \"path\": \"relative/file.pdf\"}\n```\nAfter"
+	result := ExtractDirectives(text, false)
+
+	if len(result.Attachments) != 0 {
+		t.Errorf("relative attach path should not be accepted, got %v", result.Attachments)
+	}
+	if !strings.Contains(result.CleanText, "switchboard") {
+		t.Error("non-strict mode should leave the invalid directive visible in text")
+	}
+}
+
 func TestExtractDirectives_MultipleDirectives(t *testing.T) {
 	text := `Start.
 ` + "```switchboard\n" + `{"render": "plan", "title": "A", "tasks": [{"id":"1","title":"T1","status":"complete"}]}

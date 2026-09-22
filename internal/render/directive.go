@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -24,6 +25,7 @@ var KnownDirectives = map[string]bool{
 	"poll":    true,
 	"tickets": true,
 	"todos":   true,
+	"attach":  true,
 }
 
 // MaxSupportedVersion is the highest directive version we support.
@@ -44,6 +46,8 @@ type DirectiveResult struct {
 	Blocks []map[string]interface{}
 	// FallbackText is the plain-text summary for block fallback.
 	FallbackText string
+	// Attachments is the list of absolute file paths from valid "attach" directives.
+	Attachments []string
 }
 
 // ExtractDirectives scans text for ```switchboard fenced blocks, validates them,
@@ -73,6 +77,22 @@ func ExtractDirectives(text string, strict bool) DirectiveResult {
 
 		jsonContent := strings.TrimSpace(text[jsonStart:jsonEnd])
 
+		// "attach" directives don't render Block Kit; handle them separately.
+		if path, ok, err := parseAttachDirective(jsonContent); ok {
+			if err != nil {
+				if strict {
+					slog.Warn("render: dropping invalid directive", "error", err)
+				} else {
+					cleanParts = append(cleanParts, text[fullStart:fullEnd])
+				}
+				lastEnd = fullEnd
+				continue
+			}
+			result.Attachments = append(result.Attachments, path)
+			lastEnd = fullEnd
+			continue
+		}
+
 		// Try to parse as a directive
 		blocks, fallback, err := processDirective(jsonContent)
 		if err != nil {
@@ -101,6 +121,23 @@ func ExtractDirectives(text string, strict bool) DirectiveResult {
 	result.FallbackText = strings.Join(fallbacks, " | ")
 
 	return result
+}
+
+// parseAttachDirective checks whether jsonContent is an "attach" directive.
+// ok is true iff the directive's "render" field is "attach" (regardless of
+// validity); err is non-nil when path is missing or not absolute.
+func parseAttachDirective(jsonContent string) (path string, ok bool, err error) {
+	var ad struct {
+		Render string `json:"render"`
+		Path   string `json:"path"`
+	}
+	if json.Unmarshal([]byte(jsonContent), &ad) != nil || ad.Render != "attach" {
+		return "", false, nil
+	}
+	if ad.Path == "" || !filepath.IsAbs(ad.Path) {
+		return "", true, fmt.Errorf("attach directive path must be absolute: %q", ad.Path)
+	}
+	return ad.Path, true, nil
 }
 
 // processDirective parses and renders a single directive JSON.

@@ -1618,9 +1618,53 @@ func (r *Router) postError(channelID, threadTS, msg string) {
 	})
 }
 
+// handleImage reads the file at req.Path and enqueues it for upload to the
+// requesting Slack thread. Run in a goroutine because the coalescer calls
+// this hook while holding its lock.
 func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
-	// TODO: read image from path, validate, upload via outbound queue.
-	slog.Info("router: image upload requested", "path", req.Path, "channel", req.ChannelID)
+	go func() {
+		if !filepath.IsAbs(req.Path) {
+			r.postError(req.ChannelID, req.ThreadTS, "attach: path must be absolute: "+req.Path)
+			return
+		}
+		// Model output is untrusted: only files under the session workdir or
+		// the bridge data dir may be posted.
+		clean := filepath.Clean(req.Path)
+		dataDir := r.cfg.Bridge.DataDir
+		if !underDir(clean, req.Workdir) && (dataDir == "" || !underDir(clean, dataDir)) {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: %s is outside the session workdir (%s); copy it there first", req.Path, req.Workdir))
+			return
+		}
+		data, err := os.ReadFile(clean)
+		if err != nil {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: cannot read %s: %v", req.Path, err))
+			return
+		}
+		maxBytes := r.cfg.Bridge.Files.MaxOutboundMB << 20
+		if len(data) > maxBytes {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: %s is %s which exceeds the %d MB limit",
+				filepath.Base(req.Path), formatFileSize(len(data)), r.cfg.Bridge.Files.MaxOutboundMB))
+			return
+		}
+		slog.Info("router: attaching file", "path", req.Path, "channel", req.ChannelID)
+		r.outbound.Enqueue(&outbound.OutboundItem{
+			Priority:  4,
+			ChannelID: req.ChannelID,
+			ThreadTS:  req.ThreadTS,
+			Action:    outbound.ActionUploadFile,
+			Filename:  filepath.Base(req.Path),
+			Content:   data,
+		})
+	}()
+}
+
+// underDir reports whether path (already cleaned) is dir or inside it.
+func underDir(path, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 // resolveIdentity returns just the identity for a channel (used when workdir is already known).

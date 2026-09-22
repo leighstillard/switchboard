@@ -473,6 +473,49 @@ func TestCoalescer_PlainCodeBlock_NotIntercepted(t *testing.T) {
 	}
 }
 
+func TestCoalescer_AttachDirective_CallsOnImage(t *testing.T) {
+	out := &mockOutbound{}
+	var mu sync.Mutex
+	var requests []ImageUploadRequest
+	onImage := func(req ImageUploadRequest) {
+		mu.Lock()
+		requests = append(requests, req)
+		mu.Unlock()
+	}
+	coal := NewSessionCoalescer("sess-attach", "fox", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Fox Worker"}, out, onImage)
+	defer coal.Close()
+
+	text := "Here's the report.\n```switchboard\n{\"render\": \"attach\", \"path\": \"/tmp/report.pdf\"}\n```\nAll done."
+
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: text})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+
+	mu.Lock()
+	got := append([]ImageUploadRequest{}, requests...)
+	mu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("onImage called %d times, want 1", len(got))
+	}
+	if got[0].Path != "/tmp/report.pdf" || got[0].Workdir != "/workspace/test" {
+		t.Errorf("onImage path/workdir = %q/%q, want /tmp/report.pdf//workspace/test", got[0].Path, got[0].Workdir)
+	}
+	if got[0].ChannelID != "C123" || got[0].ThreadTS != "ts1" {
+		t.Errorf("onImage channel/thread = %q/%q, want C123/ts1", got[0].ChannelID, got[0].ThreadTS)
+	}
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected at least one outbound item")
+	}
+	for _, item := range items {
+		if contains(item.Text, "switchboard") || contains(item.Text, "/tmp/report.pdf") {
+			t.Errorf("rendered text should not contain the directive: %q", item.Text)
+		}
+	}
+}
+
 func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
 	out := &mockOutbound{}
 	coal := NewSessionCoalescer("sess-dup", "elk", "C123", "ts1", "/workspace/test",
@@ -955,5 +998,53 @@ func TestCoalescer_ToolInputDelta_WithID_ClaudePath(t *testing.T) {
 		for _, item := range items {
 			t.Logf("  item text: %s", item.Text)
 		}
+	}
+}
+
+// attachRequests wires an onImage recorder into a coalescer.
+func attachRequests(t *testing.T, sess string) (*SessionCoalescer, func() []ImageUploadRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	var reqs []ImageUploadRequest
+	coal := NewSessionCoalescer(sess, "fox", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Fox Worker"}, &mockOutbound{}, func(r ImageUploadRequest) {
+			mu.Lock()
+			reqs = append(reqs, r)
+			mu.Unlock()
+		})
+	t.Cleanup(coal.Close)
+	return coal, func() []ImageUploadRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ImageUploadRequest{}, reqs...)
+	}
+}
+
+const attachDirectiveText = "```switchboard\n{\"render\": \"attach\", \"path\": \"/tmp/report.pdf\"}\n```\n"
+
+// An overflow split mid-turn resets the segment buffer; the directive that
+// streamed in before the split must still be dispatched, exactly once.
+func TestCoalescer_AttachDirective_SurvivesOverflow(t *testing.T) {
+	coal, got := attachRequests(t, "sess-attach-overflow")
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Report attached.\n" + attachDirectiveText})
+	for i := 0; i < 150; i++ {
+		id := fmt.Sprintf("tool-%d", i)
+		coal.HandleEvent(agent.Event{Type: agent.EventToolStart, ToolID: id, ToolName: "Read",
+			ToolInput: map[string]any{"file_path": fmt.Sprintf("/workspace/f_%d.go", i)}})
+		coal.HandleEvent(agent.Event{Type: agent.EventToolDone, ToolID: id, ToolName: "Read"})
+	}
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Done."})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+	if n := len(got()); n != 1 {
+		t.Fatalf("onImage called %d times across overflow, want 1", n)
+	}
+}
+
+func TestCoalescer_AttachDirective_DispatchedOnInterrupt(t *testing.T) {
+	coal, got := attachRequests(t, "sess-attach-interrupt")
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: attachDirectiveText})
+	coal.HandleEvent(agent.Event{Type: agent.EventInterrupted})
+	if n := len(got()); n != 1 {
+		t.Fatalf("onImage called %d times on interrupt, want 1", n)
 	}
 }

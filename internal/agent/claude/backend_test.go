@@ -308,6 +308,40 @@ func TestFreshSpawnArgs(t *testing.T) {
 	_ = b.Close()
 }
 
+func TestBuildArgsAppendsAttachHint(t *testing.T) {
+	b, fc, _ := testBackend(t)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+	args := fc.lastArgs()
+
+	v, ok := argValue(args, "--append-system-prompt")
+	if !ok {
+		t.Fatal("missing --append-system-prompt")
+	}
+	if !strings.HasPrefix(v, attachHint) {
+		t.Errorf("--append-system-prompt = %q, want prefix %q", v, attachHint)
+	}
+	_ = b.Close()
+}
+
+func TestBuildArgsAppendsAttachHintBeforeConfiguredPrompt(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AppendSystemPrompt = "custom instructions"
+	b := newForTest(cfg, newFakeCommander(), newFakeClock())
+	fc := b.cmd.(*fakeCommander)
+	id, _ := subscribe(t, b)
+	firstTurn(t, b, fc, id, "hi")
+
+	v, ok := argValue(fc.lastArgs(), "--append-system-prompt")
+	if !ok {
+		t.Fatal("missing --append-system-prompt")
+	}
+	if !strings.HasSuffix(v, "custom instructions") {
+		t.Errorf("--append-system-prompt = %q, want suffix %q", v, "custom instructions")
+	}
+	_ = b.Close()
+}
+
 func TestEnvStripsCLAUDECODEKeepsRest(t *testing.T) {
 	t.Setenv("CLAUDECODE", "1")
 	t.Setenv("SWITCHBOARD_SENTINEL", "keepme")
