@@ -46,7 +46,7 @@ vocabulary (`internal/agent`), so the router and coalescer are backend-agnostic.
 - **Bidirectional Slack <-> agent** with thread-per-session granularity
 - **Dual backends** — jcode and Claude Code, selectable globally and per-channel
 - **Per-channel model override** — pin a model per channel independent of backend
-- **Image support both ways** — Slack image uploads are forwarded to the agent; agent-generated images post back to the thread; non-image attachments are saved under the bridge data dir and their paths are given to the agent
+- **Image support both ways** — Slack image uploads are forwarded to the agent; agent-generated images post back to the thread; non-image attachments are saved under the bridge data dir and their paths are given to the agent; agents can also send any file back to the thread with an `attach` directive
 - **LLM notification router** — webhook events that match no deterministic rule are routed to a thread by a Claude model (budget-capped, confidence-gated)
 - **Cron scheduler** — scheduled prompt dispatches that stream a response into a new thread (dedup state persisted in SQLite)
 - **Programmatic dispatch** — `POST /api/correlate` (authenticated, fail-closed) maps external IDs to threads so routed webhooks land in the originating session
@@ -88,6 +88,16 @@ In any active agent thread:
 - `!stop` / `!cancel` - Cancel the current turn
 - `!purge` - Clear queued messages
 - `!/<cmd>` - Passthrough: sends `/<cmd>` to the agent (Slack eats a leading `/`)
+
+### Sending files back to Slack
+
+An agent can attach a file to its reply with a fenced directive anywhere in its response:
+
+```switchboard
+{"render": "attach", "path": "/absolute/path/to/file"}
+```
+
+The path must be absolute; files larger than `bridge.files.max_outbound_mb` (default 50) are rejected with an error posted to the thread instead of being uploaded.
 
 ## Documentation
 

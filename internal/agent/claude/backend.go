@@ -29,6 +29,10 @@ type Config struct {
 	ExtraArgs           []string          // appended after our flags
 }
 
+// attachHint teaches the agent the switchboard attach directive so it can send
+// files back to the Slack thread. Always appended to the system prompt.
+const attachHint = "To attach a file to your Slack reply, put this fenced block anywhere in your final response (it is stripped from the message; path must be absolute):\n```switchboard\n{\"render\": \"attach\", \"path\": \"/absolute/path/to/file\"}\n```"
+
 // DefaultConfig returns the default Claude backend configuration.
 func DefaultConfig() Config {
 	return Config{
@@ -144,9 +148,11 @@ func (b *Backend) buildArgs(sessionID string, resume bool) []string {
 	if b.cfg.Model != "" {
 		args = append(args, "--model", b.cfg.Model)
 	}
+	systemPrompt := attachHint
 	if b.cfg.AppendSystemPrompt != "" {
-		args = append(args, "--append-system-prompt", b.cfg.AppendSystemPrompt)
+		systemPrompt += "\n\n" + b.cfg.AppendSystemPrompt
 	}
+	args = append(args, "--append-system-prompt", systemPrompt)
 	if sessionID != "" {
 		if resume {
 			args = append(args, "--resume", sessionID)

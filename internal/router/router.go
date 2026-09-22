@@ -1618,9 +1618,36 @@ func (r *Router) postError(channelID, threadTS, msg string) {
 	})
 }
 
+// handleImage reads the file at req.Path and enqueues it for upload to the
+// requesting Slack thread. Run in a goroutine because the coalescer calls
+// this hook while holding its lock.
 func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
-	// TODO: read image from path, validate, upload via outbound queue.
-	slog.Info("router: image upload requested", "path", req.Path, "channel", req.ChannelID)
+	go func() {
+		if !filepath.IsAbs(req.Path) {
+			r.postError(req.ChannelID, req.ThreadTS, "attach: path must be absolute: "+req.Path)
+			return
+		}
+		data, err := os.ReadFile(req.Path)
+		if err != nil {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: cannot read %s: %v", req.Path, err))
+			return
+		}
+		maxBytes := r.cfg.Bridge.Files.MaxOutboundMB << 20
+		if len(data) > maxBytes {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: %s is %s which exceeds the %d MB limit",
+				filepath.Base(req.Path), formatFileSize(len(data)), r.cfg.Bridge.Files.MaxOutboundMB))
+			return
+		}
+		slog.Info("router: attaching file", "path", req.Path, "channel", req.ChannelID)
+		r.outbound.Enqueue(&outbound.OutboundItem{
+			Priority:  4,
+			ChannelID: req.ChannelID,
+			ThreadTS:  req.ThreadTS,
+			Action:    outbound.ActionUploadFile,
+			Filename:  filepath.Base(req.Path),
+			Content:   data,
+		})
+	}()
 }
 
 // resolveIdentity returns just the identity for a channel (used when workdir is already known).

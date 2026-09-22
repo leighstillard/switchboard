@@ -473,6 +473,51 @@ func TestCoalescer_PlainCodeBlock_NotIntercepted(t *testing.T) {
 	}
 }
 
+func TestCoalescer_AttachDirective_CallsOnImage(t *testing.T) {
+	out := &mockOutbound{}
+	var mu sync.Mutex
+	var requests []ImageUploadRequest
+	onImage := func(req ImageUploadRequest) {
+		mu.Lock()
+		requests = append(requests, req)
+		mu.Unlock()
+	}
+	coal := NewSessionCoalescer("sess-attach", "fox", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Fox Worker"}, out, onImage)
+	defer coal.Close()
+
+	text := "Here's the report.\n```switchboard\n{\"render\": \"attach\", \"path\": \"/tmp/report.pdf\"}\n```\nAll done."
+
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: text})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	got := append([]ImageUploadRequest{}, requests...)
+	mu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("onImage called %d times, want 1", len(got))
+	}
+	if got[0].Path != "/tmp/report.pdf" {
+		t.Errorf("onImage path = %q, want /tmp/report.pdf", got[0].Path)
+	}
+	if got[0].ChannelID != "C123" || got[0].ThreadTS != "ts1" {
+		t.Errorf("onImage channel/thread = %q/%q, want C123/ts1", got[0].ChannelID, got[0].ThreadTS)
+	}
+
+	items := out.getItems()
+	if len(items) == 0 {
+		t.Fatal("expected at least one outbound item")
+	}
+	for _, item := range items {
+		if contains(item.Text, "switchboard") || contains(item.Text, "/tmp/report.pdf") {
+			t.Errorf("rendered text should not contain the directive: %q", item.Text)
+		}
+	}
+}
+
 func TestCoalescer_DirectiveNoDuplication_AcrossFlushes(t *testing.T) {
 	out := &mockOutbound{}
 	coal := NewSessionCoalescer("sess-dup", "elk", "C123", "ts1", "/workspace/test",

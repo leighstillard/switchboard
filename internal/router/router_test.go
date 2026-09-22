@@ -2,11 +2,17 @@ package router
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/format5/switchboard/internal/agent"
+	"github.com/format5/switchboard/internal/coalesce"
 	"github.com/format5/switchboard/internal/config"
 	"github.com/format5/switchboard/internal/llmrouter"
+	"github.com/format5/switchboard/internal/outbound"
 )
 
 // ---------------------------------------------------------------------------
@@ -304,6 +310,121 @@ func TestCleanModelName(t *testing.T) {
 		if got := cleanModelName(in); got != want {
 			t.Errorf("cleanModelName(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// handleImage (attach directive) tests
+// ---------------------------------------------------------------------------
+
+type mockUploadPoster struct {
+	mu      sync.Mutex
+	uploads []struct {
+		channelID, threadTS, filename string
+		content                       []byte
+	}
+	posts []struct {
+		channelID, text string
+	}
+}
+
+func (m *mockUploadPoster) PostMessage(channelID, text string, opts ...outbound.PostOption) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.posts = append(m.posts, struct{ channelID, text string }{channelID, text})
+	return "ts-1", nil
+}
+func (m *mockUploadPoster) UpdateMessage(channelID, ts, text string, opts ...outbound.PostOption) error {
+	return nil
+}
+func (m *mockUploadPoster) UploadFile(channelID, threadTS, filename string, content []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.uploads = append(m.uploads, struct {
+		channelID, threadTS, filename string
+		content                       []byte
+	}{channelID, threadTS, filename, content})
+	return nil
+}
+func (m *mockUploadPoster) AddReaction(channelID, ts, emoji string) error    { return nil }
+func (m *mockUploadPoster) RemoveReaction(channelID, ts, emoji string) error { return nil }
+
+func (m *mockUploadPoster) uploadCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.uploads)
+}
+
+func (m *mockUploadPoster) postCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.posts)
+}
+
+func newTestRouterForImage(t *testing.T) (*Router, *mockUploadPoster) {
+	t.Helper()
+	poster := &mockUploadPoster{}
+	r := &Router{
+		cfg: &config.Config{
+			Bridge: config.BridgeConfig{
+				Files: config.FilesConfig{MaxOutboundMB: 1},
+			},
+		},
+		outbound: outbound.NewQueue(poster),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go r.outbound.Run(ctx)
+	return r, poster
+}
+
+func TestHandleImage_UnderLimit_EnqueuesUpload(t *testing.T) {
+	r, poster := newTestRouterForImage(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.pdf")
+	if err := os.WriteFile(path, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: path})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for poster.uploadCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if len(poster.uploads) != 1 {
+		t.Fatalf("uploads = %d, want 1", len(poster.uploads))
+	}
+	got := poster.uploads[0]
+	if got.filename != "report.pdf" || string(got.content) != "hello" {
+		t.Errorf("upload = %+v, want filename=report.pdf content=hello", got)
+	}
+	if len(poster.posts) != 0 {
+		t.Errorf("expected no error posts, got %v", poster.posts)
+	}
+}
+
+func TestHandleImage_RelativePath_PostsError(t *testing.T) {
+	r, poster := newTestRouterForImage(t)
+
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: "relative/file.pdf"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for poster.postCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if len(poster.posts) != 1 {
+		t.Fatalf("posts = %d, want 1", len(poster.posts))
+	}
+	if len(poster.uploads) != 0 {
+		t.Errorf("expected no uploads, got %v", poster.uploads)
 	}
 }
 

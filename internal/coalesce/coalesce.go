@@ -81,7 +81,9 @@ type Identity struct {
 	IconURL     string
 }
 
-// ImageUploadRequest is emitted when the coalescer encounters a generated image.
+// ImageUploadRequest is emitted when the coalescer encounters a generated
+// image, or when the agent requests a file be attached to the thread via a
+// switchboard "attach" render directive.
 type ImageUploadRequest struct {
 	ChannelID string
 	ThreadTS  string
@@ -467,6 +469,15 @@ func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 		} else {
 			// No tools: the entire text is the final message.
 			sc.finalMessageText = strings.TrimSpace(sc.allText())
+		}
+
+		// Dispatch any "attach" directives (files the agent wants sent to Slack).
+		if sc.onImage != nil {
+			if full := sc.allText(); render.HasDirectives(full) {
+				for _, p := range render.ExtractDirectives(full, sc.strictDirectives).Attachments {
+					sc.onImage(ImageUploadRequest{ChannelID: sc.channelID, ThreadTS: sc.threadTS, Path: p})
+				}
+			}
 		}
 
 		sc.finalized = true

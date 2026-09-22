@@ -268,6 +268,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Bridge.Files.MaxInboundMB == 0 {
 		cfg.Bridge.Files.MaxInboundMB = 25 // matches docs/config.example.toml
 	}
+	if cfg.Bridge.Files.MaxOutboundMB == 0 {
+		cfg.Bridge.Files.MaxOutboundMB = 50 // matches docs/config.example.toml
+	}
 
 	// Expand paths.
 	cfg.Bridge.DataDir = expandPath(cfg.Bridge.DataDir)
