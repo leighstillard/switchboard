@@ -2,7 +2,9 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -284,4 +286,37 @@ func TestIsMsgTooLong(t *testing.T) {
 
 func containsSubstring(s, sub string) bool {
 	return len(s) >= len(sub) && indexOf(s, sub) >= 0
+}
+
+type failingUploadPoster struct{ mockPoster }
+
+func (f *failingUploadPoster) UploadFile(channelID, threadTS, filename string, content []byte) error {
+	return errors.New("boom")
+}
+
+// A failed file upload must be reported in the thread, not just logged.
+func TestQueueUploadFailurePostsError(t *testing.T) {
+	poster := &failingUploadPoster{}
+	q := NewQueue(poster)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Run(ctx)
+
+	q.Enqueue(&OutboundItem{Priority: 4, ChannelID: "C1", ThreadTS: "T1", Action: ActionUploadFile, Filename: "report.pdf", Content: []byte("x")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		poster.mu.Lock()
+		n := len(poster.posts)
+		poster.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if len(poster.posts) != 1 || !strings.Contains(poster.posts[0].text, "upload of report.pdf failed") || poster.posts[0].channelID != "C1" {
+		t.Fatalf("expected one upload-failure post in C1, got %v", poster.posts)
+	}
 }

@@ -31,7 +31,7 @@ type Config struct {
 
 // attachHint teaches the agent the switchboard attach directive so it can send
 // files back to the Slack thread. Always appended to the system prompt.
-const attachHint = "To attach a file to your Slack reply, put this fenced block anywhere in your final response (it is stripped from the message; path must be absolute):\n```switchboard\n{\"render\": \"attach\", \"path\": \"/absolute/path/to/file\"}\n```"
+const attachHint = "To attach a file to your Slack reply, put this fenced block anywhere in your final response (it is stripped from the message; the path must be absolute and inside your working directory):\n```switchboard\n{\"render\": \"attach\", \"path\": \"/absolute/path/to/file\"}\n```"
 
 // DefaultConfig returns the default Claude backend configuration.
 func DefaultConfig() Config {

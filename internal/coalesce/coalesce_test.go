@@ -491,8 +491,6 @@ func TestCoalescer_AttachDirective_CallsOnImage(t *testing.T) {
 	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: text})
 	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
 
-	time.Sleep(200 * time.Millisecond)
-
 	mu.Lock()
 	got := append([]ImageUploadRequest{}, requests...)
 	mu.Unlock()
@@ -500,8 +498,8 @@ func TestCoalescer_AttachDirective_CallsOnImage(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("onImage called %d times, want 1", len(got))
 	}
-	if got[0].Path != "/tmp/report.pdf" {
-		t.Errorf("onImage path = %q, want /tmp/report.pdf", got[0].Path)
+	if got[0].Path != "/tmp/report.pdf" || got[0].Workdir != "/workspace/test" {
+		t.Errorf("onImage path/workdir = %q/%q, want /tmp/report.pdf//workspace/test", got[0].Path, got[0].Workdir)
 	}
 	if got[0].ChannelID != "C123" || got[0].ThreadTS != "ts1" {
 		t.Errorf("onImage channel/thread = %q/%q, want C123/ts1", got[0].ChannelID, got[0].ThreadTS)
@@ -1000,5 +998,53 @@ func TestCoalescer_ToolInputDelta_WithID_ClaudePath(t *testing.T) {
 		for _, item := range items {
 			t.Logf("  item text: %s", item.Text)
 		}
+	}
+}
+
+// attachRequests wires an onImage recorder into a coalescer.
+func attachRequests(t *testing.T, sess string) (*SessionCoalescer, func() []ImageUploadRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	var reqs []ImageUploadRequest
+	coal := NewSessionCoalescer(sess, "fox", "C123", "ts1", "/workspace/test",
+		Identity{DisplayName: "Fox Worker"}, &mockOutbound{}, func(r ImageUploadRequest) {
+			mu.Lock()
+			reqs = append(reqs, r)
+			mu.Unlock()
+		})
+	t.Cleanup(coal.Close)
+	return coal, func() []ImageUploadRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ImageUploadRequest{}, reqs...)
+	}
+}
+
+const attachDirectiveText = "```switchboard\n{\"render\": \"attach\", \"path\": \"/tmp/report.pdf\"}\n```\n"
+
+// An overflow split mid-turn resets the segment buffer; the directive that
+// streamed in before the split must still be dispatched, exactly once.
+func TestCoalescer_AttachDirective_SurvivesOverflow(t *testing.T) {
+	coal, got := attachRequests(t, "sess-attach-overflow")
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Report attached.\n" + attachDirectiveText})
+	for i := 0; i < 150; i++ {
+		id := fmt.Sprintf("tool-%d", i)
+		coal.HandleEvent(agent.Event{Type: agent.EventToolStart, ToolID: id, ToolName: "Read",
+			ToolInput: map[string]any{"file_path": fmt.Sprintf("/workspace/f_%d.go", i)}})
+		coal.HandleEvent(agent.Event{Type: agent.EventToolDone, ToolID: id, ToolName: "Read"})
+	}
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: "Done."})
+	coal.HandleEvent(agent.Event{Type: agent.EventTurnDone})
+	if n := len(got()); n != 1 {
+		t.Fatalf("onImage called %d times across overflow, want 1", n)
+	}
+}
+
+func TestCoalescer_AttachDirective_DispatchedOnInterrupt(t *testing.T) {
+	coal, got := attachRequests(t, "sess-attach-interrupt")
+	coal.HandleEvent(agent.Event{Type: agent.EventTextDelta, Text: attachDirectiveText})
+	coal.HandleEvent(agent.Event{Type: agent.EventInterrupted})
+	if n := len(got()); n != 1 {
+		t.Fatalf("onImage called %d times on interrupt, want 1", n)
 	}
 }

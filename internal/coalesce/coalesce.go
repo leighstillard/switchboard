@@ -89,6 +89,7 @@ type ImageUploadRequest struct {
 	ThreadTS  string
 	Path      string
 	Caption   string
+	Workdir   string // session workdir; attach paths must live under it (or the data dir)
 }
 
 // OutboundEnqueuer is the interface for submitting items to the outbound queue.
@@ -130,6 +131,8 @@ type SessionCoalescer struct {
 	directiveBlocks []map[string]interface{}
 	// Fallback text from directives (for clients that can't render blocks).
 	directiveFallback string
+	// Attach directive paths already dispatched this turn (dedupe across flushes).
+	attachSent map[string]bool
 
 	// finalMessageText holds the last assistant message segment (text after
 	// the last tool call) captured at turn end for inclusion in the done
@@ -436,6 +439,7 @@ func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 				ThreadTS:  sc.threadTS,
 				Path:      ev.ImagePath,
 				Caption:   ev.ImageCaption,
+				Workdir:   sc.workdir,
 			})
 		}
 
@@ -469,15 +473,6 @@ func (sc *SessionCoalescer) HandleEvent(ev agent.Event) {
 		} else {
 			// No tools: the entire text is the final message.
 			sc.finalMessageText = strings.TrimSpace(sc.allText())
-		}
-
-		// Dispatch any "attach" directives (files the agent wants sent to Slack).
-		if sc.onImage != nil {
-			if full := sc.allText(); render.HasDirectives(full) {
-				for _, p := range render.ExtractDirectives(full, sc.strictDirectives).Attachments {
-					sc.onImage(ImageUploadRequest{ChannelID: sc.channelID, ThreadTS: sc.threadTS, Path: p})
-				}
-			}
 		}
 
 		sc.finalized = true
@@ -531,6 +526,7 @@ func (sc *SessionCoalescer) resetForNextTurn() {
 	for k := range sc.toolInputBufs {
 		delete(sc.toolInputBufs, k)
 	}
+	sc.attachSent = nil
 	sc.directiveBlocks = nil
 	sc.directiveFallback = ""
 	// Note: finalMessageText is NOT cleared here; it's read by the router
@@ -786,6 +782,19 @@ func (sc *SessionCoalescer) renderMessage(isFinal bool) string {
 	if fullText != "" && render.HasDirectives(fullText) {
 		result := render.ExtractDirectives(fullText, sc.strictDirectives)
 		directiveResult = &result
+		// Dispatch "attach" directives here, at render time, rather than at
+		// turn end: an overflow split resets sc.segments mid-turn and would
+		// lose them. attachSent dedupes across the repeated flushes of a turn.
+		for _, path := range result.Attachments {
+			if sc.onImage == nil || sc.attachSent[path] {
+				continue
+			}
+			if sc.attachSent == nil {
+				sc.attachSent = map[string]bool{}
+			}
+			sc.attachSent[path] = true
+			sc.onImage(ImageUploadRequest{ChannelID: sc.channelID, ThreadTS: sc.threadTS, Path: path, Workdir: sc.workdir})
+		}
 		if len(result.Blocks) > 0 {
 			sc.directiveBlocks = append(sc.directiveBlocks, result.Blocks...)
 		}

@@ -1627,7 +1627,15 @@ func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 			r.postError(req.ChannelID, req.ThreadTS, "attach: path must be absolute: "+req.Path)
 			return
 		}
-		data, err := os.ReadFile(req.Path)
+		// Model output is untrusted: only files under the session workdir or
+		// the bridge data dir may be posted.
+		clean := filepath.Clean(req.Path)
+		dataDir := r.cfg.Bridge.DataDir
+		if !underDir(clean, req.Workdir) && (dataDir == "" || !underDir(clean, dataDir)) {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: %s is outside the session workdir (%s); copy it there first", req.Path, req.Workdir))
+			return
+		}
+		data, err := os.ReadFile(clean)
 		if err != nil {
 			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: cannot read %s: %v", req.Path, err))
 			return
@@ -1648,6 +1656,15 @@ func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 			Content:   data,
 		})
 	}()
+}
+
+// underDir reports whether path (already cleaned) is dir or inside it.
+func underDir(path, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 // resolveIdentity returns just the identity for a channel (used when workdir is already known).

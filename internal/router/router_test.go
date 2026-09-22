@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -387,7 +388,7 @@ func TestHandleImage_UnderLimit_EnqueuesUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: path})
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: path, Workdir: dir})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for poster.uploadCount() == 0 && time.Now().Before(deadline) {
@@ -432,13 +433,37 @@ func TestSessionLabel(t *testing.T) {
 	cases := []struct {
 		sessionID, model, want string
 	}{
-		{"session_snake_1777_abc", "claude-sonnet-4-20250514", "snake"},   // jcode animal wins
+		{"session_snake_1777_abc", "claude-sonnet-4-20250514", "snake"},                         // jcode animal wins
 		{"574853d1-1014-43b8-a8be-bb631a5fb7c1", "claude-sonnet-4-20250514", "claude-sonnet-4"}, // claude UUID → clean model
-		{"574853d1-1014-43b8-a8be-bb631a5fb7c1", "", ""},                   // no model → empty (caller skips)
+		{"574853d1-1014-43b8-a8be-bb631a5fb7c1", "", ""},                                        // no model → empty (caller skips)
 	}
 	for _, c := range cases {
 		if got := sessionLabel(c.sessionID, c.model); got != c.want {
 			t.Errorf("sessionLabel(%q,%q) = %q, want %q", c.sessionID, c.model, got, c.want)
 		}
+	}
+}
+
+func TestHandleImage_OutsideWorkdir_PostsError(t *testing.T) {
+	r, poster := newTestRouterForImage(t)
+	workdir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: outside, Workdir: workdir})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for poster.postCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if len(poster.uploads) != 0 {
+		t.Fatalf("expected no upload for a path outside the workdir, got %d", len(poster.uploads))
+	}
+	if len(poster.posts) != 1 || !strings.Contains(poster.posts[0].text, "outside the session workdir") {
+		t.Fatalf("expected one outside-workdir error post, got %v", poster.posts)
 	}
 }

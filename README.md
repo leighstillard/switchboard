@@ -97,7 +97,7 @@ An agent can attach a file to its reply with a fenced directive anywhere in its 
 {"render": "attach", "path": "/absolute/path/to/file"}
 ```
 
-The path must be absolute; files larger than `bridge.files.max_outbound_mb` (default 50) are rejected with an error posted to the thread instead of being uploaded.
+The path must be absolute and inside the session's working directory (or the bridge data dir); files larger than `bridge.files.max_outbound_mb` (default 50) are rejected with an error posted to the thread instead of being uploaded.
 
 ## Documentation
 

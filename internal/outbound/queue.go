@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"math"
 	"strconv"
@@ -531,6 +532,16 @@ func (q *Queue) execute(ctx context.Context, item *OutboundItem) {
 			"action", item.Action,
 			"error", err,
 		)
+		// A lost file upload is invisible to the user; say so in the thread.
+		if item.Action == ActionUploadFile {
+			q.Enqueue(&OutboundItem{
+				Priority:  3,
+				ChannelID: item.ChannelID,
+				ThreadTS:  item.ThreadTS,
+				Action:    ActionPostMessage,
+				Text:      fmt.Sprintf("❌ attach: upload of %s failed: %v", item.Filename, err),
+			})
+		}
 	}
 }
 
