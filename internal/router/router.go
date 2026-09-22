@@ -1628,10 +1628,15 @@ func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 			return
 		}
 		// Model output is untrusted: only files under the session workdir or
-		// the bridge data dir may be posted.
-		clean := filepath.Clean(req.Path)
-		dataDir := r.cfg.Bridge.DataDir
-		if !underDir(clean, req.Workdir) && (dataDir == "" || !underDir(clean, dataDir)) {
+		// the bridge data dir may be posted. Compare real paths so a symlinked
+		// workdir (~/workspace -> /data/workspace) matches, and a symlink
+		// inside the workdir cannot escape it.
+		clean, err := filepath.EvalSymlinks(req.Path)
+		if err != nil {
+			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: cannot read %s: %v", req.Path, err))
+			return
+		}
+		if !underDir(clean, req.Workdir) && !underDir(clean, r.cfg.Bridge.DataDir) {
 			r.postError(req.ChannelID, req.ThreadTS, fmt.Sprintf("attach: %s is outside the session workdir (%s); copy it there first", req.Path, req.Workdir))
 			return
 		}
@@ -1658,12 +1663,16 @@ func (r *Router) handleImage(req coalesce.ImageUploadRequest) {
 	}()
 }
 
-// underDir reports whether path (already cleaned) is dir or inside it.
+// underDir reports whether path (already symlink-resolved) is dir or inside
+// it. dir is symlink-resolved here; "" or a missing dir never matches.
 func underDir(path, dir string) bool {
 	if dir == "" {
 		return false
 	}
-	dir = filepath.Clean(dir)
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
 	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
