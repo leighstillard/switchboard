@@ -444,6 +444,32 @@ func TestSessionLabel(t *testing.T) {
 	}
 }
 
+func TestHandleImage_SymlinkedWorkdir_Uploads(t *testing.T) {
+	r, poster := newTestRouterForImage(t)
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "deck.pptx"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// File addressed via the real path, workdir via the symlink (and vice versa).
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: filepath.Join(real, "deck.pptx"), Workdir: link})
+	r.handleImage(coalesce.ImageUploadRequest{ChannelID: "C1", ThreadTS: "T1", Path: filepath.Join(link, "deck.pptx"), Workdir: real})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for poster.uploadCount() < 2 && poster.postCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if len(poster.posts) != 0 || len(poster.uploads) != 2 {
+		t.Fatalf("expected 2 uploads and no error posts, got uploads=%d posts=%v", len(poster.uploads), poster.posts)
+	}
+}
+
 func TestHandleImage_OutsideWorkdir_PostsError(t *testing.T) {
 	r, poster := newTestRouterForImage(t)
 	workdir := t.TempDir()
